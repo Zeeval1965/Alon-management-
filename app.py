@@ -459,7 +459,7 @@ button{background:#C62828;color:#fff;border:0;padding:4px 10px}</style></head><b
 </table></body></html>"""
 
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+UPLOAD_DIR = os.environ.get("APP_UPLOAD_DIR") or os.path.join(os.path.dirname(__file__), "uploads")
 SECTION_NAV = """<p><a href="{{ url_for('site_view', site_id=site_id) }}">חזרה לאתר</a> |
 <a href="{{ url_for('decisions_view', site_id=site_id) }}">החלטות</a> |
 <a href="{{ url_for('supervision_view', site_id=site_id) }}">דוחות פיקוח</a> |
@@ -1021,6 +1021,12 @@ def meeting_review(meeting_id):
 <td><input type="checkbox" name="skip_{{i}}" {% if r.get('skip') %}checked{% endif %}></td></tr>{% endfor %}</table>
 <p><button name="action" value="save">שמירה כטיוטה</button> <button name="action" value="publish">אישור ופרסום</button></p></form>
 """, rows=rows)
+
+
+# Render (gunicorn) imports this module and never runs the __main__ block,
+# so the database schema must be created here on the server.
+if os.environ.get("RENDER"):
+    init_db()
 
 
 if __name__ == "__main__":
