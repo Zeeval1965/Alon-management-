@@ -191,27 +191,57 @@ def _cell(row, col, name):
     return str(row[i]).strip()
 
 
-def import_contacts(path, site_id=None, site_role=None):
-    """Import contacts from the first sheet that has a 'דוא"ل' column.
-    Returns (added, skipped) where skipped counts non-empty rows without an email.
-    Raises ValueError when no sheet has an email column."""
+EMAIL_PATTERN = r"[^@\s]+@[^@\s]+\.[^@\s]+"
+
+
+def _contact_rows(path):
+    """Every non-empty row of the contacts sheet, normalised, with the problems found in it.
+    A row with problems is shown in the preview; rows without a usable email are not imported."""
     wb = openpyxl.load_workbook(path, data_only=True)
     ws, header_idx, col = _find_contact_sheet(wb)
     if ws is None:
         raise ValueError('לא נמצאה עמודה בשם דוא"ל באף גיליון. ודא שהכותרת מופיעה בשורה הראשונה של הגיליון.')
-    added = skipped = 0
-    for r in ws.iter_rows(min_row=header_idx + 2, values_only=True):
-        email = _cell(r, col, CONTACT_EMAIL_HEADER).lower()
-        if not email:
-            if any(v not in (None, "") for v in r):
-                skipped += 1
+    out, seen = [], set()
+    for offset, r in enumerate(ws.iter_rows(min_row=header_idx + 2, values_only=True)):
+        if not any(v not in (None, "") for v in r):
             continue
+        email = _cell(r, col, CONTACT_EMAIL_HEADER).lower()
         first, last = _cell(r, col, "שם פרטי"), _cell(r, col, "שם משפחה")
         full = _cell(r, col, "שם מלא")
         if not first and not last and full:
             parts = full.split(None, 1)
             first, last = parts[0], (parts[1] if len(parts) > 1 else "")
-        role = _cell(r, col, "תפקיד") or _cell(r, col, "סוג")
+        role_raw = _cell(r, col, "תפקיד") or _cell(r, col, "סוג")
+        site_role = _site_role_of(_cell(r, col, "תפקיד")) or _site_role_of(_cell(r, col, "סוג"))
+        problems = []
+        if not email:
+            problems.append('חסר דוא"ל - השורה לא תיובא')
+        elif not re.fullmatch(EMAIL_PATTERN, email):
+            problems.append('דוא"ל לא תקין - השורה לא תיובא')
+        elif email in seen:
+            problems.append("כפילות בקובץ - נשמרת הפעם האחרונה")
+        if email:
+            seen.add(email)
+        if not first and not last:
+            problems.append("חסר שם")
+        if role_raw and not site_role:
+            problems.append("תפקיד לא מוכר - יקלט בלי שיוך לאתר")
+        out.append({"line": header_idx + 2 + offset, "email": email, "first": first, "last": last,
+                    "role_raw": role_raw, "site_role": site_role, "importable": bool(email) and bool(re.fullmatch(EMAIL_PATTERN, email)),
+                    "org": _cell(r, col, "ארגון"), "phone": _cell(r, col, "טלפון"),
+                    "mobile": _cell(r, col, "טלפון נייד"), "address": _cell(r, col, "כתובת"),
+                    "problems": problems})
+    return out
+
+
+def import_contacts(path, site_id=None, site_role=None):
+    """Import the importable rows. Returns (added, skipped). A row's site role comes from its own
+    'תפקיד' (or 'סוג'); site_role is only a fallback for rows that have none."""
+    added = skipped = 0
+    for row in _contact_rows(path):
+        if not row["importable"]:
+            skipped += 1
+            continue
         db().execute(
             """INSERT INTO contacts(email, first_name, last_name, role, org, phone, mobile, address)
                VALUES (?,?,?,?,?,?,?,?)
@@ -223,13 +253,11 @@ def import_contacts(path, site_id=None, site_role=None):
                  phone=COALESCE(NULLIF(contacts.phone,''), excluded.phone),
                  mobile=COALESCE(NULLIF(contacts.mobile,''), excluded.mobile),
                  address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
-            (email, first, last, role, _cell(r, col, "ארגון"), _cell(r, col, "טלפון"),
-             _cell(r, col, "טלפון נייד"), _cell(r, col, "כתובת")))
-        # The site role comes from the row itself ('תפקיד', else 'סוג'); rows without a recognised role
-        # are imported as contacts but not linked to the site.
-        membership_role = _site_role_of(_cell(r, col, "תפקיד")) or _site_role_of(_cell(r, col, "סוג")) or site_role
+            (row["email"], row["first"], row["last"], row["role_raw"], row["org"], row["phone"],
+             row["mobile"], row["address"]))
+        membership_role = row["site_role"] or site_role
         if site_id and membership_role:
-            cid = db().execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()[0]
+            cid = db().execute("SELECT id FROM contacts WHERE email=?", (row["email"],)).fetchone()[0]
             db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
                          (site_id, cid, membership_role))
         added += 1
@@ -982,32 +1010,78 @@ def site_new():
 <button>שמירה</button></form>""", url_for=url_for)
 
 
-@app.route("/contacts/import", methods=["GET", "POST"])
+def _import_dir():
+    return os.path.join(UPLOAD_DIR, "imports")
+
+
+def _valid_token(token):
+    return len(token) == 32 and all(c in "0123456789abcdef" for c in token)
+
+
+@app.route("/contacts/import", methods=["GET"])
 def contacts_import():
-    if request.method == "POST":
-        f = request.files.get("file")
-        site_id = request.form.get("site_id", type=int)
-        if not f or not site_id:
-            flash("יש לבחור אתר וקובץ")
-            return redirect(url_for("contacts_import"))
-        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-        f.save(tmp.name)
-        try:
-            n, skipped = import_contacts(tmp.name, site_id=site_id)
-        except ValueError as exc:
-            flash(str(exc))
-            return redirect(url_for("contacts_import"))
-        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
-        return redirect(url_for("site_view", site_id=site_id))
     all_sites = db().execute("SELECT id, name FROM sites ORDER BY id").fetchall()
     return page("ייבוא אנשי קשר", """
-<form method="post" enctype="multipart/form-data">
+<form method="post" action="{{ url_for('contacts_import_preview') }}" enctype="multipart/form-data">
 <p><label>אתר: <select name="site_id" required>
 {% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
 <p><input type="file" name="file" accept=".xlsx" required></p>
-<button>ייבוא</button></form>
-<p class="note">התפקיד במערכת נלקח מעמודת "תפקיד" (או "סוג") בכל שורה: יזם, נציגות, בעלי דירות, יועצים, מפקח, קבלן. שורה שהתפקיד בה לא מוכר נקלטת כאיש קשר בלי שיוך לאתר. מי שכבר קיים מעודכן ולא מוכפל.</p>""",
+<button>בדיקה לפני ייבוא</button></form>
+<p class="note">התפקיד במערכת נלקח מעמודת "תפקיד" (או "סוג") בכל שורה: יזם, נציגות, בעלי דירות, יועצים, מפקח, קבלן. בשלב הבדיקה תראה מה ייובא ומה דורש תיקון, ורק אחרי אישור הייבוא יתבצע.</p>""",
                 url_for=url_for, sites=all_sites)
+
+
+@app.route("/contacts/import/preview", methods=["POST"])
+def contacts_import_preview():
+    f = request.files.get("file")
+    site_id = request.form.get("site_id", type=int)
+    if not f or not site_id:
+        flash("יש לבחור אתר וקובץ")
+        return redirect(url_for("contacts_import"))
+    os.makedirs(_import_dir(), exist_ok=True)
+    token = uuid.uuid4().hex
+    path = os.path.join(_import_dir(), token + ".xlsx")
+    f.save(path)
+    try:
+        rows = _contact_rows(path)
+    except ValueError as exc:
+        os.remove(path)
+        flash(str(exc))
+        return redirect(url_for("contacts_import"))
+    site = db().execute("SELECT name FROM sites WHERE id=?", (site_id,)).fetchone()
+    ok = sum(1 for r in rows if r["importable"])
+    return page("בדיקה לפני ייבוא", """
+<p>אתר: <b>{{ site_name }}</b> | ייבואו <b>{{ ok }}</b> מתוך {{ rows|length }} שורות.
+{% if rows|length - ok %}השורות שסומנו בכתום לא ייובאו או ייקלטו חלקית. אפשר לתקן את הקובץ ולהעלות אותו שוב, או לאשר כמות שהוא.{% endif %}</p>
+<table><tr><th>שורה</th><th>דוא"ל</th><th>שם</th><th>תפקיד בקובץ</th><th>שיוך באתר</th><th>הערות</th></tr>
+{% for r in rows %}<tr style="{% if r['problems'] %}background:#fff4d6{% endif %}">
+<td>{{ r['line'] }}</td><td>{{ r['email'] }}</td><td>{{ r['first'] }} {{ r['last'] }}</td>
+<td>{{ r['role_raw'] }}</td><td>{{ r['site_role'] or '-' }}</td><td>{{ r['problems']|join(' | ') }}</td></tr>{% endfor %}
+</table>
+<form method="post" action="{{ url_for('contacts_import_confirm') }}">
+<input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="site_id" value="{{ site_id }}">
+<p><button>אישור וייבוא</button> <a href="{{ url_for('contacts_import') }}">ביטול</a></p></form>""",
+                url_for=url_for, rows=rows, ok=ok, token=token, site_id=site_id,
+                site_name=site["name"] if site else "")
+
+
+@app.route("/contacts/import/confirm", methods=["POST"])
+def contacts_import_confirm():
+    token = request.form.get("token", "")
+    site_id = request.form.get("site_id", type=int)
+    if not _valid_token(token) or not site_id:
+        flash("הבדיקה פגה, העלה את הקובץ שוב")
+        return redirect(url_for("contacts_import"))
+    path = os.path.join(_import_dir(), token + ".xlsx")
+    if not os.path.exists(path):
+        flash("הקובץ לא נמצא, העלה אותו שוב")
+        return redirect(url_for("contacts_import"))
+    try:
+        n, skipped = import_contacts(path, site_id=site_id)
+    finally:
+        os.remove(path)
+    flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל). שורות שדולגו: {skipped}")
+    return redirect(url_for("site_view", site_id=site_id))
 
 
 @app.route("/sites/<int:site_id>")

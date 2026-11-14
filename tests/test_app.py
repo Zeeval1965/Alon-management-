@@ -243,6 +243,48 @@ class ContactImportTests(AppTestCase):
                 A.import_contacts(path)
 
 
+class ContactPreviewFlowTests(AppTestCase):
+    """Upload shows a preview with problems; nothing is imported until the admin confirms."""
+
+    def xlsx_bytes(self, rows):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "יועצים"
+        for row in rows:
+            ws.append(row)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_preview_then_confirm_imports_only_valid_rows(self):
+        data = self.xlsx_bytes([["שם פרטי", "דוא\"ל", "תפקיד"],
+                                ["ענת", "anat3@example.com", "יזם"],
+                                ["אבי", "not-an-email", "יועצים"]])
+        c = self.login("admin@test")
+        r = c.post("/contacts/import/preview", data={"site_id": "1",
+                                                     "file": (io.BytesIO(data), "c.xlsx")},
+                   content_type="multipart/form-data")
+        html = r.get_data(as_text=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("לא תקין", html)
+        self.assertIsNone(self.db_one("SELECT id FROM contacts WHERE email='anat3@example.com'"))
+        import re as _re
+        token = _re.search(r'name="token" value="([0-9a-f]{32})"', html).group(1)
+        r2 = c.post("/contacts/import/confirm", data={"token": token, "site_id": "1"})
+        self.assertEqual(r2.status_code, 302)
+        self.assertIsNotNone(self.db_one("SELECT id FROM contacts WHERE email='anat3@example.com'"))
+        self.assertIsNone(self.db_one("SELECT id FROM contacts WHERE email='not-an-email'"))
+        self.assertEqual(self.db_one("SELECT m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                                     "WHERE c.email='anat3@example.com'")[0], "יזם")
+        self.assertFalse(os.path.exists(os.path.join(A.UPLOAD_DIR, "imports", token + ".xlsx")))
+
+    def test_confirm_rejects_malformed_token(self):
+        c = self.login("admin@test")
+        r = c.post("/contacts/import/confirm", data={"token": "../../etc", "site_id": "1"})
+        self.assertEqual(r.status_code, 302)
+
+
 class ContactMembershipImportTests(AppTestCase):
     """Importing with a site and role links every row to that site as a member."""
 
