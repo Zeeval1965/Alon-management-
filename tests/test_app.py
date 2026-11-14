@@ -184,5 +184,64 @@ class ModuleTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT COUNT(*) FROM supervision_items"), 28)
 
 
+class ContactImportTests(AppTestCase):
+    """Contact import reads the first sheet that has a 'דוא"ל' column and tolerates the template layout."""
+
+    def write_xlsx(self, sheets):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        for title, rows in sheets:
+            ws = wb.create_sheet(title)
+            for row in rows:
+                ws.append(row)
+        path = os.path.join(self.tmp.name, "contacts.xlsx")
+        wb.save(path)
+        return path
+
+    def contact(self, email):
+        with A.app.app_context():
+            row = A.db().execute("SELECT first_name, last_name, role FROM contacts WHERE email=?", (email,)).fetchone()
+        return tuple(row) if row else None
+
+    def test_reads_second_sheet_when_first_sheet_is_instructions(self):
+        path = self.write_xlsx([
+            ("הסבר", [["תבנית ייבוא - הלל הזקן 14"], ["הוראות כלליות"]]),
+            ("יועצים", [["תחום", "שם מלא", "תפקיד", "דוא\"ל"],
+                        ["קרקע", "אביה זאב", "מהנדס קרקע", "aviah@example.com"],
+                        ["", "", "", ""]]),
+        ])
+        with A.app.app_context():
+            added, skipped = A.import_contacts(path)
+        self.assertEqual((added, skipped), (1, 0))
+        self.assertEqual(self.contact("aviah@example.com"), ("אביה", "זאב", "מהנדס קרקע"))
+
+    def test_full_name_is_split_into_first_and_last(self):
+        path = self.write_xlsx([("בעלי דירות", [["שם מלא", "דוא\"ל", "סוג"],
+                                                ["דנה כהן ולוי", "dana@example.com", "בעל דירה"]])])
+        with A.app.app_context():
+            A.import_contacts(path)
+        self.assertEqual(self.contact("dana@example.com"), ("דנה", "כהן ולוי", "בעל דירה"))
+
+    def test_typographic_quote_in_header_is_recognised(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\u05f4ל"], ["רן", "ran@example.com"]])])
+        with A.app.app_context():
+            added, _ = A.import_contacts(path)
+        self.assertEqual(added, 1)
+        self.assertIsNotNone(self.contact("ran@example.com"))
+
+    def test_rows_without_email_are_counted_as_skipped(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["א", ""], ["ב", "b@example.com"]])])
+        with A.app.app_context():
+            added, skipped = A.import_contacts(path)
+        self.assertEqual((added, skipped), (1, 1))
+
+    def test_missing_email_column_raises_clear_error(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "תפקיד"], ["א", "מהנדס"]])])
+        with A.app.app_context():
+            with self.assertRaises(ValueError):
+                A.import_contacts(path)
+
+
 if __name__ == "__main__":
     unittest.main()

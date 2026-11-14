@@ -153,19 +153,55 @@ def priority_of(task, today=None):
 
 
 # ---------- importers ----------
+CONTACT_EMAIL_HEADER = 'דוא"ל'
+
+
+def _norm_header(value):
+    """Header text with the common Hebrew/typographic quote variants mapped to a plain double quote."""
+    text = str(value or "").strip()
+    for quote in ("״", "”", "“", "''"):
+        text = text.replace(quote, '"')
+    return text
+
+
+def _find_contact_sheet(wb):
+    """First worksheet with a row (within the top 10) that contains a 'דוא"ל' column."""
+    for ws in wb.worksheets:
+        for idx, row in enumerate(ws.iter_rows(values_only=True, max_row=10)):
+            header = [_norm_header(h) for h in row]
+            if CONTACT_EMAIL_HEADER in header:
+                return ws, idx, {h: i for i, h in enumerate(header) if h}
+    return None, None, None
+
+
+def _cell(row, col, name):
+    i = col.get(name)
+    if i is None or i >= len(row) or row[i] in (None, ""):
+        return ""
+    return str(row[i]).strip()
+
+
 def import_contacts(path, site_id=None):
-    ws = openpyxl.load_workbook(path, data_only=True).active
-    rows = list(ws.iter_rows(values_only=True))
-    header = [str(h or "").strip() for h in rows[0]]
-    col = {h: i for i, h in enumerate(header)}
-    added = 0
-    for r in rows[1:]:
-        email = str(r[col['דוא"ל']] or "").strip().lower() if 'דוא"ל' in col else ""
+    """Import contacts from the first sheet that has a 'דוא"ل' column.
+    Returns (added, skipped) where skipped counts non-empty rows without an email.
+    Raises ValueError when no sheet has an email column."""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws, header_idx, col = _find_contact_sheet(wb)
+    if ws is None:
+        raise ValueError('לא נמצאה עמודה בשם דוא"ל באף גיליון. ודא שהכותרת מופיעה בשורה הראשונה של הגיליון.')
+    added = skipped = 0
+    for r in ws.iter_rows(min_row=header_idx + 2, values_only=True):
+        email = _cell(r, col, CONTACT_EMAIL_HEADER).lower()
         if not email:
+            if any(v not in (None, "") for v in r):
+                skipped += 1
             continue
-        def g_(name):
-            i = col.get(name)
-            return str(r[i]).strip() if i is not None and r[i] not in (None, "") else ""
+        first, last = _cell(r, col, "שם פרטי"), _cell(r, col, "שם משפחה")
+        full = _cell(r, col, "שם מלא")
+        if not first and not last and full:
+            parts = full.split(None, 1)
+            first, last = parts[0], (parts[1] if len(parts) > 1 else "")
+        role = _cell(r, col, "תפקיד") or _cell(r, col, "סוג")
         db().execute(
             """INSERT INTO contacts(email, first_name, last_name, role, org, phone, mobile, address)
                VALUES (?,?,?,?,?,?,?,?)
@@ -177,11 +213,11 @@ def import_contacts(path, site_id=None):
                  phone=COALESCE(NULLIF(contacts.phone,''), excluded.phone),
                  mobile=COALESCE(NULLIF(contacts.mobile,''), excluded.mobile),
                  address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
-            (email, g_("שם פרטי"), g_("שם משפחה"), g_("תפקיד"), g_("ארגון"),
-             g_("טלפון"), g_("טלפון נייד"), g_("כתובת")))
+            (email, first, last, role, _cell(r, col, "ארגון"), _cell(r, col, "טלפון"),
+             _cell(r, col, "טלפון נייד"), _cell(r, col, "כתובת")))
         added += 1
     db().commit()
-    return added
+    return added, skipped
 
 
 def _words(text):
@@ -935,8 +971,12 @@ def contacts_import():
         f = request.files["file"]
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         f.save(tmp.name)
-        n = import_contacts(tmp.name)
-        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל)")
+        try:
+            n, skipped = import_contacts(tmp.name)
+        except ValueError as exc:
+            flash(str(exc))
+            return redirect(url_for("contacts_import"))
+        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
         return redirect(url_for("sites"))
     return page("ייבוא אנשי קשר", """
 <form method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required>
