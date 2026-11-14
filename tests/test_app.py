@@ -243,5 +243,31 @@ class ContactImportTests(AppTestCase):
                 A.import_contacts(path)
 
 
+class ContactMembershipImportTests(AppTestCase):
+    """Importing with a site and role links every row to that site as a member."""
+
+    write_xlsx = ContactImportTests.write_xlsx
+
+    def test_import_with_site_and_role_creates_memberships(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["ענת", "anat@example.com"],
+                                            ["אבי", "avi@example.com"]])])
+        with A.app.app_context():
+            added, _ = A.import_contacts(path, site_id=1, site_role="יועצים")
+            rows = A.db().execute(
+                "SELECT c.email, m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                "WHERE m.site_id=1 AND c.email LIKE '%@example.com' ORDER BY c.email").fetchall()
+        self.assertEqual(added, 2)
+        self.assertEqual([tuple(r) for r in rows], [("anat@example.com", "יועצים"), ("avi@example.com", "יועצים")])
+
+    def test_reimport_does_not_duplicate_memberships(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["ענת", "anat@example.com"]])])
+        with A.app.app_context():
+            A.import_contacts(path, site_id=1, site_role="יועצים")
+            A.import_contacts(path, site_id=1, site_role="יועצים")
+            n = A.db().execute("SELECT COUNT(*) FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                               "WHERE c.email='anat@example.com' AND m.site_id=1").fetchone()[0]
+        self.assertEqual(n, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

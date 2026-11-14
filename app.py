@@ -181,7 +181,7 @@ def _cell(row, col, name):
     return str(row[i]).strip()
 
 
-def import_contacts(path, site_id=None):
+def import_contacts(path, site_id=None, site_role=None):
     """Import contacts from the first sheet that has a 'דוא"ل' column.
     Returns (added, skipped) where skipped counts non-empty rows without an email.
     Raises ValueError when no sheet has an email column."""
@@ -215,6 +215,10 @@ def import_contacts(path, site_id=None):
                  address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
             (email, first, last, role, _cell(r, col, "ארגון"), _cell(r, col, "טלפון"),
              _cell(r, col, "טלפון נייד"), _cell(r, col, "כתובת")))
+        if site_id and site_role:
+            cid = db().execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()[0]
+            db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
+                         (site_id, cid, site_role))
         added += 1
     db().commit()
     return added, skipped
@@ -968,19 +972,32 @@ def site_new():
 @app.route("/contacts/import", methods=["GET", "POST"])
 def contacts_import():
     if request.method == "POST":
-        f = request.files["file"]
+        f = request.files.get("file")
+        site_id = request.form.get("site_id", type=int)
+        role = (request.form.get("role") or "").strip()
+        if not f or not site_id or role not in ROLE_READ:
+            flash("יש לבחור אתר, תפקיד במערכת, וקובץ")
+            return redirect(url_for("contacts_import"))
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         f.save(tmp.name)
         try:
-            n, skipped = import_contacts(tmp.name)
+            n, skipped = import_contacts(tmp.name, site_id=site_id, site_role=role)
         except ValueError as exc:
             flash(str(exc))
             return redirect(url_for("contacts_import"))
-        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
-        return redirect(url_for("sites"))
+        flash(f"יובאו {n} שורות ושויכו לאתר כ{role} (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
+        return redirect(url_for("site_view", site_id=site_id))
+    all_sites = db().execute("SELECT id, name FROM sites ORDER BY id").fetchall()
     return page("ייבוא אנשי קשר", """
-<form method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required>
-<button>ייבוא</button></form>""", url_for=url_for)
+<form method="post" enctype="multipart/form-data">
+<p><label>אתר: <select name="site_id" required>
+{% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
+<p><label>תפקיד במערכת לכל השורות בקובץ: <select name="role" required>
+{% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select></label></p>
+<p><input type="file" name="file" accept=".xlsx" required></p>
+<button>ייבוא</button></form>
+<p class="note">להעלות בנפרד את בעלי הדירות (תפקיד: בעלי דירות) ואת היועצים (תפקיד: יועצים). מי שכבר קיים מעודכן ולא מוכפל.</p>""",
+                url_for=url_for, sites=all_sites, roles=list(ROLE_READ.keys()))
 
 
 @app.route("/sites/<int:site_id>")
