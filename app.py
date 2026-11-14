@@ -1,0 +1,1039 @@
+"""MVP skeleton: sites, contacts, protocol import with approval, tasks, outbox."""
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import uuid
+
+import openpyxl
+from flask import Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from protocol_parser import extract_rows, extract_supervision_items
+
+DB_PATH = os.environ.get("APP_DB", os.path.join(os.path.dirname(__file__), "app.db"))
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sites (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT,
+  land_date TEXT, delivery_date TEXT, months_total INTEGER, contract_ref TEXT,
+  digest_time TEXT DEFAULT '08:00', weekly_day TEXT DEFAULT 'ראשון'
+);
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, first_name TEXT, last_name TEXT,
+  role TEXT, org TEXT, phone TEXT, mobile TEXT, address TEXT, short_name TEXT,
+  pref_channel TEXT DEFAULT 'whatsapp', is_consultant INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS memberships (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, contact_id INTEGER NOT NULL,
+  site_role TEXT NOT NULL, permission TEXT, notify_freq TEXT,
+  UNIQUE(site_id, contact_id, site_role)
+);
+CREATE TABLE IF NOT EXISTS meetings (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, kind TEXT NOT NULL,
+  meeting_date TEXT, source_name TEXT, month_current INTEGER, month_total INTEGER,
+  status TEXT DEFAULT 'draft', staged_rows TEXT
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, public_no TEXT NOT NULL,
+  topic_no TEXT, topic TEXT, text TEXT, assignee_text TEXT,
+  status TEXT DEFAULT 'פתוחה', target_text TEXT, target_date TEXT,
+  last_meeting_id INTEGER, UNIQUE(site_id, public_no)
+);
+CREATE TABLE IF NOT EXISTS task_targets (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, target_text TEXT, meeting_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS task_assignments (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, contact_id INTEGER NOT NULL,
+  raw_name TEXT, confirmed INTEGER DEFAULT 0, UNIQUE(task_id, contact_id)
+);
+CREATE TABLE IF NOT EXISTS outbox (
+  id INTEGER PRIMARY KEY, site_id INTEGER, contact_id INTEGER, channel TEXT,
+  body TEXT, mode TEXT DEFAULT 'מיידי', status TEXT DEFAULT 'queued', created TEXT
+);
+CREATE TABLE IF NOT EXISTS admin_queue (
+  id INTEGER PRIMARY KEY, site_id INTEGER, meeting_id INTEGER, item_json TEXT,
+  reason TEXT, status TEXT DEFAULT 'פתוח', created TEXT
+);
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, topic TEXT NOT NULL, text TEXT NOT NULL,
+  decided_on TEXT, source TEXT, created TEXT
+);
+CREATE TABLE IF NOT EXISTS supervision_items (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, report_date TEXT, item_no TEXT,
+  text TEXT, photo TEXT, UNIQUE(site_id, report_date, item_no)
+);
+CREATE TABLE IF NOT EXISTS plans (
+  id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
+  file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
+);
+CREATE TABLE IF NOT EXISTS stage_status (
+  site_id INTEGER NOT NULL, level TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+  PRIMARY KEY(site_id, level, stage)
+);
+"""
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("APP_SECRET", "dev-only")
+
+
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+
+@app.teardown_appcontext
+def _close(_):
+    d = g.pop("db", None)
+    if d:
+        d.close()
+
+
+def init_db():
+    c = sqlite3.connect(DB_PATH)
+    c.executescript(SCHEMA)
+    for stmt in ("ALTER TABLE memberships ADD COLUMN notify_freq TEXT",
+                 "ALTER TABLE sites ADD COLUMN digest_time TEXT DEFAULT '08:00'",
+                 "ALTER TABLE sites ADD COLUMN weekly_day TEXT DEFAULT 'ראשון'",
+                 "ALTER TABLE outbox ADD COLUMN mode TEXT DEFAULT 'מיידי'",
+                 "ALTER TABLE contacts ADD COLUMN password_hash TEXT",
+                 "ALTER TABLE contacts ADD COLUMN is_admin INTEGER DEFAULT 0",
+                 "ALTER TABLE sites ADD COLUMN levels TEXT",
+                 "ALTER TABLE sites ADD COLUMN stages TEXT"):
+        try:
+            c.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    c.commit()
+    c.close()
+
+
+# ---------- dates & priority ----------
+_DATE = re.compile(r"^(\d{1,2})[./](\d{1,2})[./](\d{2,4})$")
+
+
+def parse_date(text):
+    m = _DATE.match((text or "").strip())
+    if not m:
+        return None
+    d, mth, y = (int(x) for x in m.groups())
+    if y < 100:
+        y += 2000
+    try:
+        return dt.date(y, mth, d).isoformat()
+    except ValueError:
+        return None
+
+
+_ANY_DATE = re.compile(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}")
+
+
+def current_target_date(text):
+    """A target field may hold several dates: each protocol that carried the task
+    left its estimate here. The last date is the current estimate; the rest is history."""
+    dates = [parse_date(d) for d in _ANY_DATE.findall(text or "")]
+    dates = [d for d in dates if d]
+    return dates[-1] if dates else None
+
+
+def priority_of(task, today=None):
+    """0 = top. Overdue or 'מיידי' tasks come first while still open."""
+    if task["status"] == "בוצע":
+        return 9
+    today = today or dt.date.today().isoformat()
+    if task["target_date"] and task["target_date"] < today:
+        return 0
+    if (task["target_text"] or "").strip() == "מיידי":
+        return 1
+    return 2
+
+
+# ---------- importers ----------
+def import_contacts(path, site_id=None):
+    ws = openpyxl.load_workbook(path, data_only=True).active
+    rows = list(ws.iter_rows(values_only=True))
+    header = [str(h or "").strip() for h in rows[0]]
+    col = {h: i for i, h in enumerate(header)}
+    added = 0
+    for r in rows[1:]:
+        email = str(r[col['דוא"ל']] or "").strip().lower() if 'דוא"ל' in col else ""
+        if not email:
+            continue
+        def g_(name):
+            i = col.get(name)
+            return str(r[i]).strip() if i is not None and r[i] not in (None, "") else ""
+        db().execute(
+            """INSERT INTO contacts(email, first_name, last_name, role, org, phone, mobile, address)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(email) DO UPDATE SET
+                 first_name=COALESCE(NULLIF(contacts.first_name,''), excluded.first_name),
+                 last_name=COALESCE(NULLIF(contacts.last_name,''), excluded.last_name),
+                 role=COALESCE(NULLIF(contacts.role,''), excluded.role),
+                 org=COALESCE(NULLIF(contacts.org,''), excluded.org),
+                 phone=COALESCE(NULLIF(contacts.phone,''), excluded.phone),
+                 mobile=COALESCE(NULLIF(contacts.mobile,''), excluded.mobile),
+                 address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
+            (email, g_("שם פרטי"), g_("שם משפחה"), g_("תפקיד"), g_("ארגון"),
+             g_("טלפון"), g_("טלפון נייד"), g_("כתובת")))
+        added += 1
+    db().commit()
+    return added
+
+
+def _words(text):
+    return set(re.findall(r"[\w\u0590-\u05FF]{2,}", (text or "").replace('"', "")))
+
+
+def same_task(existing, row):
+    """Same public number is not enough: numbers restart in every meeting.
+    Treat it as the same task only when the topic matches and the wording overlaps."""
+    ta, tb = _words(existing["topic"]), _words(row.get("topic"))
+    if ta and tb and not (ta & tb):  # topic column is free text; share at least one word
+        return False
+    a, b = _words(existing["text"]), _words(row.get("task"))
+    if len(a) < 4 or len(b) < 4:  # too short to tell apart: never guess
+        return False
+    return len(a & b) / max(len(a), len(b)) >= 0.4
+
+
+def to_queue(site_id, meeting_id, row, reason):
+    db().execute(
+        "INSERT INTO admin_queue(site_id, meeting_id, item_json, reason, created) VALUES (?,?,?,?,?)",
+        (site_id, meeting_id, json.dumps(row, ensure_ascii=False), reason,
+         dt.datetime.now().isoformat(timespec="minutes")))
+
+
+def publish_meeting(meeting_id):
+    """Publish approved rows. Anything the system cannot match with confidence goes to
+    the admin queue instead of being guessed. Rows are processed in meeting-date order."""
+    m = db().execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
+    site_id = m["site_id"]
+    rows = [r for r in json.loads(m["staged_rows"] or "[]") if not r.get("skip")]
+
+    def key(r):
+        d = r.get("meeting_date") or ""
+        try:
+            return dt.datetime.strptime(d, "%d.%m.%y")
+        except ValueError:
+            return dt.datetime.min
+    rows.sort(key=key)
+
+    published, queued = [], []
+    used = set()  # (task, protocol date): one task appears at most once per protocol
+    for r in rows:
+        number = str(r["number"]).strip()
+        if r.get("flags"):
+            to_queue(site_id, meeting_id, r, "; ".join(r["flags"]))
+            queued.append(number)
+            continue
+        # Numbers restart in every meeting, so identity comes from content, not from the number.
+        day = r.get("meeting_date")
+        candidates = [t for t in db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+                      if (t["id"], day) not in used]
+        hits = [t for t in candidates if same_task(t, r)]
+        if len(hits) > 1:
+            to_queue(site_id, meeting_id, r, "התאמה מרובה למשימות קיימות - לאשר לאיזו משימה זה שייך")
+            queued.append(number)
+            continue
+        match = hits[0] if hits else None
+        target_date = current_target_date(r["target"])
+        if match is None:
+            base = f"{r.get('meeting_date') or m['id']}#{number}"
+            public = base
+            n = 2
+            while db().execute("SELECT 1 FROM tasks WHERE site_id=? AND public_no=?", (site_id, public)).fetchone():
+                public = f"{base}-{n}"
+                n += 1
+            cur = db().execute(
+                """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
+                       target_text, target_date, last_meeting_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (site_id, public, r["number"], r["topic"], r["task"], r["assignee"],
+                 r["target"], target_date, meeting_id))
+            task_id = cur.lastrowid
+        else:
+            task_id = match["id"]
+            if match["target_text"] != r["target"]:  # new estimate from this protocol
+                db().execute(
+                    "UPDATE tasks SET target_text=?, target_date=?, last_meeting_id=? WHERE id=?",
+                    (r["target"], target_date, meeting_id, task_id))
+        db().execute("INSERT INTO task_targets(task_id, target_text, meeting_id) VALUES (?,?,?)",
+                     (task_id, r["target"], meeting_id))
+        if re.search(r"(^|\s)בוצע$", (r.get("target") or "").strip()):  # 'בוצע' or 'dd.mm.yy בוצע'
+            db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (task_id,))
+        published.append(task_id)
+        used.add((task_id, day))
+
+    # Decisions written in a protocol ('החלטה') are stored by topic, once per text and date.
+    for r in rows:
+        if "החלטה" in (r.get("target") or ""):
+            topic = r.get("subject") or r.get("topic") or "כללי"
+            day = r.get("meeting_date") or ""
+            exists = db().execute("SELECT 1 FROM decisions WHERE site_id=? AND text=? AND decided_on=?",
+                                  (site_id, r["task"], day)).fetchone()
+            if not exists:
+                db().execute(
+                    "INSERT INTO decisions(site_id, topic, text, decided_on, source, created) VALUES (?,?,?,?,?,?)",
+                    (site_id, topic, r["task"], day, "פרוטוקול", dt.datetime.now().isoformat(timespec="minutes")))
+
+    # Done by removal: only for full protocols, only tasks that were in this protocol's
+    # listing and are missing from it. Tasks matched into the queue are not closed.
+    if m["kind"] in ("ביצוע", "שבועית"):
+        listed_ids = set(published)
+        # only tasks from the same kind of protocol: a weekly report does not close execution items
+        gone = db().execute(
+            """SELECT t.id FROM tasks t JOIN meetings lm ON lm.id = t.last_meeting_id
+               WHERE t.site_id=? AND t.status!='בוצע' AND lm.kind=? AND t.last_meeting_id != ?""",
+            (site_id, m["kind"], meeting_id)).fetchall()
+        for t in gone:
+            if t["id"] not in listed_ids:
+                db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (t["id"],))
+    for task_id in published:
+        suggest_assignees(task_id)
+    db().execute("UPDATE meetings SET status='published' WHERE id=?", (meeting_id,))
+    db().commit()
+    return {"published": len(published), "queued": len(queued)}
+
+
+# ---------- notifications (queued; provider adapter attaches later) ----------
+# Membership frequency wins over system defaults:
+#   'מיידי' / 'יומי' / 'שבועי' = receive, delivered now / in a daily or weekly digest
+#   'כבוי'                     = receive nothing, even if the system would send
+#   None                       = system default (supervisors get the site's default schedule)
+# Every message without an explicit 'מיידי' goes out at the site's default time
+# (sites.digest_time, weekly_day for 'שבועי').
+SUPERVISOR_ROLES = ("מפקח", "מנהל מערכת")
+FREQS = ("מיידי", "יומי", "שבועי", "כבוי")
+
+
+def recipients_for_event(site_id):
+    rows = db().execute(
+        """SELECT m.notify_freq, m.site_role, c.* FROM memberships m
+           JOIN contacts c ON c.id = m.contact_id WHERE m.site_id=?""", (site_id,)).fetchall()
+    out = []
+    for r in rows:
+        if r["notify_freq"] == "כבוי":
+            continue
+        if r["notify_freq"]:
+            out.append((r, r["notify_freq"]))
+        elif r["site_role"] in SUPERVISOR_ROLES:
+            out.append((r, "יומי"))  # site default: goes out at the site's digest time
+    return out
+
+
+# Development phase: every outgoing message (updates, reminders, FYI) goes to the
+# developer instead of the real stakeholder. The intended recipient is kept in the text.
+DEV_MODE = os.environ.get("APP_DEV_MODE", "1") == "1"
+DEV_EMAIL = os.environ.get("APP_DEV_EMAIL", "zeeval@gmail.com")
+DEV_MOBILE = os.environ.get("APP_DEV_MOBILE", "054-5700906")  # kept for when WhatsApp is connected
+
+
+def dev_contact():
+    """The one recipient that receives everything while the system is in development:
+    the owner's mobile (WhatsApp) when set, otherwise the owner's email."""
+    row = db().execute("SELECT * FROM contacts WHERE email=?", (DEV_EMAIL,)).fetchone()
+    if row is None:
+        db().execute(
+            "INSERT INTO contacts(email, first_name, last_name, role, is_consultant, pref_channel, mobile) "
+            "VALUES (?,?,?,?,0,'whatsapp',?)", (DEV_EMAIL, "בעל הפרויקט", "", "בדיקות", DEV_MOBILE))
+        db().commit()
+    elif DEV_MOBILE and row["mobile"] != DEV_MOBILE:
+        db().execute("UPDATE contacts SET mobile=?, pref_channel='whatsapp' WHERE id=?",
+                     (DEV_MOBILE, row["id"]))
+        db().commit()
+    return db().execute("SELECT * FROM contacts WHERE email=?", (DEV_EMAIL,)).fetchone()
+
+
+def enqueue(site_id, contact, body, mode):
+    if DEV_MODE:
+        intended = f"{contact['first_name']} {contact['last_name']}".strip() or contact["email"]
+        body = f"[פיתוח - במקור אל: {intended}] {body}"
+        contact = dev_contact()
+    if DEV_MODE:
+        channel = "email"  # until WhatsApp is connected, development messages go to the owner's email
+    else:
+        channel = "email" if contact["is_consultant"] else (contact["pref_channel"] or "whatsapp")
+    db().execute(
+        "INSERT INTO outbox(site_id, contact_id, channel, body, mode, created) VALUES (?,?,?,?,?,?)",
+        (site_id, contact["id"], channel, body, mode, dt.datetime.now().isoformat(timespec="minutes")))
+
+
+def notify_task_event(task, text):
+    for contact, mode in recipients_for_event(task["site_id"]):
+        enqueue(task["site_id"], contact, text, mode)
+    db().commit()
+
+
+def notify_supervisors_task_handled(task, by_name, new_status):
+    text = (f"משימה {task['public_no']} ({task['topic'] or 'ללא נושא'}): {task['text'][:120]} "
+            f"- עודכנה לסטטוס '{new_status}' על ידי {by_name}.")
+    notify_task_event(task, text)
+
+
+def send_task_reminders(site_id, today=None):
+    """Queue reminders for open tasks that are overdue or due within a day (site default time)."""
+    today = today or dt.date.today()
+    limit = (today + dt.timedelta(days=1)).isoformat()
+    tasks = db().execute(
+        """SELECT * FROM tasks WHERE site_id=? AND status!='בוצע'
+           AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
+    for t in tasks:
+        when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
+        text = (f"תזכורת: משימה {t['public_no']} ({t['topic'] or 'ללא נושא'}): {t['text'][:120]} - {when}.")
+        # reminders go to the site's recipients (by their settings) and to the confirmed assignees
+        assignees = db().execute(
+            """SELECT c.* FROM task_assignments a JOIN contacts c ON c.id = a.contact_id
+               WHERE a.task_id=? AND a.confirmed=1""", (t["id"],)).fetchall()
+        seen = set()
+        for contact, mode in recipients_for_event(site_id):
+            seen.add(contact["id"])
+            enqueue(site_id, contact, text, mode)
+        for a in assignees:
+            if a["id"] not in seen:
+                enqueue(site_id, a, text, "יומי")  # site default schedule
+                seen.add(a["id"])
+    db().commit()
+
+
+def digest(site_id, mode):
+    """Bundle queued messages of one frequency per recipient (run by a daily or weekly job)."""
+    rows = db().execute(
+        "SELECT contact_id, body FROM outbox WHERE site_id=? AND mode=? AND status='queued' ORDER BY id",
+        (site_id, mode)).fetchall()
+    bundles = {}
+    for r in rows:
+        bundles.setdefault(r["contact_id"], []).append(r["body"])
+    return {cid: "\n".join(items) for cid, items in bundles.items()}
+
+
+WEEKDAYS = ("ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת")
+_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+@app.route("/sites/<int:site_id>/schedule", methods=["POST"])
+def site_schedule(site_id):
+    """Site-wide default for scheduled (daily / weekly) messages."""
+    t = request.form.get("digest_time", "08:00")
+    d = request.form.get("weekly_day", "ראשון")
+    if not _TIME.match(t) or d not in WEEKDAYS:
+        abort(400)
+    db().execute("UPDATE sites SET digest_time=?, weekly_day=? WHERE id=?", (t, d, site_id))
+    db().commit()
+    return redirect(url_for("site_view", site_id=site_id))
+
+
+def digest_slots(site):
+    """When the scheduled digests of a site go out: daily at digest_time, weekly on weekly_day."""
+    return {"יומי": f"כל יום ב-{site['digest_time']}",
+            "שבועי": f"כל {site['weekly_day']} ב-{site['digest_time']}"}
+
+
+@app.route("/memberships/<int:membership_id>/freq", methods=["POST"])
+def membership_freq(membership_id):
+    freq = request.form.get("freq") or None
+    if freq not in (None, *FREQS):
+        abort(400)
+    db().execute("UPDATE memberships SET notify_freq=? WHERE id=?", (freq, membership_id))
+    db().commit()
+    return ("", 204)
+
+
+ADMIN_QUEUE_PAGE = """<!doctype html><html dir="rtl" lang="he"><head><meta charset="utf-8">
+<title>תור מנהל מערכת</title>
+<style>body{font-family:Arial;background:#fff;color:#222}h1{color:#C62828}
+table{border-collapse:collapse;width:100%}th{background:#F2F2F2;color:#6B6B6B}
+td,th{border:1px solid #ddd;padding:6px;vertical-align:top}tr.open td{background:#FBE9E9}
+button{background:#C62828;color:#fff;border:0;padding:4px 10px}</style></head><body>
+<h1>תור מנהל מערכת</h1>
+<p>שורות שהמערכת לא זיהתה בוודאות. לא נשמרו כמשימות עד לטיפול.</p>
+<table><tr><th>מזהה</th><th>סיבה</th><th>מספר</th><th>נושא</th><th>משימה</th><th>יעד</th><th>פעולה</th></tr>
+{% for q in items %}<tr class="open"><td>{{ q['id'] }}</td><td>{{ q['reason'] }}</td><td>{{ q['num'] }}</td>
+<td>{{ q['topic'] }}</td><td>{{ q['task'] }}</td><td>{{ q['target'] }}</td>
+<td><form method="post" action="{{ url_for('admin_queue_resolve', qid=q['id']) }}">
+<button name="action" value="new">הוסף כמשימה חדשה</button> <button name="action" value="drop">סגור בלי יצירה</button>
+</form></td></tr>{% else %}<tr><td colspan="7">אין פריטים פתוחים</td></tr>{% endfor %}
+</table></body></html>"""
+
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+SECTION_NAV = """<p><a href="{{ url_for('site_view', site_id=site_id) }}">חזרה לאתר</a> |
+<a href="{{ url_for('decisions_view', site_id=site_id) }}">החלטות</a> |
+<a href="{{ url_for('supervision_view', site_id=site_id) }}">דוחות פיקוח</a> |
+<a href="{{ url_for('plans_view', site_id=site_id) }}">תוכניות</a> |
+<a href="{{ url_for('progress_view', site_id=site_id) }}">התקדמות</a></p>"""
+PAGE_CSS = """<meta charset="utf-8"><style>
+body{font-family:Arial;color:#222;background:#fff}h1,h2{color:#C62828}
+table{border-collapse:collapse;width:100%}th{background:#F2F2F2;color:#6B6B6B}
+td,th{border:1px solid #ddd;padding:6px;vertical-align:top}
+button{background:#C62828;color:#fff;border:0;padding:6px 12px}
+input,textarea,select{padding:4px;margin:2px}
+</style>"""
+
+
+@app.route("/sites/<int:site_id>/decisions", methods=["GET", "POST"])
+def decisions_view(site_id):
+    if request.method == "POST":
+        topic = (request.form.get("topic") or "").strip()
+        text = (request.form.get("text") or "").strip()
+        if topic and text:
+            db().execute(
+                "INSERT INTO decisions(site_id, topic, text, decided_on, source, created) VALUES (?,?,?,?,?,?)",
+                (site_id, topic, text, (request.form.get("decided_on") or "").strip(),
+                 "ידני", dt.datetime.now().isoformat(timespec="minutes")))
+            db().commit()
+        return redirect(url_for("decisions_view", site_id=site_id))
+    rows = db().execute("SELECT * FROM decisions WHERE site_id=? ORDER BY topic, id", (site_id,)).fetchall()
+    return render_template_string(
+        PAGE_CSS + "<h1>החלטות לפי נושא</h1>" + SECTION_NAV + """
+<table><tr><th>נושא</th><th>החלטה</th><th>תאריך</th><th>מקור</th></tr>
+{% for r in rows %}<tr><td>{{ r['topic'] }}</td><td>{{ r['text'] }}</td><td>{{ r['decided_on'] }}</td><td>{{ r['source'] }}</td></tr>
+{% else %}<tr><td colspan="4">אין החלטות עדיין</td></tr>{% endfor %}</table>
+<h2>החלטה חדשה</h2>
+<form method="post"><input name="topic" placeholder="נושא (למשל חשמל)" required>
+<input name="text" placeholder="ההחלטה" required size="60">
+<input name="decided_on" placeholder="תאריך (dd.mm.yy)"><button>שמור</button></form>""",
+        rows=rows, site_id=site_id)
+
+
+@app.route("/sites/<int:site_id>/supervision", methods=["GET", "POST"])
+def supervision_view(site_id):
+    if request.method == "POST":
+        f = request.files.get("file")
+        report_date = (request.form.get("report_date") or "").strip()
+        if f and report_date:
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                f.save(tmp.name)
+            try:
+                for it in extract_supervision_items(tmp.name):
+                    db().execute(
+                        """INSERT OR REPLACE INTO supervision_items(site_id, report_date, item_no, text, photo)
+                           VALUES (?,?,?,?,?)""",
+                        (site_id, report_date, it["item_no"], it["text"], it["photo"]))
+            finally:
+                os.unlink(tmp.name)
+            db().commit()
+        return redirect(url_for("supervision_view", site_id=site_id))
+    rows = db().execute(
+        "SELECT * FROM supervision_items WHERE site_id=? ORDER BY report_date, CAST(item_no AS INTEGER)",
+        (site_id,)).fetchall()
+    return render_template_string(
+        PAGE_CSS + "<h1>דוחות פיקוח</h1>" + SECTION_NAV + """
+<table><tr><th>תאריך דוח</th><th>פריט</th><th>תיאור</th><th>תמונה</th></tr>
+{% for r in rows %}<tr><td>{{ r['report_date'] }}</td><td>{{ r['item_no'] }}</td>
+<td>{{ r['text'] }}</td><td>{{ r['photo'] }}</td></tr>
+{% else %}<tr><td colspan="4">אין דוחות עדיין</td></tr>{% endfor %}</table>
+<h2>העלאת דוח פיקוח</h2>
+<form method="post" enctype="multipart/form-data">
+<input type="file" name="file" accept="application/pdf" required>
+<input name="report_date" placeholder="תאריך הדוח (dd.mm.yy)" required>
+<button>העלה</button></form>""",
+        rows=rows, site_id=site_id)
+
+
+@app.route("/sites/<int:site_id>/plans", methods=["GET", "POST"])
+def plans_view(site_id):
+    if request.method == "POST":
+        f = request.files.get("file")
+        title = (request.form.get("title") or "").strip()
+        if f and title:
+            os.makedirs(os.path.join(UPLOAD_DIR, str(site_id)), exist_ok=True)
+            ext = os.path.splitext(f.filename or "")[1].lower()
+            stored = os.path.join(str(site_id), f"{uuid.uuid4().hex}{ext}")
+            f.save(os.path.join(UPLOAD_DIR, stored))
+            db().execute(
+                """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (site_id, title, (request.form.get("version") or "").strip(), stored, f.filename,
+                 dt.datetime.now().isoformat(timespec="minutes")))
+            db().commit()
+        return redirect(url_for("plans_view", site_id=site_id))
+    rows = db().execute("SELECT * FROM plans WHERE site_id=? ORDER BY title, id", (site_id,)).fetchall()
+    return render_template_string(
+        PAGE_CSS + "<h1>תוכניות וגרסאות</h1>" + SECTION_NAV + """
+<table><tr><th>שם</th><th>גרסה</th><th>קובץ מקורי</th><th>הועלה</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r['title'] }}</td><td>{{ r['version'] }}</td><td>{{ r['original_name'] }}</td>
+<td>{{ r['uploaded_at'] }}</td><td><a href="{{ url_for('plan_file', plan_id=r['id']) }}">הורדה</a></td></tr>
+{% else %}<tr><td colspan="5">אין תוכניות עדיין</td></tr>{% endfor %}</table>
+<h2>תוכנית חדשה</h2>
+<form method="post" enctype="multipart/form-data">
+<input name="title" placeholder="שם התוכנית (למשל חתך א-א)" required>
+<input name="version" placeholder="גרסה">
+<input type="file" name="file" required><button>העלה</button></form>""",
+        rows=rows, site_id=site_id)
+
+
+@app.route("/plans/<int:plan_id>/file")
+def plan_file(plan_id):
+    r = db().execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+    if r is None:
+        abort(404)
+    return send_from_directory(UPLOAD_DIR, r["file_path"], as_attachment=True,
+                               download_name=r["original_name"] or "plan")
+
+
+# ---------- access: login and roles per site ----------
+# Roles on a site (memberships.site_role) and what each may read or change.
+# Assumption to confirm with the owner: owners do not see supervision reports.
+ROLE_READ = {
+    "מפקח": {"tasks", "decisions", "supervision", "plans", "protocols", "progress"},
+    "יזם": {"tasks", "decisions", "supervision", "plans", "progress"},
+    "נציגות": {"tasks", "decisions", "supervision", "plans", "progress"},
+    "בעלי דירות": {"tasks", "decisions", "plans", "progress"},
+    "יועצים": {"tasks", "decisions", "plans", "progress"},
+    "קבלן": {"tasks", "plans", "progress"},
+}
+ROLE_WRITE = {
+    "מפקח": {"tasks", "decisions", "supervision", "plans", "protocols", "progress"},
+    "יזם": {"decisions"},
+    "נציגות": {"decisions"},
+    "יועצים": {"plans"},
+}
+
+# endpoint -> section it belongs to; endpoints not listed are administrator-only
+SECTION_OF = {
+    "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
+    "decisions_view": "decisions",
+    "supervision_view": "supervision",
+    "plans_view": "plans", "plan_file": "plans",
+    "meeting_upload": "protocols", "meeting_review": "protocols",
+    "progress_view": "progress", "progress_save": "progress",
+}
+PUBLIC_ENDPOINTS = {"login", "logout", "static"}
+
+
+def current_contact():
+    if "cid" not in session:
+        return None
+    if "_me" not in g:
+        g._me = db().execute("SELECT * FROM contacts WHERE id=?", (session["cid"],)).fetchone()
+    return g._me
+
+
+def roles_on_site(contact, site_id):
+    rows = db().execute("SELECT site_role FROM memberships WHERE site_id=? AND contact_id=?",
+                        (site_id, contact["id"])).fetchall()
+    return {r["site_role"] for r in rows}
+
+
+@app.before_request
+def require_access():
+    endpoint = request.endpoint
+    if endpoint in PUBLIC_ENDPOINTS or endpoint is None:
+        return None
+    me = current_contact()
+    if me is None:
+        return redirect(url_for("login"))
+    if me["is_admin"]:
+        return None
+    section = SECTION_OF.get(endpoint)
+    if section is None:
+        abort(403)  # administrator-only screen
+    site_id = (request.view_args or {}).get("site_id")
+    if site_id is None:
+        # tasks and plan files: find the site from the record
+        if "task_id" in (request.view_args or {}):
+            row = db().execute("SELECT site_id FROM tasks WHERE id=?", (request.view_args["task_id"],)).fetchone()
+            site_id = row["site_id"] if row else None
+        elif "plan_id" in (request.view_args or {}):
+            row = db().execute("SELECT site_id FROM plans WHERE id=?", (request.view_args["plan_id"],)).fetchone()
+            site_id = row["site_id"] if row else None
+        elif "meeting_id" in (request.view_args or {}):
+            row = db().execute("SELECT site_id FROM meetings WHERE id=?", (request.view_args["meeting_id"],)).fetchone()
+            site_id = row["site_id"] if row else None
+    if site_id is None:
+        abort(404)
+    roles = roles_on_site(me, site_id)
+    allowed = (ROLE_WRITE if request.method == "POST" else ROLE_READ)
+    if not any(section in allowed.get(r, set()) for r in roles):
+        abort(403)
+    return None
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        pw = request.form.get("password") or ""
+        row = db().execute("SELECT * FROM contacts WHERE lower(email)=?", (email,)).fetchone()
+        if row and row["password_hash"] and check_password_hash(row["password_hash"], pw):
+            session["cid"] = row["id"]
+            m = db().execute("SELECT site_id FROM memberships WHERE contact_id=? LIMIT 1", (row["id"],)).fetchone()
+            if m is not None:
+                return redirect(url_for("site_view", site_id=m["site_id"]))
+            return redirect(url_for("sites"))
+        error = "פרטי ההתחברות שגויים"
+    return render_template_string(
+        PAGE_CSS + """<h1>כניסה</h1><p style="color:#C62828">{{ error }}</p>
+<form method="post"><input name="email" placeholder="דוא״ל" required>
+<input name="password" type="password" placeholder="סיסמה" required>
+<button>כניסה</button></form>""", error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.pop("cid", None)
+    return redirect(url_for("login"))
+
+
+def set_password_cli(email, password):
+    init_db()
+    c = sqlite3.connect(DB_PATH)
+    cur = c.execute("UPDATE contacts SET password_hash=? WHERE lower(email)=?",
+                    (generate_password_hash(password), email.strip().lower()))
+    c.commit()
+    print("updated" if cur.rowcount else "no such contact")
+
+
+DEFAULT_STAGES = ["הריסה", "שורינג", "חפירה", "שלד", "מפגשי חזית", "אקוסטיקה",
+                  "בניין ירוק", "אינסטלציה", "תשתיות חלשות"]  # from the spec; to be confirmed per site
+STATUS_OPTIONS = ("לא התחיל", "בביצוע", "הושלם")
+STATUS_BG = {"לא התחיל": "#FFFFFF", "בביצוע": "#FBE9E9", "הושלם": "#F2F2F2"}
+
+
+def site_levels_stages(site):
+    levels = [x.strip() for x in (site["levels"] or "").splitlines() if x.strip()]
+    stages = [x.strip() for x in (site["stages"] or "").splitlines() if x.strip()] or DEFAULT_STAGES
+    return levels, stages
+
+
+@app.route("/sites/<int:site_id>/progress", methods=["GET", "POST"])
+def progress_view(site_id):
+    site = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+    if site is None:
+        abort(404)
+    if request.method == "POST":
+        if request.form.get("action") == "config":
+            db().execute("UPDATE sites SET levels=?, stages=? WHERE id=?",
+                         (request.form.get("levels", ""), request.form.get("stages", ""), site_id))
+        else:
+            level = request.form.get("level", "")
+            stage = request.form.get("stage", "")
+            status = request.form.get("status", "")
+            if status in STATUS_OPTIONS and level and stage:
+                db().execute("INSERT OR REPLACE INTO stage_status(site_id, level, stage, status) VALUES (?,?,?,?)",
+                             (site_id, level, stage, status))
+        db().commit()
+        return redirect(url_for("progress_view", site_id=site_id))
+    site = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+    levels, stages = site_levels_stages(site)
+    cells = {(r["level"], r["stage"]): r["status"] for r in db().execute(
+        "SELECT level, stage, status FROM stage_status WHERE site_id=?", (site_id,)).fetchall()}
+    writable = request.method == "GET"
+    return render_template_string(
+        PAGE_CSS + "<h1>התקדמות לפי קומה ושלב</h1>" + SECTION_NAV + """
+{% if not levels %}<p>עדיין לא הוגדרו קומות. הגדר אותן למטה, שורה לכל קומה.</p>{% endif %}
+<table><tr><th>קומה \\ שלב</th>{% for s in stages %}<th>{{ s }}</th>{% endfor %}</tr>
+{% for l in levels %}<tr><th>{{ l }}</th>
+{% for s in stages %}{% set st = cells.get((l, s), 'לא התחיל') %}
+<td style="background:{{ bg[st] }}"><form method="post">
+<input type="hidden" name="level" value="{{ l }}"><input type="hidden" name="stage" value="{{ s }}">
+<select name="status" onchange="this.form.submit()">{% for o in options %}
+<option {% if o == st %}selected{% endif %}>{{ o }}</option>{% endfor %}</select></form></td>
+{% endfor %}</tr>{% endfor %}</table>
+<h2>הגדרות האתר</h2>
+<form method="post"><input type="hidden" name="action" value="config">
+<p>קומות (שורה לכל קומה):</p><textarea name="levels" rows="6" cols="30">{{ site['levels'] or '' }}</textarea>
+<p>שלבים (שורה לכל שלב, ריק = ברירת המחדל):</p><textarea name="stages" rows="9" cols="30">{{ site['stages'] or '' }}</textarea>
+<p><button>שמור הגדרות</button></p></form>""",
+        levels=levels, stages=stages, cells=cells, bg=STATUS_BG, options=STATUS_OPTIONS, site=site,
+        site_id=site_id)
+
+
+@app.route("/admin/queue")
+def admin_queue():
+    rows = db().execute("SELECT * FROM admin_queue WHERE status='פתוח' ORDER BY id").fetchall()
+    items = []
+    for r in rows:
+        d = json.loads(r["item_json"])
+        items.append({"id": r["id"], "reason": r["reason"], "num": d.get("number", ""),
+                      "topic": d.get("topic", ""), "task": d.get("task", ""), "target": d.get("target", "")})
+    return render_template_string(ADMIN_QUEUE_PAGE, items=items)
+
+
+@app.route("/admin/queue/<int:qid>/resolve", methods=["POST"])
+def admin_queue_resolve(qid):
+    """action 'new': the row becomes a new task. action 'drop': the row is left out."""
+    q = db().execute("SELECT * FROM admin_queue WHERE id=? AND status='פתוח'", (qid,)).fetchone()
+    if q is None:
+        abort(404)
+    if request.form.get("action") == "new":
+        r = json.loads(q["item_json"])
+        day = r.get("meeting_date") or ""
+        base = f"{day or q['meeting_id']}#{r['number']}"
+        public, n = base, 2
+        while db().execute("SELECT 1 FROM tasks WHERE site_id=? AND public_no=?", (q["site_id"], public)).fetchone():
+            public, n = f"{base}-{n}", n + 1
+        db().execute(
+            """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
+                   target_text, target_date, last_meeting_id) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (q["site_id"], public, r["number"], r["topic"], r["task"], r["assignee"],
+             r["target"], current_target_date(r["target"]), q["meeting_id"]))
+        new_id = db().execute("SELECT id FROM tasks WHERE site_id=? AND public_no=?",
+                              (q["site_id"], public)).fetchone()["id"]
+        db().execute("INSERT INTO task_targets(task_id, target_text, meeting_id) VALUES (?,?,?)",
+                     (new_id, r["target"], q["meeting_id"]))
+        suggest_assignees(new_id)
+        status = "נוצרה משימה"
+    else:
+        status = "נסגר בלי יצירה"
+    db().execute("UPDATE admin_queue SET status=? WHERE id=?", (status, qid))
+    db().commit()
+    return redirect(url_for("admin_queue"))
+
+
+@app.route("/tasks/<int:task_id>/status", methods=["POST"])
+def task_status(task_id):
+    t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    new_status = request.form["status"]
+    by_name = request.form.get("by", "לא צוין")
+    db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, task_id))
+    db().commit()
+    if new_status != "פתוחה":
+        notify_supervisors_task_handled(t, by_name, new_status)
+    return redirect(url_for("site_view", site_id=t["site_id"]))
+
+
+# ---------- assignee linking: text in 'לטיפול' -> contacts (supervisor confirms) ----------
+def _full_names(site_id):
+    rows = db().execute(
+        """SELECT DISTINCT c.id, c.first_name, c.last_name FROM memberships m
+           JOIN contacts c ON c.id = m.contact_id WHERE m.site_id=?""", (site_id,)).fetchall()
+    return rows
+
+
+def suggest_assignees(task_id):
+    """Find contacts of the site whose name appears in the task's 'לטיפול' text.
+    Matches full name first, then first name plus last initial ('ליאור י'). Nothing is
+    linked until the supervisor confirms."""
+    t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    text = t["assignee_text"] or ""
+    found = []
+    for c in _full_names(t["site_id"]):
+        first, last = (c["first_name"] or "").strip(), (c["last_name"] or "").strip()
+        if not first:
+            continue
+        candidates = []
+        if last:
+            candidates.append(f"{first} {last}")
+            candidates.append(f"{first} {last[:1]}")
+        candidates.append(first)
+        for cand in candidates:
+            if re.search(rf"(?<!\S){re.escape(cand)}(?!\S)", text):
+                found.append((c["id"], cand))
+                break
+    for cid, raw in found:
+        db().execute(
+            "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name) VALUES (?,?,?)",
+            (task_id, cid, raw))
+    db().commit()
+    return found
+
+
+@app.route("/tasks/<int:task_id>/assignees/<int:contact_id>/confirm", methods=["POST"])
+def confirm_assignee(task_id, contact_id):
+    db().execute("UPDATE task_assignments SET confirmed=1 WHERE task_id=? AND contact_id=?",
+                 (task_id, contact_id))
+    db().commit()
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return redirect(url_for("assignments", site_id=t["site_id"]))
+
+
+@app.route("/sites/<int:site_id>/assignments")
+def assignments(site_id):
+    rows = db().execute(
+        """SELECT t.id AS task_id, t.public_no, t.text, t.assignee_text, a.contact_id, a.raw_name,
+                  a.confirmed, c.first_name, c.last_name, c.role, c.org
+           FROM tasks t JOIN task_assignments a ON a.task_id = t.id
+           JOIN contacts c ON c.id = a.contact_id
+           WHERE t.site_id=? ORDER BY t.public_no""", (site_id,)).fetchall()
+    return page("שיוך משימות לאנשי קשר", """
+<p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.</p>
+<table><tr><th>משימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>סטטוס</th></tr>
+{% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
+<td>{{ r['first_name'] }} {{ r['last_name'] or '' }} ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
+<td>{% if r['confirmed'] %}מאושר{% else %}
+<form method="post" action="{{ url_for('confirm_assignee', task_id=r['task_id'], contact_id=r['contact_id']) }}">
+<button>אישור השיוך</button></form>{% endif %}</td></tr>{% endfor %}</table>
+""", rows=rows, url_for=url_for)
+
+# ---------- routes ----------
+PAGE = """<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }}</title>
+<style>
+:root{--red:#C62828;--red-light:#FBE9E9;--white:#FFFFFF;--gray:#6B6B6B;--gray-light:#F2F2F2;--gray-line:#D0D0D0}
+body{font-family:Arial,sans-serif;margin:0;background:var(--white);color:#222;line-height:1.5}
+header{background:var(--red);color:var(--white);padding:12px 16px}
+header a{color:var(--white);margin-left:16px;text-decoration:none;font-weight:bold}
+main{padding:16px;max-width:1100px;margin:0 auto}
+h2{color:var(--red);border-bottom:2px solid var(--red);padding-bottom:4px}
+h3{color:var(--gray);margin-top:24px}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+td,th{border:1px solid var(--gray-line);padding:6px;vertical-align:top;font-size:14px}
+th{background:var(--gray-light);color:var(--gray);text-align:right}
+tr.overdue{background:var(--red-light);color:var(--red);font-weight:bold}
+tr.urgent{border-right:4px solid var(--red)}
+tr.done{background:var(--gray-light);color:var(--gray)}
+button,input[type=submit]{background:var(--red);color:var(--white);border:0;padding:6px 14px;border-radius:3px;cursor:pointer}
+button:hover{background:#A31F1F}
+input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radius:3px}
+.note{color:var(--gray);font-size:13px}
+.flash{background:var(--red-light);color:var(--red);padding:8px;border-radius:3px}
+</style></head><body>
+<header><b>הלל הזקן 14</b>
+<a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
+<main><h2>{{ title }}</h2>
+{% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
+{{ body|safe }}</main></body></html>"""
+
+
+def page(title, body, **ctx):
+    return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
+                                  url_for=url_for, get_flashed_messages=lambda: [])
+
+
+@app.route("/")
+def sites():
+    rows = db().execute("SELECT * FROM sites ORDER BY id").fetchall()
+    return page("אתרים", """
+<p><a href="{{ url_for('site_new') }}">אתר חדש</a></p>
+<table><tr><th>אתר</th><th>עלייה לקרקע</th><th>מסירה</th><th>חודשי ביצוע (חוזה)</th><th></th></tr>
+{% for s in rows %}<tr><td>{{ s['name'] }}</td><td>{{ s['land_date'] }}</td><td>{{ s['delivery_date'] }}</td>
+<td>{{ s['months_total'] }}</td><td><a href="{{ url_for('site_view', site_id=s['id']) }}">פתיחה</a></td></tr>{% endfor %}</table>
+""", rows=rows, url_for=url_for)
+
+
+@app.route("/sites/new", methods=["GET", "POST"])
+def site_new():
+    if request.method == "POST":
+        f = request.form
+        db().execute(
+            "INSERT INTO sites(name, address, land_date, delivery_date, months_total, contract_ref) VALUES (?,?,?,?,?,?)",
+            (f["name"], f.get("address", ""), parse_date(f.get("land_date", "")),
+             parse_date(f.get("delivery_date", "")), int(f.get("months_total") or 0), f.get("contract_ref", "")))
+        db().commit()
+        return redirect(url_for("sites"))
+    return page("אתר חדש", """
+<form method="post">
+<p>שם פרויקט <input name="name" required></p><p>כתובת <input name="address"></p>
+<p>תאריך עלייה לקרקע (לפי החוזה, dd.mm.yy) <input name="land_date"></p>
+<p>תאריך מסירה (לפי החוזה) <input name="delivery_date"></p>
+<p>סך חודשי הביצוע (לפי החוזה) <input name="months_total" type="number"></p>
+<p>מזהה חוזה <input name="contract_ref"></p>
+<button>שמירה</button></form>""", url_for=url_for)
+
+
+@app.route("/contacts/import", methods=["GET", "POST"])
+def contacts_import():
+    if request.method == "POST":
+        f = request.files["file"]
+        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        f.save(tmp.name)
+        n = import_contacts(tmp.name)
+        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל)")
+        return redirect(url_for("sites"))
+    return page("ייבוא אנשי קשר", """
+<form method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required>
+<button>ייבוא</button></form>""", url_for=url_for)
+
+
+@app.route("/sites/<int:site_id>")
+def site_view(site_id):
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+    today = dt.date.today().isoformat()
+    open_t = sorted([t for t in tasks if t["status"] != "בוצע"], key=lambda t: (priority_of(t, today), t["public_no"]))
+    done_t = [t for t in tasks if t["status"] == "בוצע"]
+    month = db().execute("SELECT month_current, month_total, meeting_date FROM meetings WHERE site_id=? AND status='published' AND month_current IS NOT NULL ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
+    return page(s["name"], """
+<form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
+שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
+יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
+<button>שמירה</button></form>
+<p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a></p>
+<h3>משימות פתוחות</h3>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
+{% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
+<td>{{ t['text'] }}</td><td>{{ t['assignee_text'] }}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
+<form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
+<select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>בוצע</option></select>
+<input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td></tr>{% endfor %}</table>
+<h3>משימות שבוצעו</h3>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th></tr>
+{% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] }}</td></tr>{% endfor %}</table>
+""", s=s, weekdays=WEEKDAYS, open_t=open_t, done_t=done_t, rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+        month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
+
+
+@app.route("/sites/<int:site_id>/meetings/new", methods=["GET", "POST"])
+def meeting_upload(site_id):
+    if request.method == "POST":
+        f = request.files["file"]
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        f.save(tmp.name)
+        rows = extract_rows(tmp.name)
+        cur = db().execute(
+            "INSERT INTO meetings(site_id, kind, source_name, staged_rows) VALUES (?,?,?,?)",
+            (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(rows, ensure_ascii=False)))
+        db().commit()
+        return redirect(url_for("meeting_review", meeting_id=cur.lastrowid))
+    return page("העלאת פרוטוקול", """
+<form method="post" enctype="multipart/form-data">
+<p>סוג פגישה <select name="kind"><option>ביצוע</option><option>שבועית</option><option>סופרפוזיציה</option></select></p>
+<input type="file" name="file" accept=".pdf" required> <button>העלאה לבדיקה</button></form>""", url_for=url_for)
+
+
+@app.route("/meetings/<int:meeting_id>/review", methods=["GET", "POST"])
+def meeting_review(meeting_id):
+    m = db().execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone() or abort(404)
+    rows = json.loads(m["staged_rows"] or "[]")
+    if request.method == "POST":
+        for i, r in enumerate(rows):
+            r["number"] = request.form.get(f"number_{i}", r["number"])
+            r["topic"] = request.form.get(f"topic_{i}", r["topic"])
+            r["task"] = request.form.get(f"task_{i}", r["task"])
+            r["assignee"] = request.form.get(f"assignee_{i}", r["assignee"])
+            r["target"] = request.form.get(f"target_{i}", r["target"])
+            r["skip"] = bool(request.form.get(f"skip_{i}"))
+        db().execute("UPDATE meetings SET staged_rows=? WHERE id=?",
+                     (json.dumps(rows, ensure_ascii=False), meeting_id))
+        if request.form.get("action") == "publish":
+            publish_meeting(meeting_id)
+            return redirect(url_for("site_view", site_id=m["site_id"]))
+        db().commit()
+        flash("נשמר כטיוטה")
+    return page("בדיקת פרוטוקול לפני פרסום", """
+<p>ערכו כל שורה לפני הפרסום. סמנו 'לא לפרסם' לשורות שחולצו בצורה שגויה.</p>
+<form method="post"><table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th><th>יעד</th><th>לא לפרסם</th></tr>
+{% for r in rows %}{% set i = loop.index0 %}<tr>
+<td><input name="number_{{i}}" value="{{ r['number'] }}" size="5"></td>
+<td><input name="topic_{{i}}" value="{{ r['topic'] }}"></td>
+<td><textarea name="task_{{i}}" rows="3" cols="50">{{ r['task'] }}</textarea></td>
+<td><input name="assignee_{{i}}" value="{{ r['assignee'] }}"></td>
+<td><input name="target_{{i}}" value="{{ r['target'] }}"></td>
+<td><input type="checkbox" name="skip_{{i}}" {% if r.get('skip') %}checked{% endif %}></td></tr>{% endfor %}</table>
+<p><button name="action" value="save">שמירה כטיוטה</button> <button name="action" value="publish">אישור ופרסום</button></p></form>
+""", rows=rows)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 4 and sys.argv[1] == "set-password":
+        set_password_cli(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 2 and sys.argv[1] == "run-reminders":
+        init_db()
+        with app.app_context():
+            for site in db().execute("SELECT id FROM sites").fetchall():
+                send_task_reminders(site["id"])
+            db().commit()
+            print("queued:", db().execute("SELECT COUNT(*) FROM outbox WHERE status='queued'").fetchone()[0])
+    else:
+        init_db()
+        app.run(debug=False, port=5055)
