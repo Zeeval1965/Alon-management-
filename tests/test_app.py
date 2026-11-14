@@ -271,6 +271,21 @@ class ContactMembershipImportTests(AppTestCase):
         self.assertEqual([tuple(r) for r in rows],
                          [("michal@example.com", "יועצים"), ("yossi@example.com", "יזם")])
 
+    def test_role_comes_from_row_with_aliases_and_unknown_roles_are_not_linked(self):
+        path = self.write_xlsx([("בעלי דירות", [["שם מלא", "דוא\"ל", "סוג"],
+                                                ["דנה כהן", "dana2@example.com", "בעל דירה"],
+                                                ["רון לוי", "ron2@example.com", "מנהל עבודה"]])])
+        with A.app.app_context():
+            added, _ = A.import_contacts(path, site_id=1)
+            rows = A.db().execute(
+                "SELECT c.email, m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                "WHERE m.site_id=1 AND c.email LIKE '%2@example.com' ORDER BY c.email").fetchall()
+            contact_count = A.db().execute(
+                "SELECT COUNT(*) FROM contacts WHERE email LIKE '%2@example.com'").fetchone()[0]
+        self.assertEqual(added, 2)
+        self.assertEqual(contact_count, 2)
+        self.assertEqual([tuple(r) for r in rows], [("dana2@example.com", "בעלי דירות")])
+
     def test_reimport_does_not_duplicate_memberships(self):
         path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["ענת", "anat@example.com"]])])
         with A.app.app_context():

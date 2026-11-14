@@ -174,6 +174,16 @@ def _find_contact_sheet(wb):
     return None, None, None
 
 
+ROLE_ALIASES = {"בעל דירה": "בעלי דירות", "בעלי דירה": "בעלי דירות", "בעלים": "בעלי דירות",
+                "יזמים": "יזם", "נציג": "נציגות"}
+
+
+def _site_role_of(value):
+    """Map a free-text value from the file to a site role, or None when it is not one."""
+    value = ROLE_ALIASES.get(value or "", value or "")
+    return value if value in ROLE_READ else None
+
+
 def _cell(row, col, name):
     i = col.get(name)
     if i is None or i >= len(row) or row[i] in (None, ""):
@@ -215,9 +225,9 @@ def import_contacts(path, site_id=None, site_role=None):
                  address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
             (email, first, last, role, _cell(r, col, "ארגון"), _cell(r, col, "טלפון"),
              _cell(r, col, "טלפון נייד"), _cell(r, col, "כתובת")))
-        # A row whose 'תפקיד' is itself a site role (יזם, נציגות, ...) keeps that role;
-        # any other row gets the role chosen on the import form.
-        membership_role = role if role in ROLE_READ else site_role
+        # The site role comes from the row itself ('תפקיד', else 'סוג'); rows without a recognised role
+        # are imported as contacts but not linked to the site.
+        membership_role = _site_role_of(_cell(r, col, "תפקיד")) or _site_role_of(_cell(r, col, "סוג")) or site_role
         if site_id and membership_role:
             cid = db().execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()[0]
             db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
@@ -977,31 +987,27 @@ def contacts_import():
     if request.method == "POST":
         f = request.files.get("file")
         site_id = request.form.get("site_id", type=int)
-        role = (request.form.get("role") or "").strip()
-        if not f or not site_id or role not in ROLE_READ:
-            flash("יש לבחור אתר, תפקיד במערכת, וקובץ")
+        if not f or not site_id:
+            flash("יש לבחור אתר וקובץ")
             return redirect(url_for("contacts_import"))
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         f.save(tmp.name)
         try:
-            n, skipped = import_contacts(tmp.name, site_id=site_id, site_role=role)
+            n, skipped = import_contacts(tmp.name, site_id=site_id)
         except ValueError as exc:
             flash(str(exc))
             return redirect(url_for("contacts_import"))
-        flash(f"יובאו {n} שורות ושויכו לאתר כ{role} (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
+        flash(f"יובאו {n} שורות (איחוד לפי דוא\"ל). שורות בלי דוא\"ל שדולגו: {skipped}")
         return redirect(url_for("site_view", site_id=site_id))
     all_sites = db().execute("SELECT id, name FROM sites ORDER BY id").fetchall()
     return page("ייבוא אנשי קשר", """
 <form method="post" enctype="multipart/form-data">
 <p><label>אתר: <select name="site_id" required>
 {% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
-<p><label>תפקיד במערכת לכל השורות בקובץ: <select name="role" required>
-<option value="" selected disabled>בחר תפקיד</option>
-{% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select></label></p>
 <p><input type="file" name="file" accept=".xlsx" required></p>
 <button>ייבוא</button></form>
-<p class="note">להעלות בנפרד את בעלי הדירות (תפקיד: בעלי דירות) ואת היועצים (תפקיד: יועצים). מי שכבר קיים מעודכן ולא מוכפל.</p>""",
-                url_for=url_for, sites=all_sites, roles=list(ROLE_READ.keys()))
+<p class="note">התפקיד במערכת נלקח מעמודת "תפקיד" (או "סוג") בכל שורה: יזם, נציגות, בעלי דירות, יועצים, מפקח, קבלן. שורה שהתפקיד בה לא מוכר נקלטת כאיש קשר בלי שיוך לאתר. מי שכבר קיים מעודכן ולא מוכפל.</p>""",
+                url_for=url_for, sites=all_sites)
 
 
 @app.route("/sites/<int:site_id>")
