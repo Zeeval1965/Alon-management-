@@ -996,6 +996,7 @@ def contacts_import():
 <p><label>אתר: <select name="site_id" required>
 {% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
 <p><label>תפקיד במערכת לכל השורות בקובץ: <select name="role" required>
+<option value="" selected disabled>בחר תפקיד</option>
 {% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}</select></label></p>
 <p><input type="file" name="file" accept=".xlsx" required></p>
 <button>ייבוא</button></form>
