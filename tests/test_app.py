@@ -259,6 +259,18 @@ class ContactMembershipImportTests(AppTestCase):
         self.assertEqual(added, 2)
         self.assertEqual([tuple(r) for r in rows], [("anat@example.com", "יועצים"), ("avi@example.com", "יועצים")])
 
+    def test_row_role_that_is_a_site_role_overrides_form_role(self):
+        path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל", "תפקיד"],
+                                            ["יוסי", "yossi@example.com", "יזם"],
+                                            ["מיכל", "michal@example.com", "מנהל עבודה"]])])
+        with A.app.app_context():
+            A.import_contacts(path, site_id=1, site_role="יועצים")
+            rows = A.db().execute(
+                "SELECT c.email, m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                "WHERE m.site_id=1 AND c.email LIKE '%@example.com' ORDER BY c.email").fetchall()
+        self.assertEqual([tuple(r) for r in rows],
+                         [("michal@example.com", "יועצים"), ("yossi@example.com", "יזם")])
+
     def test_reimport_does_not_duplicate_memberships(self):
         path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["ענת", "anat@example.com"]])])
         with A.app.app_context():

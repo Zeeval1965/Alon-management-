@@ -215,10 +215,13 @@ def import_contacts(path, site_id=None, site_role=None):
                  address=COALESCE(NULLIF(contacts.address,''), excluded.address)""",
             (email, first, last, role, _cell(r, col, "ארגון"), _cell(r, col, "טלפון"),
              _cell(r, col, "טלפון נייד"), _cell(r, col, "כתובת")))
-        if site_id and site_role:
+        # A row whose 'תפקיד' is itself a site role (יזם, נציגות, ...) keeps that role;
+        # any other row gets the role chosen on the import form.
+        membership_role = role if role in ROLE_READ else site_role
+        if site_id and membership_role:
             cid = db().execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()[0]
             db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
-                         (site_id, cid, site_role))
+                         (site_id, cid, membership_role))
         added += 1
     db().commit()
     return added, skipped
