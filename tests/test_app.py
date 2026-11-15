@@ -802,5 +802,28 @@ class InformationOnlyTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "לידיעה")
 
 
+class InitialIdentifiesPersonTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            for email, last in (("ys@x.test", "ישראלי"), ("eg@x.test", "בניה ירוקה")):
+                cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES (?,'ליאור',?)", (email, last))
+                d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            d.commit()
+
+    def test_first_name_and_initial_link_to_the_only_matching_person(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'9','x','ליאור י')")
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='9'").fetchone()[0]
+            d.commit()
+            A.suggest_assignees(tid)
+            rows = [tuple(r) for r in d.execute(
+                "SELECT c.last_name, a.confirmed FROM task_assignments a JOIN contacts c ON c.id=a.contact_id "
+                "WHERE a.task_id=?", (tid,)).fetchall()]
+        self.assertEqual(rows, [("ישראלי", 1)])
+
+
 if __name__ == "__main__":
     unittest.main()

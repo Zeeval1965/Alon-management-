@@ -951,10 +951,12 @@ def suggest_assignees(task_id):
     text = t["assignee_text"] or ""
     found = []
     people = list(_full_names(t["site_id"]))
-    firsts = {}
+    firsts, initials = {}, {}
     for c in people:
         key = (c["first_name"] or "").strip()
         firsts[key] = firsts.get(key, 0) + 1
+        ikey = (key, (c["last_name"] or "").strip()[:1])
+        initials[ikey] = initials.get(ikey, 0) + 1
     hits = []  # (contact_id, matched text, first name, kind) with kind: full / initial / first
     for c in people:
         first, last = (c["first_name"] or "").strip(), (c["last_name"] or "").strip()
@@ -974,14 +976,18 @@ def suggest_assignees(task_id):
     for cid, cand, first, kind in hits:
         if kind == "first" and first in specific_firsts:
             continue
+        contact = next(c for c in people if c["id"] == cid)
+        ikey = (first, (contact["last_name"] or "").strip()[:1])
+        # "ליאור י" is the same person as "ליאור ישראלי" when no one else on the site has that initial
         auto = kind == "full" or (kind == "first" and firsts.get(first, 0) == 1) \
-            or (kind == "initial" and firsts.get(first, 0) == 1)
+            or (kind == "initial" and initials.get(ikey, 0) == 1)
         found.append((cid, cand, auto))
     for cid, raw, full in found:
         db().execute(
             "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,?)",
             (task_id, cid, raw, 1 if full else 0))
         if full:
+            db().execute("UPDATE task_assignments SET confirmed=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
             has_responsible = db().execute(
                 "SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone()
             if not has_responsible:
