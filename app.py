@@ -1094,7 +1094,7 @@ def assignments_rematch(site_id):
 @app.route("/sites/<int:site_id>/assignments")
 def assignments(site_id):
     rows = db().execute(
-        """SELECT t.id AS task_id, t.public_no, t.text, t.assignee_text, a.contact_id, a.raw_name,
+        """SELECT t.id AS task_id, t.public_no, t.topic, t.text, t.assignee_text, a.contact_id, a.raw_name,
                   a.confirmed, a.is_responsible, a.is_cc, c.first_name, c.last_name, c.role, c.org,
                   EXISTS(SELECT 1 FROM task_assignments x JOIN memberships m
                          ON m.contact_id = x.contact_id AND m.site_id = t.site_id
@@ -1105,8 +1105,8 @@ def assignments(site_id):
     return page("שיוך משימות לאנשי קשר", """
 <p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.
 בכל משימה יש אדם אחד אחראי לביצוע, והאחרים מקבלים גישה לצפייה בלבד.</p>
-<table><tr><th>משימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
-{% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
+<table><tr><th>משימה</th><th>תיאור המשימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
+{% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td style="min-width:260px">{{ r['topic'] or '' }}: {{ r['text'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
 <td><a href="{{ url_for('contact_card', site_id=site_id, contact_id=r['contact_id']) }}">{{ r['first_name'] }} {{ r['last_name'] or '' }}</a> ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
 <td>{% if not r['confirmed'] %}ממתין לאישור{% elif r['is_responsible'] %}אחראי לביצוע{% elif r['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td>
 <td>{% if not r['confirmed'] %}
