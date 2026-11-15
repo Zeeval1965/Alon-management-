@@ -96,7 +96,9 @@ def _close(_):
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
-    for stmt in ("ALTER TABLE memberships ADD COLUMN notify_freq TEXT",
+    for stmt in ("ALTER TABLE task_assignments ADD COLUMN is_responsible INTEGER DEFAULT 0",
+                 "ALTER TABLE task_assignments ADD COLUMN is_cc INTEGER DEFAULT 0",
+                 "ALTER TABLE memberships ADD COLUMN notify_freq TEXT",
                  "ALTER TABLE sites ADD COLUMN digest_time TEXT DEFAULT '08:00'",
                  "ALTER TABLE sites ADD COLUMN weekly_day TEXT DEFAULT 'ראשון'",
                  "ALTER TABLE outbox ADD COLUMN mode TEXT DEFAULT 'מיידי'",
@@ -175,7 +177,7 @@ def _find_contact_sheet(wb):
 
 
 ROLE_ALIASES = {"בעל דירה": "בעלי דירות", "בעלי דירה": "בעלי דירות", "בעלים": "בעלי דירות",
-                "יזמים": "יזם", "נציג": "נציגות"}
+                "יזמים": "יזם", "נציג": "נציגות", "קבלן ראשי": "קבלן"}
 
 
 NOT_A_ROLE = {"רושם", "מכותב"}  # recipient-type words; not site roles
@@ -483,10 +485,11 @@ def send_task_reminders(site_id, today=None):
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
         text = (f"תזכורת: משימה {t['public_no']} ({t['topic'] or 'ללא נושא'}): {t['text'][:120]} - {when}.")
-        # reminders go to the site's recipients (by their settings) and to the confirmed assignees
+        # reminders go to the site's recipients (by their settings) and to the task's responsible
+        # party only; other people on the task (view-only, or copied) keep their link but get no copy
         assignees = db().execute(
             """SELECT c.* FROM task_assignments a JOIN contacts c ON c.id = a.contact_id
-               WHERE a.task_id=? AND a.confirmed=1""", (t["id"],)).fetchall()
+               WHERE a.task_id=? AND a.confirmed=1 AND a.is_responsible=1""", (t["id"],)).fetchall()
         seen = set()
         for contact, mode in recipients_for_event(site_id):
             seen.add(contact["id"])
@@ -697,6 +700,7 @@ ROLE_WRITE = {
 # endpoint -> section it belongs to; endpoints not listed are administrator-only
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
+    "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -704,6 +708,22 @@ SECTION_OF = {
     "progress_view": "progress", "progress_save": "progress",
 }
 PUBLIC_ENDPOINTS = {"login", "logout", "static"}
+# contact import and editing: administrator and supervisors (deleting field values: administrator only)
+MANAGER_ENDPOINTS = {"contacts_import", "contacts_import_preview", "contacts_import_confirm", "contact_edit",
+                     "contact_role_add", "contact_role_remove", "contact_delete"}
+CONTACT_EDIT_FIELDS = [("first_name", "שם פרטי"), ("last_name", "שם משפחה"), ("org", "ארגון"),
+                       ("role", "תפקיד"), ("phone", "טלפון"), ("mobile", "נייד"),
+                       ("email", 'דוא"ל'), ("address", "כתובת")]
+
+
+def is_manager(contact):
+    """Administrator, or anyone who is a supervisor (מפקח) on some site."""
+    if contact is None:
+        return False
+    if contact["is_admin"]:
+        return True
+    return db().execute("SELECT 1 FROM memberships WHERE contact_id=? AND site_role='מפקח'",
+                        (contact["id"],)).fetchone() is not None
 
 
 def current_contact():
@@ -730,6 +750,8 @@ def require_access():
         return redirect(url_for("login"))
     if me["is_admin"]:
         return None
+    if endpoint in MANAGER_ENDPOINTS:
+        return None if is_manager(me) else abort(403)
     section = SECTION_OF.get(endpoint)
     if section is None:
         abort(403)  # administrator-only screen
@@ -939,28 +961,147 @@ def suggest_assignees(task_id):
 def confirm_assignee(task_id, contact_id):
     db().execute("UPDATE task_assignments SET confirmed=1 WHERE task_id=? AND contact_id=?",
                  (task_id, contact_id))
+    # the first confirmed person on a task becomes its responsible party
+    has_responsible = db().execute(
+        "SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone()
+    if not has_responsible:
+        db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?",
+                     (task_id, contact_id))
     db().commit()
     t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone()
     return redirect(url_for("assignments", site_id=t["site_id"]))
+
+
+@app.route("/tasks/<int:task_id>/assignees/<int:contact_id>/responsible", methods=["POST"])
+def set_responsible(task_id, contact_id):
+    """Make one confirmed person the responsible party; everyone else on the task is view-only."""
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    confirmed = db().execute(
+        "SELECT 1 FROM task_assignments WHERE task_id=? AND contact_id=? AND confirmed=1",
+        (task_id, contact_id)).fetchone()
+    if not confirmed:
+        abort(400)  # only a confirmed assignee can be responsible
+    db().execute("UPDATE task_assignments SET is_responsible=0 WHERE task_id=?", (task_id,))
+    db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?",
+                 (task_id, contact_id))
+    db().commit()
+    return redirect(url_for("assignments", site_id=t["site_id"]))
+
+
+def task_has_contractor_responsible(task_id):
+    """True when a responsible person on the task is the main contractor (site role קבלן)."""
+    return db().execute(
+        """SELECT 1 FROM task_assignments a JOIN tasks t ON t.id = a.task_id
+           JOIN memberships m ON m.contact_id = a.contact_id AND m.site_id = t.site_id
+           WHERE a.task_id=? AND a.is_responsible=1 AND m.site_role IN ('קבלן', 'קבלן ראשי')""", (task_id,)).fetchone() is not None
+
+
+@app.route("/tasks/<int:task_id>/assignees/<int:contact_id>/responsible/add", methods=["POST"])
+def add_responsible(task_id, contact_id):
+    """With a main contractor responsible, everyone listed as responsible gets the reminder."""
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    row = db().execute("SELECT confirmed, is_cc FROM task_assignments WHERE task_id=? AND contact_id=?",
+                       (task_id, contact_id)).fetchone() or abort(404)
+    if not row["confirmed"] or row["is_cc"] or not task_has_contractor_responsible(task_id):
+        abort(400)
+    db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?",
+                 (task_id, contact_id))
+    db().commit()
+    return redirect(url_for("assignments", site_id=t["site_id"]))
+
+
+@app.route("/tasks/<int:task_id>/assignees/<int:contact_id>/cc", methods=["POST"])
+def toggle_cc(task_id, contact_id):
+    """Mark a confirmed person on a task as copied (מכותב): kept for reports, never sent a reminder."""
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    row = db().execute("SELECT is_cc, is_responsible FROM task_assignments WHERE task_id=? AND contact_id=?",
+                       (task_id, contact_id)).fetchone() or abort(404)
+    if row["is_responsible"]:
+        abort(400)  # the responsible party cannot also be a copy
+    db().execute("UPDATE task_assignments SET is_cc=? WHERE task_id=? AND contact_id=?",
+                 (0 if row["is_cc"] else 1, task_id, contact_id))
+    db().commit()
+    return redirect(url_for("assignments", site_id=t["site_id"]))
+
+
+@app.route("/sites/<int:site_id>/cc-report")
+def cc_report(site_id):
+    """How often each person was copied on tasks, and which tasks."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rows = db().execute(
+        """SELECT c.first_name, c.last_name, c.role, c.org, t.public_no, t.topic, t.text
+           FROM task_assignments a JOIN tasks t ON t.id = a.task_id
+           JOIN contacts c ON c.id = a.contact_id
+           WHERE t.site_id=? AND a.is_cc=1 ORDER BY c.first_name, c.last_name, t.public_no""",
+        (site_id,)).fetchall()
+    people = {}
+    for r in rows:
+        key = (r["first_name"], r["last_name"] or "")
+        people.setdefault(key, {"name": f"{r['first_name']} {r['last_name'] or ''}".strip(),
+                                "role": r["role"] or "", "org": r["org"] or "", "tasks": []})
+        people[key]["tasks"].append(f"{r['public_no']} ({r['topic'] or 'ללא נושא'})")
+    return page("דוח מכותבים - " + s["name"], """
+<p class="note">מספר המשימות שבהן איש הקשר סומן כמכותב. המכותבים לא מקבלים תזכורות.</p>
+<table><tr><th>איש קשר</th><th>תפקיד</th><th>ארגון</th><th>מספר פעמים</th><th>משימות</th></tr>
+{% for p in people.values()|sort(attribute='name') %}<tr><td>{{ p['name'] }}</td><td>{{ p['role'] }}</td>
+<td>{{ p['org'] }}</td><td>{{ p['tasks']|length }}</td><td>{{ p['tasks']|join(' · ') }}</td></tr>{% else %}
+<tr><td colspan="5">אין מכותבים מסומנים עדיין</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('assignments', site_id=s['id']) }}">חזרה לשיוך משימות</a></p>
+""", people=people, s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/assignments")
 def assignments(site_id):
     rows = db().execute(
         """SELECT t.id AS task_id, t.public_no, t.text, t.assignee_text, a.contact_id, a.raw_name,
-                  a.confirmed, c.first_name, c.last_name, c.role, c.org
+                  a.confirmed, a.is_responsible, a.is_cc, c.first_name, c.last_name, c.role, c.org,
+                  EXISTS(SELECT 1 FROM task_assignments x JOIN memberships m
+                         ON m.contact_id = x.contact_id AND m.site_id = t.site_id
+                         WHERE x.task_id = t.id AND x.is_responsible = 1 AND m.site_role IN ('קבלן', 'קבלן ראשי')) AS contractor_task
            FROM tasks t JOIN task_assignments a ON a.task_id = t.id
            JOIN contacts c ON c.id = a.contact_id
-           WHERE t.site_id=? ORDER BY t.public_no""", (site_id,)).fetchall()
+           WHERE t.site_id=? ORDER BY t.public_no, a.is_responsible DESC""", (site_id,)).fetchall()
     return page("שיוך משימות לאנשי קשר", """
-<p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.</p>
-<table><tr><th>משימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>סטטוס</th></tr>
+<p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.
+בכל משימה יש אדם אחד אחראי לביצוע, והאחרים מקבלים גישה לצפייה בלבד.</p>
+<table><tr><th>משימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
 {% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
 <td>{{ r['first_name'] }} {{ r['last_name'] or '' }} ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
-<td>{% if r['confirmed'] %}מאושר{% else %}
+<td>{% if not r['confirmed'] %}ממתין לאישור{% elif r['is_responsible'] %}אחראי לביצוע{% elif r['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td>
+<td>{% if not r['confirmed'] %}
 <form method="post" action="{{ url_for('confirm_assignee', task_id=r['task_id'], contact_id=r['contact_id']) }}">
-<button>אישור השיוך</button></form>{% endif %}</td></tr>{% endfor %}</table>
-""", rows=rows, url_for=url_for)
+<button>אישור השיוך</button></form>
+{% else %}{% if not r['is_responsible'] %}
+<form method="post" action="{{ url_for('set_responsible', task_id=r['task_id'], contact_id=r['contact_id']) }}">
+<button>הפוך לאחראי לביצוע</button></form>
+{% if r['contractor_task'] and not r['is_cc'] and not r['is_responsible'] %}
+<form method="post" action="{{ url_for('add_responsible', task_id=r['task_id'], contact_id=r['contact_id']) }}">
+<button>הוסף כאחראי (קבלן ראשי)</button></form>{% endif %}
+<form method="post" action="{{ url_for('toggle_cc', task_id=r['task_id'], contact_id=r['contact_id']) }}">
+<button>{% if r['is_cc'] %}בטל מכותב{% else %}סמן כמכותב{% endif %}</button></form>{% endif %}{% endif %}</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('cc_report', site_id=site_id) }}">דוח מכותבים</a></p>
+""", rows=rows, url_for=url_for, site_id=site_id)
+
+
+@app.route("/sites/<int:site_id>/contacts")
+def site_contacts(site_id):
+    """Read-only list of the project's contacts, with the site roles each one holds."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rows = db().execute(
+        """SELECT c.id, c.first_name, c.last_name, c.org, c.phone, c.mobile, c.email,
+                  GROUP_CONCAT(m.site_role, ', ') AS site_roles
+           FROM contacts c JOIN memberships m ON m.contact_id = c.id
+           WHERE m.site_id=? GROUP BY c.id ORDER BY c.first_name, c.last_name""", (site_id,)).fetchall()
+    return page("אנשי קשר - " + s["name"], """
+{% if can_edit %}<p class="note">מנהל המערכת והמפקח יכולים לערוך פרטים. מחיקת שדות - למנהל המערכת בלבד.</p>
+<p><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר מקובץ</a></p>
+{% else %}<p class="note">רשימה לצפייה בלבד.</p>{% endif %}
+<table><tr><th>שם</th><th>ארגון</th><th>תפקיד באתר</th><th>טלפון</th><th>נייד</th><th>דוא"ל</th>{% if can_edit %}<th></th>{% endif %}</tr>
+{% for r in rows %}<tr><td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['org'] or '' }}</td>
+<td>{{ r['site_roles'] }}</td><td>{{ r['phone'] or '' }}</td><td>{{ r['mobile'] or '' }}</td><td>{{ r['email'] or '' }}</td>
+{% if can_edit %}<td><a href="{{ url_for('contact_edit', contact_id=r['id']) }}">עריכה</a></td>{% endif %}</tr>{% endfor %}</table>
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+""", rows=rows, s=s, url_for=url_for, can_edit=is_manager(current_contact()))
 
 # ---------- routes ----------
 PAGE = """<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
@@ -1035,6 +1176,101 @@ def _import_dir():
 
 def _valid_token(token):
     return len(token) == 32 and all(c in "0123456789abcdef" for c in token)
+
+
+@app.route("/contacts/<int:contact_id>/edit", methods=["GET", "POST"])
+def contact_edit(contact_id):
+    c = db().execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone() or abort(404)
+    me = current_contact()
+    values = {key: (c[key] or "") for key, _ in CONTACT_EDIT_FIELDS}
+    error = None
+    if request.method == "POST":
+        for key, _ in CONTACT_EDIT_FIELDS:
+            new = (request.form.get(key) or "").strip()
+            if not new and not me["is_admin"]:
+                new = values[key]  # supervisors cannot blank a field; only the administrator can
+            values[key] = new
+        email = values["email"]
+        if email and not re.fullmatch(EMAIL_PATTERN, email):
+            error = 'כתובת הדוא"ל לא תקינה.'
+        elif email and db().execute("SELECT 1 FROM contacts WHERE email=? AND id<>?",
+                                    (email, contact_id)).fetchone():
+            error = 'כתובת הדוא"ל כבר שייכת לאיש קשר אחר.'
+        if error is None:
+            db().execute(
+                "UPDATE contacts SET first_name=?, last_name=?, org=?, role=?, phone=?, mobile=?, email=?, address=? "
+                "WHERE id=?",
+                (values["first_name"] or None, values["last_name"] or None, values["org"] or None,
+                 values["role"] or None, values["phone"] or None, values["mobile"] or None,
+                 values["email"] or None, values["address"] or None, contact_id))
+            db().commit()
+            return redirect(url_for("sites"))
+    memberships = db().execute(
+        """SELECT m.site_id, m.site_role, s.name FROM memberships m JOIN sites s ON s.id = m.site_id
+           WHERE m.contact_id=? ORDER BY s.id, m.site_role""", (contact_id,)).fetchall()
+    return page("עריכת איש קשר", """
+<form method="post">
+{% for key, label in fields %}<p>{{ label }} <input name="{{ key }}" value="{{ values[key] }}" size="30"></p>{% endfor %}
+<button>שמירה</button></form>
+{% if error %}<p class="note">{{ error }}</p>{% endif %}
+{% if not is_admin %}<p class="note">שדה ריק משאיר את הערך הקיים. מחיקת שדות מותרת למנהל המערכת בלבד.</p>{% endif %}
+<h3>תפקידים באתרים</h3>
+<table><tr><th>אתר</th><th>תפקיד</th>{% if is_admin %}<th></th>{% endif %}</tr>
+{% for m in memberships %}<tr><td>{{ m['name'] }}</td><td>{{ m['site_role'] }}</td>
+{% if is_admin %}<td><form method="post" action="{{ url_for('contact_role_remove', contact_id=cid) }}">
+<input type="hidden" name="site_id" value="{{ m['site_id'] }}"><input type="hidden" name="site_role" value="{{ m['site_role'] }}">
+<button>הסרה</button></form></td>{% endif %}</tr>{% else %}<tr><td colspan="3">אין תפקידים</td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('contact_role_add', contact_id=cid) }}">
+אתר <select name="site_id">{% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select>
+תפקיד <input name="site_role" size="16"> <button>הוספה</button></form>
+{% if is_admin and not c['is_admin'] %}
+<h3>מחיקת איש קשר</h3>
+<form method="post" action="{{ url_for('contact_delete', contact_id=cid) }}">
+<button>מחיקת איש הקשר (מנהל המערכת בלבד)</button></form>
+{% endif %}
+""", fields=CONTACT_EDIT_FIELDS, values=values, error=error, is_admin=bool(me["is_admin"]),
+        memberships=memberships, sites=db().execute("SELECT id, name FROM sites ORDER BY id").fetchall(),
+        cid=contact_id, c=c)
+
+
+@app.route("/contacts/<int:contact_id>/roles/add", methods=["POST"])
+def contact_role_add(contact_id):
+    db().execute("SELECT 1 FROM contacts WHERE id=?", (contact_id,)).fetchone() or abort(404)
+    site_id = request.form.get("site_id", type=int)
+    role = _site_role_of(request.form.get("site_role", ""))
+    if not site_id or not role or not db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone():
+        abort(400)
+    db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
+                 (site_id, contact_id, role))
+    db().commit()
+    return redirect(url_for("contact_edit", contact_id=contact_id))
+
+
+@app.route("/contacts/<int:contact_id>/roles/remove", methods=["POST"])
+def contact_role_remove(contact_id):
+    if not current_contact()["is_admin"]:
+        abort(403)  # removing a role is administrator-only, like clearing fields
+    db().execute("DELETE FROM memberships WHERE contact_id=? AND site_id=? AND site_role=?",
+                 (contact_id, request.form.get("site_id", type=int), request.form.get("site_role", "")))
+    db().commit()
+    return redirect(url_for("contact_edit", contact_id=contact_id))
+
+
+@app.route("/contacts/<int:contact_id>/delete", methods=["POST"])
+def contact_delete(contact_id):
+    me = current_contact()
+    if not me["is_admin"]:
+        abort(403)  # deletion is administrator-only
+    if contact_id == me["id"]:
+        abort(400)  # the administrator cannot delete their own account
+    c = db().execute("SELECT is_admin FROM contacts WHERE id=?", (contact_id,)).fetchone() or abort(404)
+    if c["is_admin"]:
+        abort(400)
+    db().execute("DELETE FROM task_assignments WHERE contact_id=?", (contact_id,))
+    db().execute("DELETE FROM memberships WHERE contact_id=?", (contact_id,))
+    db().execute("DELETE FROM contacts WHERE id=?", (contact_id,))
+    db().commit()
+    return redirect(url_for("sites"))
 
 
 @app.route("/contacts/import", methods=["GET"])
@@ -1143,7 +1379,7 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט (לצפייה)</a></p>
 <h3>משימות פתוחות</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>

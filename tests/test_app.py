@@ -340,5 +340,237 @@ class ContactMembershipImportTests(AppTestCase):
         self.assertEqual(n, 1)
 
 
+class TaskAssignmentRoleTests(AppTestCase):
+    """One responsible party per task; the others are view-only."""
+
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) "
+                      "VALUES (1, '1', 'לתקן נזילה', 'ליאור י וגיא')")
+            for name in ("ליאור", "גיא"):
+                cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES (?,?,?)",
+                                (name + "@x.test", name, "י" if name == "ליאור" else ""))
+                d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')",
+                          (cur.lastrowid,))
+                d.execute("INSERT INTO task_assignments(task_id, contact_id, raw_name) VALUES (1,?,?)",
+                          (cur.lastrowid, name))
+            d.commit()
+        self.ids = [r[0] for r in self.rows(
+            "SELECT contact_id FROM task_assignments WHERE task_id=1 ORDER BY contact_id")]
+
+    def rows(self, sql, args=()):
+        with A.app.app_context():
+            return [tuple(r) for r in A.db().execute(sql, args).fetchall()]
+
+    def responsible(self):
+        return [r[0] for r in self.rows(
+            "SELECT contact_id FROM task_assignments WHERE task_id=1 AND is_responsible=1")]
+
+    def test_first_confirmed_person_becomes_responsible(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        self.assertEqual(self.responsible(), [a])
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        self.assertEqual(self.responsible(), [a])  # second person is view-only
+
+    def test_switching_responsible_keeps_exactly_one(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/responsible")
+        self.assertEqual(self.responsible(), [b])
+        self.assertEqual(len(self.responsible()), 1)
+
+    def test_unconfirmed_person_cannot_be_responsible(self):
+        sup = self.login("sup@test")
+        a, _ = self.ids
+        r = sup.post(f"/tasks/1/assignees/{a}/responsible")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.responsible(), [])
+
+    def test_only_supervisor_can_change_responsibility(self):
+        owner = self.login("owner@test")
+        a, _ = self.ids
+        r = owner.post(f"/tasks/1/assignees/{a}/responsible")
+        self.assertEqual(r.status_code, 403)
+
+    def test_assignments_page_shows_role_labels(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        html = sup.get("/sites/1/assignments").get_data(as_text=True)
+        self.assertIn("אחראי לביצוע", html)
+        self.assertIn("לצפייה", html)
+
+
+class SiteContactsTests(AppTestCase):
+    def test_members_see_read_only_contacts_list(self):
+        owner = self.login("owner@test")
+        r = owner.get("/sites/1/contacts")
+        self.assertEqual(r.status_code, 200)
+        html = r.get_data(as_text=True)
+        self.assertIn("owner@test", html)
+        self.assertNotIn("password_hash", html)
+        self.assertNotIn("<form", html)  # no editing controls
+
+    def test_main_site_page_links_to_contacts(self):
+        owner = self.login("owner@test")
+        html = owner.get("/sites/1").get_data(as_text=True)
+        self.assertIn("/sites/1/contacts", html)
+
+    def test_contacts_list_is_not_writable(self):
+        owner = self.login("owner@test")
+        self.assertIn(owner.post("/sites/1/contacts").status_code, (403, 405))
+
+
+class ReminderRecipientTests(TaskAssignmentRoleTests):
+    def test_reminder_goes_to_responsible_only(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        with A.app.app_context():
+            A.db().execute("UPDATE tasks SET target_date=? WHERE id=1", (A.dt.date.today().isoformat(),))
+            A.db().commit()
+            A.send_task_reminders(1, A.dt.date.today())
+        bodies = " ".join(r[0] for r in self.rows("SELECT body FROM outbox WHERE site_id=1"))
+        self.assertIn("ליאור", bodies)      # responsible party (ids[0]) gets the reminder
+        self.assertNotIn("גיא", bodies)     # view-only person gets no copy
+
+    def test_cc_is_marked_and_reported_but_not_sent(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/cc")
+        self.assertEqual(self.rows("SELECT is_cc FROM task_assignments WHERE task_id=1 AND contact_id=?", (b,)),
+                         [(1,)])
+        html = sup.get("/sites/1/cc-report").get_data(as_text=True)
+        self.assertIn("גיא", html)
+        self.assertIn("<td>1</td>", html)  # counted once
+        with A.app.app_context():
+            A.db().execute("UPDATE tasks SET target_date=? WHERE id=1", (A.dt.date.today().isoformat(),))
+            A.db().commit()
+            A.send_task_reminders(1, A.dt.date.today())
+        bodies = " ".join(r[0] for r in self.rows("SELECT body FROM outbox WHERE site_id=1"))
+        self.assertNotIn("גיא", bodies)
+
+    def test_responsible_cannot_be_marked_cc(self):
+        sup = self.login("sup@test")
+        a, _ = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        self.assertEqual(sup.post(f"/tasks/1/assignees/{a}/cc").status_code, 400)
+
+class ContractorResponsibleTests(TaskAssignmentRoleTests):
+    def make_contractor(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'קבלן')", (self.ids[0],))
+            A.db().commit()
+
+    def test_contractor_task_allows_several_responsible_and_all_are_reminded(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        self.make_contractor()
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/responsible/add")
+        self.assertEqual(sorted(r[0] for r in self.rows(
+            "SELECT contact_id FROM task_assignments WHERE task_id=1 AND is_responsible=1")), [a, b])
+        with A.app.app_context():
+            A.db().execute("UPDATE tasks SET target_date=? WHERE id=1", (A.dt.date.today().isoformat(),))
+            A.db().commit()
+            A.send_task_reminders(1, A.dt.date.today())
+        bodies = " ".join(r[0] for r in self.rows("SELECT body FROM outbox WHERE site_id=1"))
+        self.assertIn("ליאור", bodies)
+        self.assertIn("גיא", bodies)
+
+    def test_second_responsible_refused_without_contractor(self):
+        sup = self.login("sup@test")
+        a, b = self.ids
+        sup.post(f"/tasks/1/assignees/{a}/confirm")
+        sup.post(f"/tasks/1/assignees/{b}/confirm")
+        self.assertEqual(sup.post(f"/tasks/1/assignees/{b}/responsible/add").status_code, 400)
+        self.assertEqual(len(self.rows(
+            "SELECT 1 FROM task_assignments WHERE task_id=1 AND is_responsible=1")), 1)
+
+
+class ContactManagementTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():  # real-looking addresses: the email check requires a domain dot
+            for old, new in (("sup@test", "sup@x.test"), ("owner@test", "owner@x.test"), ("admin@test", "admin@x.test")):
+                A.db().execute("UPDATE contacts SET email=? WHERE email=?", (new, old))
+            A.db().commit()
+
+    def owner_id(self):
+        return self.db_val("SELECT id FROM contacts WHERE email='owner@x.test'")
+
+    def test_supervisor_can_edit_but_not_blank_a_field(self):
+        sup = self.login("sup@x.test")
+        cid = self.owner_id()
+        sup.post(f"/contacts/{cid}/edit", data={"phone": "03-1111111", "email": "owner@x.test"})
+        self.assertEqual(self.db_val("SELECT phone FROM contacts WHERE id=?", (cid,)), "03-1111111")
+        sup.post(f"/contacts/{cid}/edit", data={"phone": "", "email": "owner@x.test"})
+        self.assertEqual(self.db_val("SELECT phone FROM contacts WHERE id=?", (cid,)), "03-1111111")
+
+    def test_administrator_can_blank_a_field(self):
+        admin = self.login("admin@x.test")
+        cid = self.owner_id()
+        admin.post(f"/contacts/{cid}/edit", data={"phone": "", "email": "owner@x.test"})
+        self.assertIsNone(self.db_val("SELECT phone FROM contacts WHERE id=?", (cid,)))
+
+    def test_owner_cannot_edit_or_import(self):
+        owner = self.login("owner@x.test")
+        cid = self.owner_id()
+        self.assertEqual(owner.get(f"/contacts/{cid}/edit").status_code, 403)
+        self.assertEqual(owner.get("/contacts/import").status_code, 403)
+
+    def test_supervisor_can_open_import(self):
+        self.assertEqual(self.login("sup@x.test").get("/contacts/import").status_code, 200)
+
+    def test_duplicate_email_is_rejected(self):
+        sup = self.login("sup@x.test")
+        cid = self.owner_id()
+        r = sup.post(f"/contacts/{cid}/edit", data={"email": "sup@x.test"})
+        self.assertIn("כבר שייכת", r.get_data(as_text=True))
+        self.assertEqual(self.db_val("SELECT email FROM contacts WHERE id=?", (cid,)), "owner@x.test")
+
+    def test_list_shows_edit_only_to_managers(self):
+        html_sup = self.login("sup@x.test").get("/sites/1/contacts").get_data(as_text=True)
+        html_owner = self.login("owner@x.test").get("/sites/1/contacts").get_data(as_text=True)
+        self.assertIn("/contacts/", html_sup)
+        self.assertNotIn("/edit", html_owner)
+
+
+class ContactRoleAndDeleteTests(ContactManagementTests):
+    def test_supervisor_can_add_role_but_not_remove_it(self):
+        sup = self.login("sup@x.test")
+        cid = self.owner_id()
+        sup.post(f"/contacts/{cid}/roles/add", data={"site_id": "1", "site_role": "קבלן ראשי"})
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM memberships WHERE contact_id=? AND site_role='קבלן'", (cid,)), 1)
+        r = sup.post(f"/contacts/{cid}/roles/remove", data={"site_id": "1", "site_role": "קבלן"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_administrator_can_remove_role(self):
+        admin = self.login("admin@x.test")
+        cid = self.owner_id()
+        admin.post(f"/contacts/{cid}/roles/remove", data={"site_id": "1", "site_role": "בעלי דירות"})
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM memberships WHERE contact_id=?", (cid,)), 0)
+
+    def test_only_administrator_can_delete_and_not_self_or_admin(self):
+        cid = self.owner_id()
+        self.assertEqual(self.login("sup@x.test").post(f"/contacts/{cid}/delete").status_code, 403)
+        admin = self.login("admin@x.test")
+        self.assertEqual(admin.post("/contacts/1/delete").status_code, 400)  # own account
+        admin.post(f"/contacts/{cid}/delete")
+        self.assertIsNone(self.db_val("SELECT id FROM contacts WHERE id=?", (cid,)))
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM memberships WHERE contact_id=?", (cid,)), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
