@@ -271,7 +271,8 @@ class ContactPreviewFlowTests(AppTestCase):
         self.assertIsNone(self.db_one("SELECT id FROM contacts WHERE email='anat3@example.com'"))
         import re as _re
         token = _re.search(r'name="token" value="([0-9a-f]{32})"', html).group(1)
-        r2 = c.post("/contacts/import/confirm", data={"token": token, "site_id": "1"})
+        r2 = c.post("/contacts/import/confirm", data={"token": token, "site_id": "1", "include_0": "on",
+                                                      "include_1": "on"})
         self.assertEqual(r2.status_code, 302)
         self.assertIsNotNone(self.db_one("SELECT id FROM contacts WHERE email='anat3@example.com'"))
         self.assertIsNone(self.db_one("SELECT id FROM contacts WHERE email='not-an-email'"))
@@ -311,9 +312,9 @@ class ContactMembershipImportTests(AppTestCase):
                 "SELECT c.email, m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
                 "WHERE m.site_id=1 AND c.email LIKE '%@example.com' ORDER BY c.email").fetchall()
         self.assertEqual([tuple(r) for r in rows],
-                         [("michal@example.com", "יועצים"), ("yossi@example.com", "יזם")])
+                         [("michal@example.com", "מנהל עבודה"), ("yossi@example.com", "יזם")])
 
-    def test_role_comes_from_row_with_aliases_and_unknown_roles_are_not_linked(self):
+    def test_role_comes_from_row_with_aliases_and_any_role_text_is_linked(self):
         path = self.write_xlsx([("בעלי דירות", [["שם מלא", "דוא\"ל", "סוג"],
                                                 ["דנה כהן", "dana2@example.com", "בעל דירה"],
                                                 ["רון לוי", "ron2@example.com", "מנהל עבודה"]])])
@@ -326,7 +327,8 @@ class ContactMembershipImportTests(AppTestCase):
                 "SELECT COUNT(*) FROM contacts WHERE email LIKE '%2@example.com'").fetchone()[0]
         self.assertEqual(added, 2)
         self.assertEqual(contact_count, 2)
-        self.assertEqual([tuple(r) for r in rows], [("dana2@example.com", "בעלי דירות")])
+        self.assertEqual([tuple(r) for r in rows],
+                         [("dana2@example.com", "בעלי דירות"), ("ron2@example.com", "מנהל עבודה")])
 
     def test_reimport_does_not_duplicate_memberships(self):
         path = self.write_xlsx([("יועצים", [["שם פרטי", "דוא\"ל"], ["ענת", "anat@example.com"]])])
