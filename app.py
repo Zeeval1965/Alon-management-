@@ -1239,31 +1239,103 @@ def highlight(value, terms):
 
 @app.route("/sites/<int:site_id>/search")
 def site_search(site_id):
-    """Search every task of the site. Quoted phrases match exactly; several words must all appear."""
+    """Search and filter: tasks or decisions; by words, status, contact, topic; quick views."""
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     q = (request.args.get("q") or "").strip()
+    kind = request.args.get("kind") if request.args.get("kind") in ("משימות", "החלטות") else "משימות"
+    view = request.args.get("view") if request.args.get("view") in ("open", "done", "info") else ""
+    status = request.args.get("status") or ""
+    topic = request.args.get("topic") or ""
+    contact_id = request.args.get("contact", type=int)
     terms = search_terms(q)
-    results = []
-    if terms:
+    active = bool(terms or status or topic or contact_id or view)
+
+    statuses = [r[0] for r in db().execute(
+        "SELECT DISTINCT status FROM tasks WHERE site_id=? AND status IS NOT NULL ORDER BY status", (site_id,)).fetchall()]
+    topics = sorted({r[0] for r in db().execute(
+        "SELECT topic FROM tasks WHERE site_id=? AND topic IS NOT NULL UNION SELECT topic FROM decisions "
+        "WHERE site_id=? AND topic IS NOT NULL", (site_id, site_id)).fetchall() if r[0]})
+    contacts = _full_names(site_id)
+
+    tasks, decisions = [], []
+    if kind == "משימות" and (active or not q):
+        linked = set()
+        if contact_id:
+            linked = {r[0] for r in db().execute(
+                "SELECT task_id FROM task_assignments WHERE contact_id=?", (contact_id,)).fetchall()}
         for t in db().execute("SELECT * FROM tasks WHERE site_id=? ORDER BY public_no", (site_id,)).fetchall():
+            if view == "open" and t["status"] == "בוצע":
+                continue
+            if view == "done" and t["status"] != "בוצע":
+                continue
+            if view == "info" and t["status"] != "לידיעה":
+                continue
+            if status and t["status"] != status:
+                continue
+            if topic and (t["topic"] or "") != topic:
+                continue
+            if contact_id and t["id"] not in linked:
+                continue
             haystack = " ".join(str(t[k] or "") for k in ("public_no", "topic", "text", "assignee_text",
                                                           "status", "target_text")).lower()
             if all(term.lower() in haystack for term in terms):
-                results.append(t)
-    return page("חיפוש משימות - " + s["name"], """
-<form method="get"><input name="q" value="{{ q }}" size="40" placeholder='מילה, או צמד מילים בגרשיים' >
-<button>חיפוש</button></form>
-{% if terms %}<p class="note">נמצאו {{ results|length }} משימות.</p>
+                tasks.append(t)
+    if kind == "החלטות":
+        for d in db().execute("SELECT * FROM decisions WHERE site_id=? ORDER BY decided_on DESC, id DESC",
+                              (site_id,)).fetchall():
+            if topic and (d["topic"] or "") != topic:
+                continue
+            haystack = " ".join(str(d[k] or "") for k in ("topic", "text", "source", "decided_on")).lower()
+            if all(term.lower() in haystack for term in terms):
+                decisions.append(d)
+
+    shown = tasks if kind == "משימות" else decisions
+    return page("חיפוש וחיתוך - " + s["name"], """
+<p>
+<a href="{{ url_for('site_search', site_id=s['id'], view='open') }}">משימות פתוחות</a> ·
+<a href="{{ url_for('site_search', site_id=s['id'], view='done') }}">משימות שבוצעו</a> ·
+<a href="{{ url_for('site_search', site_id=s['id'], view='info') }}">לידיעה</a> ·
+<a href="{{ url_for('site_search', site_id=s['id'], kind='החלטות') }}">כל ההחלטות</a> ·
+<a href="{{ url_for('site_warnings', site_id=s['id']) }}">ללא שיוך</a>
+</p>
+<form method="get">
+<input name="q" value="{{ q }}" size="30" placeholder='מילה, או צמד מילים בגרשיים'>
+סוג <select name="kind">
+<option {% if kind == 'משימות' %}selected{% endif %}>משימות</option>
+<option {% if kind == 'החלטות' %}selected{% endif %}>החלטות</option></select>
+{% if kind == 'משימות' %}
+סטטוס <select name="status"><option value="">הכול</option>
+{% for st in statuses %}<option {% if st == status %}selected{% endif %}>{{ st }}</option>{% endfor %}</select>
+איש קשר <select name="contact"><option value="">הכול</option>
+{% for c in contacts %}<option value="{{ c['id'] }}" {% if c['id'] == contact_id %}selected{% endif %}>{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
+{% endif %}
+נושא <select name="topic"><option value="">הכול</option>
+{% for tp in topics %}<option {% if tp == topic %}selected{% endif %}>{{ tp }}</option>{% endfor %}</select>
+<input type="hidden" name="view" value="{{ view }}">
+<button>חיפוש</button>
+</form>
+{% if kind == 'החלטות' %}<p class="note">להחלטות אין שיוך לאנשי קשר, ולכן הסינון לפי סטטוס ואיש קשר לא חל עליהן.</p>{% endif %}
+{% if shown or active or kind == 'החלטות' %}<p class="note">נמצאו {{ shown|length }} {{ kind }}.</p>{% endif %}
+{% if kind == 'משימות' and (active or not q) %}
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
-{% for t in results %}<tr><td>{{ hl(t['public_no'], terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
+{% for t in tasks %}<tr><td>{{ hl(t['public_no'], terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
 <td>{{ hl(t['text'], terms) }}</td><td>{{ hl(t['assignee_text'], terms) }}</td>
 <td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td>
 <td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
-<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% else %}
-<tr><td colspan="7">אין תוצאות</td></tr>{% endfor %}</table>{% endif %}
+<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>
+{% else %}<tr><td colspan="7">אין תוצאות</td></tr>{% endfor %}</table>
+{% endif %}
+{% if kind == 'החלטות' %}
+<table><tr><th>נושא</th><th>החלטה</th><th>תאריך</th><th>מקור</th></tr>
+{% for d in decisions %}<tr><td>{{ hl(d['topic'], terms) }}</td><td>{{ hl(d['text'], terms) }}</td>
+<td>{{ d['decided_on'] or '' }}</td><td>{{ d['source'] or '' }}</td></tr>
+{% else %}<tr><td colspan="4">אין החלטות תואמות</td></tr>{% endfor %}</table>
+{% endif %}
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", q=q, terms=terms, results=results, hl=highlight, s=s, url_for=url_for)
+""", q=q, kind=kind, view=view, status=status, topic=topic, contact_id=contact_id, terms=terms,
+        active=active, statuses=statuses, topics=topics, contacts=contacts, tasks=tasks, decisions=decisions,
+        shown=shown, hl=highlight, s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/warnings")

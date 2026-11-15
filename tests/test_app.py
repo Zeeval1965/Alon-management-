@@ -959,5 +959,46 @@ class PrintMarkTests(AppTestCase):
         self.assertEqual(self.login("owner@test").post(f"/tasks/{self.p1}/print-flag").status_code, 403)
 
 
+class FilterTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('fl@x.test','נועה','ברק')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            self.noa = cur.lastrowid
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'F1','חשמל','תיקון לוח','פתוחה')")
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'F2','חשמל','סגירה','בוצע')")
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'F3','אינסטלציה','צנרת','פתוחה')")
+            t1 = d.execute("SELECT id FROM tasks WHERE public_no='F1'").fetchone()[0]
+            d.execute("INSERT INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?, '', 1)",
+                      (t1, self.noa))
+            d.execute("INSERT INTO decisions(site_id, topic, text, decided_on, source, created) "
+                      "VALUES (1,'חשמל','לאשר לוח חדש','02.12.25','פרוטוקול','x')")
+            d.commit()
+
+    def get(self, **params):
+        return self.login("owner@test").get("/sites/1/search", query_string=params).get_data(as_text=True)
+
+    def test_open_view_hides_done_tasks(self):
+        html = self.get(view="open")
+        self.assertIn(">F1<", html)
+        self.assertNotIn(">F2<", html)
+
+    def test_topic_and_status_combine(self):
+        html = self.get(topic="חשמל", status="בוצע")
+        self.assertIn(">F2<", html)
+        self.assertNotIn(">F1<", html)
+
+    def test_contact_filter_uses_assignments(self):
+        html = self.get(contact=str(self.noa))
+        self.assertIn(">F1<", html)
+        self.assertNotIn(">F3<", html)
+
+    def test_decisions_kind_lists_decisions_and_filters_by_topic(self):
+        self.assertIn("לאשר לוח חדש", self.get(kind="החלטות"))
+        self.assertIn("אין החלטות תואמות", self.get(kind="החלטות", topic="אינסטלציה"))
+
+
 if __name__ == "__main__":
     unittest.main()
