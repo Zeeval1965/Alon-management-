@@ -706,7 +706,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks",
+    "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -913,6 +913,23 @@ def admin_queue_resolve(qid):
     db().execute("UPDATE admin_queue SET status=? WHERE id=?", (status, qid))
     db().commit()
     return redirect(url_for("admin_queue"))
+
+
+@app.route("/tasks/<int:task_id>/triage", methods=["POST"])
+def task_triage(task_id):
+    """For a task with no one to assign: 'info' marks it for information only, 'delete' removes it."""
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    action = request.form.get("action")
+    if action == "info":
+        db().execute("UPDATE tasks SET status='לידיעה' WHERE id=?", (task_id,))
+    elif action == "delete":
+        db().execute("DELETE FROM task_assignments WHERE task_id=?", (task_id,))
+        db().execute("DELETE FROM task_targets WHERE task_id=?", (task_id,))
+        db().execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    else:
+        abort(400)
+    db().commit()
+    return redirect(url_for("site_warnings", site_id=t["site_id"]))
 
 
 @app.route("/tasks/<int:task_id>/status", methods=["POST"])
@@ -1152,12 +1169,12 @@ def site_warnings(site_id):
     duplicates = [{"name": f"{k[0]} {k[1]}", "records": list(v.values())}
                   for k, v in groups.items() if len(v) > 1]
     unassigned = db().execute(
-        """SELECT t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
+        """SELECT t.id, t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
            WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה')
              AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
            ORDER BY t.public_no""", (site_id,)).fetchall()
     pending = db().execute(
-        """SELECT t.public_no, t.topic, t.text, a.raw_name, c.first_name, c.last_name, c.org
+        """SELECT t.id AS task_id, t.public_no, t.topic, t.text, a.raw_name, a.contact_id, c.first_name, c.last_name, c.org
            FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
            WHERE t.site_id=? AND t.status!='בוצע' AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
     return page("התרעות - " + s["name"], """
@@ -1166,13 +1183,18 @@ def site_warnings(site_id):
 {% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
-<table><tr><th>משימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
-{% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td>{{ p['raw_name'] }}</td>
-<td>{{ p['first_name'] }} {{ p['last_name'] or '' }}</td><td>{{ p['org'] or '' }}</td></tr>
-{% else %}<tr><td colspan="4">אין שיוכים ממתינים. לאישור השיוכים: <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות</a></td></tr>{% endfor %}</table>
+<table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
+{% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
+<td>{{ p['raw_name'] }}</td>
+<td><a href="{{ url_for('assignments', site_id=s['id']) }}">{{ p['first_name'] }} {{ p['last_name'] or '' }}</a></td><td>{{ p['org'] or '' }}</td></tr>
+{% else %}<tr><td colspan="5">אין שיוכים ממתינים. לאישור השיוכים: <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות</a></td></tr>{% endfor %}</table>
 <h3>משימות פתוחות ללא שיוך לאיש קשר</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
-{% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] or '' }}</td></tr>
+{% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
+<td>{{ t['assignee_text'] or '' }}
+<form method="post" action="{{ url_for('task_triage', task_id=t['id']) }}" style="margin-top:4px">
+<button name="action" value="info">1 - לידיעה</button>
+<button name="action" value="delete" onclick="return confirm('למחוק את המשימה? הפעולה אינה הפיכה.')">2 - מחק</button></form></td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 """, duplicates=duplicates, unassigned=unassigned, pending=pending, s=s, url_for=url_for)

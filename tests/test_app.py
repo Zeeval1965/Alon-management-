@@ -825,5 +825,27 @@ class InitialIdentifiesPersonTests(AppTestCase):
         self.assertEqual(rows, [("ישראלי", 1)])
 
 
+class TriageTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'T1','לבדוק','')")
+            A.db().commit()
+            self.tid = A.db().execute("SELECT id FROM tasks WHERE public_no='T1'").fetchone()[0]
+
+    def test_mark_for_information_only(self):
+        self.login("sup@test").post(f"/tasks/{self.tid}/triage", data={"action": "info"})
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.tid,)), "לידיעה")
+
+    def test_delete_task(self):
+        self.login("sup@test").post(f"/tasks/{self.tid}/triage", data={"action": "delete"})
+        self.assertIsNone(self.db_val("SELECT id FROM tasks WHERE id=?", (self.tid,)))
+
+    def test_owner_cannot_triage(self):
+        r = self.login("owner@test").post(f"/tasks/{self.tid}/triage", data={"action": "delete"})
+        self.assertEqual(r.status_code, 403)
+        self.assertIsNotNone(self.db_val("SELECT id FROM tasks WHERE id=?", (self.tid,)))
+
+
 if __name__ == "__main__":
     unittest.main()
