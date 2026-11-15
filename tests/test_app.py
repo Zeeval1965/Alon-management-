@@ -572,5 +572,36 @@ class ContactRoleAndDeleteTests(ContactManagementTests):
         self.assertEqual(self.db_val("SELECT COUNT(*) FROM memberships WHERE contact_id=?", (cid,)), 0)
 
 
+class AutoAssignTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('gil@x.test','גיל','כהן')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'קבלן')", (cur.lastrowid,))
+            dan = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('dan@x.test','דני','לוי')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (dan.lastrowid,))
+            d.commit()
+
+    def add_task(self, text):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1, ?, 'x', ?)",
+                           (str(len(text)) + text[:3], text))
+            tid = A.db().execute("SELECT MAX(id) FROM tasks").fetchone()[0]
+            A.suggest_assignees(tid)
+            A.db().commit()
+            return tid
+
+    def test_full_name_is_linked_and_confirmed_as_responsible(self):
+        tid = self.add_task("גיל כהן")
+        row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=?", (tid,))
+        self.assertEqual((row["confirmed"], row["is_responsible"]), (1, 1))
+
+    def test_partial_name_waits_for_supervisor(self):
+        tid = self.add_task("דני")
+        row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=?", (tid,))
+        self.assertEqual((row["confirmed"], row["is_responsible"]), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

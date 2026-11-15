@@ -931,8 +931,8 @@ def _full_names(site_id):
 
 def suggest_assignees(task_id):
     """Find contacts of the site whose name appears in the task's 'לטיפול' text.
-    Matches full name first, then first name plus last initial ('ליאור י'). Nothing is
-    linked until the supervisor confirms."""
+    A full-name match (first and last name) is linked at once; the first confirmed person
+    becomes responsible. Partial matches ('ליאור י', first name only) wait for the supervisor."""
     t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     text = t["assignee_text"] or ""
     found = []
@@ -942,17 +942,23 @@ def suggest_assignees(task_id):
             continue
         candidates = []
         if last:
-            candidates.append(f"{first} {last}")
-            candidates.append(f"{first} {last[:1]}")
-        candidates.append(first)
-        for cand in candidates:
+            candidates.append((f"{first} {last}", True))
+            candidates.append((f"{first} {last[:1]}", False))
+        candidates.append((first, False))
+        for cand, full in candidates:
             if re.search(rf"(?<!\S){re.escape(cand)}(?!\S)", text):
-                found.append((c["id"], cand))
+                found.append((c["id"], cand, full))
                 break
-    for cid, raw in found:
+    for cid, raw, full in found:
         db().execute(
-            "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name) VALUES (?,?,?)",
-            (task_id, cid, raw))
+            "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,?)",
+            (task_id, cid, raw, 1 if full else 0))
+        if full:
+            has_responsible = db().execute(
+                "SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone()
+            if not has_responsible:
+                db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?",
+                             (task_id, cid))
     db().commit()
     return found
 
@@ -1381,14 +1387,14 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט (לצפייה)</a></p>
 <h3>משימות פתוחות</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
-<td>{{ t['text'] }}</td><td>{{ t['assignee_text'] }}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
+<td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{{ t['assignee_text'] }}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>בוצע</option></select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th></tr>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] }}</td></tr>{% endfor %}</table>
 """, s=s, weekdays=WEEKDAYS, open_t=open_t, done_t=done_t, rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
