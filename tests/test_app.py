@@ -926,5 +926,38 @@ class TaskSearchTests(AppTestCase):
         self.assertIn("<mark>", html)
 
 
+class PrintMarkTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'P1','להדפסה','')")
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'P2','לא להדפסה','')")
+            d.commit()
+            self.p1 = d.execute("SELECT id FROM tasks WHERE public_no='P1'").fetchone()[0]
+
+    def test_mark_toggles_and_print_page_lists_only_marked(self):
+        sup = self.login("sup@test")
+        sup.post(f"/tasks/{self.p1}/print-flag", data={"next": "/sites/1/print"})
+        html = sup.get("/sites/1/print").get_data(as_text=True)
+        self.assertIn(">P1<", html)
+        self.assertNotIn(">P2<", html)
+        sup.post(f"/tasks/{self.p1}/print-flag", data={"next": "/sites/1/print"})
+        self.assertNotIn(">P1<", sup.get("/sites/1/print").get_data(as_text=True))
+
+    def test_clear_removes_all_marks(self):
+        sup = self.login("sup@test")
+        sup.post(f"/tasks/{self.p1}/print-flag", data={"next": "/"})
+        sup.post("/sites/1/print/clear")
+        self.assertEqual(self.db_val("SELECT print_flag FROM tasks WHERE id=?", (self.p1,)), 0)
+
+    def test_redirect_only_to_local_path(self):
+        self.assertEqual(A._safe_next("//evil.example", "/x"), "/x")
+        self.assertEqual(A._safe_next("/sites/1", "/x"), "/sites/1")
+
+    def test_owner_cannot_mark(self):
+        self.assertEqual(self.login("owner@test").post(f"/tasks/{self.p1}/print-flag").status_code, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

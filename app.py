@@ -98,6 +98,7 @@ def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
     for stmt in ("ALTER TABLE task_assignments ADD COLUMN is_responsible INTEGER DEFAULT 0",
+                 "ALTER TABLE tasks ADD COLUMN print_flag INTEGER DEFAULT 0",
                  "ALTER TABLE task_assignments ADD COLUMN is_cc INTEGER DEFAULT 0",
                  "ALTER TABLE memberships ADD COLUMN notify_freq TEXT",
                  "ALTER TABLE sites ADD COLUMN digest_time TEXT DEFAULT '08:00'",
@@ -708,7 +709,7 @@ SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
-    "site_search": "tasks",
+    "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
@@ -937,6 +938,44 @@ def assign_task(task_id):
         db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
     db().commit()
     return redirect(url_for("site_warnings", site_id=t["site_id"]))
+
+
+def _safe_next(url, fallback):
+    return url if url and url.startswith("/") and not url.startswith("//") else fallback
+
+
+@app.route("/tasks/<int:task_id>/print-flag", methods=["POST"])
+def task_print_flag(task_id):
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    db().execute("UPDATE tasks SET print_flag=CASE WHEN print_flag=1 THEN 0 ELSE 1 END WHERE id=?", (task_id,))
+    db().commit()
+    return redirect(_safe_next(request.form.get("next"), url_for("site_view", site_id=t["site_id"])))
+
+
+@app.route("/sites/<int:site_id>/print")
+def site_print(site_id):
+    """Printable list of the tasks marked for printing."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rows = db().execute("SELECT * FROM tasks WHERE site_id=? AND print_flag=1 ORDER BY public_no",
+                        (site_id,)).fetchall()
+    return page("להדפסה - " + s["name"], """
+<style>@media print { header, .noprint { display: none !important; } main { padding: 0; } }</style>
+<p class="noprint"><button onclick="window.print()">הדפסה</button>
+<form method="post" action="{{ url_for('site_print_clear', site_id=s['id']) }}" style="display:inline">
+<button onclick="return confirm('לבטל את כל הסימונים להדפסה?')">ביטול כל הסימונים</button></form></p>
+<h3>משימות להדפסה ({{ rows|length }})</h3>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th></tr>
+{% for t in rows %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
+<td>{{ t['assignee_text'] or '' }}</td><td>{{ t['target_text'] or '' }}</td><td>{{ t['status'] }}</td></tr>
+{% else %}<tr><td colspan="6">לא סומנו משימות להדפסה</td></tr>{% endfor %}</table>
+""", rows=rows, s=s, url_for=url_for)
+
+
+@app.route("/sites/<int:site_id>/print/clear", methods=["POST"])
+def site_print_clear(site_id):
+    db().execute("UPDATE tasks SET print_flag=0 WHERE site_id=?", (site_id,))
+    db().commit()
+    return redirect(url_for("site_print", site_id=site_id))
 
 
 @app.route("/tasks/<int:task_id>/triage", methods=["POST"])
@@ -1215,11 +1254,14 @@ def site_search(site_id):
 <form method="get"><input name="q" value="{{ q }}" size="40" placeholder='מילה, או צמד מילים בגרשיים' >
 <button>חיפוש</button></form>
 {% if terms %}<p class="note">נמצאו {{ results|length }} משימות.</p>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th></tr>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in results %}<tr><td>{{ hl(t['public_no'], terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
 <td>{{ hl(t['text'], terms) }}</td><td>{{ hl(t['assignee_text'], terms) }}</td>
-<td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td></tr>{% else %}
-<tr><td colspan="6">אין תוצאות</td></tr>{% endfor %}</table>{% endif %}
+<td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td>
+<td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
+<input type="hidden" name="next" value="{{ request.full_path }}">
+<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% else %}
+<tr><td colspan="7">אין תוצאות</td></tr>{% endfor %}</table>{% endif %}
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 """, q=q, terms=terms, results=results, hl=highlight, s=s, url_for=url_for)
 
@@ -1764,14 +1806,17 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a></p>
 <h3>משימות פתוחות</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
 <td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>לידיעה</option><option>בוצע</option></select>
-<input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td></tr>{% endfor %}</table>
+<input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
+<td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
+<input type="hidden" name="next" value="{{ request.full_path }}">
+<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
