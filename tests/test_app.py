@@ -778,5 +778,29 @@ class AmbiguousFirstNameTests(AutoAssignTests):
                 "JOIN contacts c ON c.id=a.contact_id WHERE a.task_id=?", (tid,)).fetchall()]
 
 
+class InformationOnlyTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text, status, target_date) "
+                      "VALUES (1, '5', 'לידיעה בלבד', 'ישראל', 'לידיעה', ?)", (A.dt.date.today().isoformat(),))
+            d.commit()
+
+    def test_information_only_task_gets_no_reminder_and_no_warning(self):
+        with A.app.app_context():
+            A.send_task_reminders(1, A.dt.date.today())
+            self.assertEqual(A.db().execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
+        self.assertNotIn("לידיעה בלבד", html)
+
+    def test_status_can_be_set_to_information_only(self):
+        with A.app.app_context():
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='5'").fetchone()[0]
+        self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "בטיפול", "by": "x"})
+        self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "לידיעה", "by": "x"})
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "לידיעה")
+
+
 if __name__ == "__main__":
     unittest.main()

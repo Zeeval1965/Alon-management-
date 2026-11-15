@@ -485,7 +485,7 @@ def send_task_reminders(site_id, today=None):
     today = today or dt.date.today()
     limit = (today + dt.timedelta(days=1)).isoformat()
     tasks = db().execute(
-        """SELECT * FROM tasks WHERE site_id=? AND status!='בוצע'
+        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה')
            AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
@@ -1147,7 +1147,7 @@ def site_warnings(site_id):
                   for k, v in groups.items() if len(v) > 1]
     unassigned = db().execute(
         """SELECT t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
-           WHERE t.site_id=? AND t.status!='בוצע'
+           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה')
              AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
            ORDER BY t.public_no""", (site_id,)).fetchall()
     pending = db().execute(
@@ -1659,7 +1659,7 @@ def site_view(site_id):
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
 <td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
-<select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>בוצע</option></select>
+<select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>לידיעה</option><option>בוצע</option></select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
