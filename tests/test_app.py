@@ -598,10 +598,25 @@ class AutoAssignTests(AppTestCase):
         row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=?", (tid,))
         self.assertEqual((row["confirmed"], row["is_responsible"]), (1, 1))
 
-    def test_partial_name_waits_for_supervisor(self):
+    def test_partial_name_is_linked_when_unique_on_the_site(self):
         tid = self.add_task("דני")
         row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=?", (tid,))
-        self.assertEqual((row["confirmed"], row["is_responsible"]), (0, 0))
+        self.assertEqual((row["confirmed"], row["is_responsible"]), (1, 1))
+
+    def test_partial_name_waits_when_several_people_share_the_first_name(self):
+        with A.app.app_context():
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('dani2@x.test','דני','כהן')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            d.commit()
+        tid = self.add_task("דני")
+        rows = [tuple(r) for r in self.rows_for(tid)]
+        self.assertTrue(rows)
+        self.assertTrue(all(r[0] == 0 for r in rows))
+
+    def rows_for(self, tid):
+        with A.app.app_context():
+            return A.db().execute("SELECT confirmed FROM task_assignments WHERE task_id=?", (tid,)).fetchall()
 
 
 class MultiRoleCellTests(AppTestCase):
@@ -702,6 +717,23 @@ class RematchTests(AutoAssignTests):
         self.login("sup@test").post("/sites/1/assignments/rematch")
         row = self.db_one("SELECT confirmed FROM task_assignments WHERE task_id=?", (tid,))
         self.assertEqual(row["confirmed"], 1)
+
+
+class ContactCardTests(AutoAssignTests):
+    def test_task_shows_linked_name_as_link_to_card(self):
+        tid = self.add_task("גיל כהן")
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        cid = self.db_val("SELECT contact_id FROM task_assignments WHERE task_id=?", (tid,))
+        self.assertIn(f"/sites/1/contacts/{cid}", html)
+        self.assertIn("גיל כהן", html)
+
+    def test_card_is_read_only_and_visible_to_members(self):
+        tid = self.add_task("גיל כהן")
+        cid = self.db_val("SELECT contact_id FROM task_assignments WHERE task_id=?", (tid,))
+        r = self.login("owner@test").get(f"/sites/1/contacts/{cid}")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("כרטיס איש קשר", r.get_data(as_text=True))
+        self.assertNotIn("/edit", r.get_data(as_text=True))
 
 
 if __name__ == "__main__":

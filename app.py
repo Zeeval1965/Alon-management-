@@ -706,7 +706,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks", "assignments_rematch": "tasks",
+    "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -944,12 +944,18 @@ def rematch_site(site_id):
 
 def suggest_assignees(task_id):
     """Find contacts of the site whose name appears in the task's 'לטיפול' text.
-    A full-name match (first and last name) is linked at once; the first confirmed person
-    becomes responsible. Partial matches ('ליאור י', first name only) wait for the supervisor."""
+    A full-name match (first and last name) is linked at once. A partial match ('ליאור י', first
+    name only) is linked at once only when exactly one person on the site has that first name;
+    otherwise it waits for the supervisor. The first linked person becomes responsible."""
     t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     text = t["assignee_text"] or ""
     found = []
-    for c in _full_names(t["site_id"]):
+    people = list(_full_names(t["site_id"]))
+    firsts = {}
+    for c in people:
+        key = (c["first_name"] or "").strip()
+        firsts[key] = firsts.get(key, 0) + 1
+    for c in people:
         first, last = (c["first_name"] or "").strip(), (c["last_name"] or "").strip()
         if not first:
             continue
@@ -960,7 +966,8 @@ def suggest_assignees(task_id):
         candidates.append((first, False))
         for cand, full in candidates:
             if re.search(rf"(?<!\w){re.escape(cand)}(?!\w)", text):
-                found.append((c["id"], cand, full))
+                auto = full or firsts.get(first, 0) == 1
+                found.append((c["id"], cand, auto))
                 break
     for cid, raw, full in found:
         db().execute(
@@ -1092,7 +1099,7 @@ def assignments(site_id):
 בכל משימה יש אדם אחד אחראי לביצוע, והאחרים מקבלים גישה לצפייה בלבד.</p>
 <table><tr><th>משימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
 {% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
-<td>{{ r['first_name'] }} {{ r['last_name'] or '' }} ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
+<td><a href="{{ url_for('contact_card', site_id=site_id, contact_id=r['contact_id']) }}">{{ r['first_name'] }} {{ r['last_name'] or '' }}</a> ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
 <td>{% if not r['confirmed'] %}ממתין לאישור{% elif r['is_responsible'] %}אחראי לביצוע{% elif r['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td>
 <td>{% if not r['confirmed'] %}
 <form method="post" action="{{ url_for('confirm_assignee', task_id=r['task_id'], contact_id=r['contact_id']) }}">
@@ -1113,8 +1120,10 @@ def assignments(site_id):
 
 @app.route("/sites/<int:site_id>/warnings")
 def site_warnings(site_id):
-    """Things to fix: the same person recorded more than once, and tasks with no one assigned."""
+    """Things to fix: the same person recorded more than once, tasks with no one assigned, and
+    names that still wait for the supervisor. The name check is run again first."""
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rematch_site(site_id)
     people = db().execute(
         """SELECT c.id, c.first_name, c.last_name, c.email, c.org, m.site_role
            FROM memberships m JOIN contacts c ON c.id = m.contact_id WHERE m.site_id=?
@@ -1133,17 +1142,59 @@ def site_warnings(site_id):
            WHERE t.site_id=? AND t.status!='בוצע'
              AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
            ORDER BY t.public_no""", (site_id,)).fetchall()
+    pending = db().execute(
+        """SELECT t.public_no, t.topic, t.text, a.raw_name, c.first_name, c.last_name, c.org
+           FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
+           WHERE t.site_id=? AND t.status!='בוצע' AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
     return page("התרעות - " + s["name"], """
 <h3>אנשי קשר כפולים (אותו שם, יותר מרשומה אחת) - מומלץ למחוק את הכפילות</h3>
 <table><tr><th>שם</th><th>רשומות</th></tr>
 {% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
+<h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
+<table><tr><th>משימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
+{% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td>{{ p['raw_name'] }}</td>
+<td>{{ p['first_name'] }} {{ p['last_name'] or '' }}</td><td>{{ p['org'] or '' }}</td></tr>
+{% else %}<tr><td colspan="4">אין שיוכים ממתינים. לאישור השיוכים: <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות</a></td></tr>{% endfor %}</table>
 <h3>משימות פתוחות ללא שיוך לאיש קשר</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
 {% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] or '' }}</td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", duplicates=duplicates, unassigned=unassigned, s=s, url_for=url_for)
+""", duplicates=duplicates, unassigned=unassigned, pending=pending, s=s, url_for=url_for)
+
+
+@app.route("/sites/<int:site_id>/contacts/<int:contact_id>")
+def contact_card(site_id, contact_id):
+    """Personal details card of a contact on this site. Read-only."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    c = db().execute("SELECT id, first_name, last_name, org, role, phone, mobile, email, address FROM contacts WHERE id=?",
+                     (contact_id,)).fetchone() or abort(404)
+    roles = [r[0] for r in db().execute(
+        "SELECT site_role FROM memberships WHERE site_id=? AND contact_id=? ORDER BY site_role",
+        (site_id, contact_id)).fetchall()]
+    tasks = db().execute(
+        """SELECT t.public_no, t.topic, t.status, a.confirmed, a.is_responsible, a.is_cc FROM task_assignments a
+           JOIN tasks t ON t.id = a.task_id WHERE t.site_id=? AND a.contact_id=? ORDER BY t.public_no""",
+        (site_id, contact_id)).fetchall()
+    return page("כרטיס איש קשר", """
+<h3>{{ c['first_name'] }} {{ c['last_name'] or '' }}</h3>
+<table>
+<tr><th>ארגון</th><td>{{ c['org'] or '' }}</td></tr>
+<tr><th>תפקיד</th><td>{{ c['role'] or '' }}</td></tr>
+<tr><th>תפקיד באתר</th><td>{{ roles|join(', ') }}</td></tr>
+<tr><th>טלפון</th><td>{{ c['phone'] or '' }}</td></tr>
+<tr><th>נייד</th><td>{{ c['mobile'] or '' }}</td></tr>
+<tr><th>דוא"ל</th><td dir="ltr">{{ c['email'] or '' }}</td></tr>
+<tr><th>כתובת</th><td>{{ c['address'] or '' }}</td></tr>
+</table>
+<h3>משימות</h3>
+<table><tr><th>משימה</th><th>סטטוס</th><th>תפקיד בשיוך</th></tr>
+{% for t in tasks %}<tr><td>{{ t['public_no'] }} {{ t['topic'] or '' }}</td><td>{{ t['status'] }}</td>
+<td>{% if not t['confirmed'] %}ממתין לאישור{% elif t['is_responsible'] %}אחראי לביצוע{% elif t['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td></tr>
+{% else %}<tr><td colspan="3">אין משימות משויכות</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('site_contacts', site_id=s['id']) }}">חזרה לרשימת אנשי הקשר</a></p>
+""", c=c, roles=roles, tasks=tasks, s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/contacts")
@@ -1542,6 +1593,17 @@ def contacts_import_confirm():
     return redirect(url_for("site_view", site_id=site_id))
 
 
+def _linked_people(site_id):
+    """task_id -> [(contact_id, name)] for the site, for linking names to their cards."""
+    out = {}
+    for r in db().execute(
+            """SELECT a.task_id, c.id, c.first_name, c.last_name FROM task_assignments a
+               JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
+               WHERE t.site_id=? ORDER BY a.is_responsible DESC, c.first_name""", (site_id,)).fetchall():
+        out.setdefault(r[0], []).append({"id": r[1], "name": f"{r[2] or ''} {r[3] or ''}".strip()})
+    return out
+
+
 @app.route("/sites/<int:site_id>")
 def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -1560,14 +1622,14 @@ def site_view(site_id):
 <h3>משימות פתוחות</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
-<td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{{ t['assignee_text'] }}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
+<td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>בוצע</option></select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] }}</td></tr>{% endfor %}</table>
-""", s=s, weekdays=WEEKDAYS, open_t=open_t, done_t=done_t, rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+{% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
+""", s=s, weekdays=WEEKDAYS, open_t=open_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
