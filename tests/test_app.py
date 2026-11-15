@@ -794,6 +794,12 @@ class InformationOnlyTests(AppTestCase):
         html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
         self.assertNotIn("לידיעה בלבד", html)
 
+    def test_information_only_task_sits_under_information_heading_not_open(self):
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        info_at = html.index("<h3>לידיעה</h3>")
+        self.assertGreater(html.index("לידיעה בלבד"), info_at)
+        self.assertLess(html.index("<h3>משימות פתוחות</h3>"), info_at)
+
     def test_status_can_be_set_to_information_only(self):
         with A.app.app_context():
             tid = A.db().execute("SELECT id FROM tasks WHERE public_no='5'").fetchone()[0]

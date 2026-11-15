@@ -1264,7 +1264,7 @@ def site_search(site_id):
             linked = {r[0] for r in db().execute(
                 "SELECT task_id FROM task_assignments WHERE contact_id=?", (contact_id,)).fetchall()}
         for t in db().execute("SELECT * FROM tasks WHERE site_id=? ORDER BY public_no", (site_id,)).fetchall():
-            if view == "open" and t["status"] == "בוצע":
+            if view == "open" and t["status"] in ("בוצע", "לידיעה"):
                 continue
             if view == "done" and t["status"] != "בוצע":
                 continue
@@ -1869,7 +1869,9 @@ def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
     today = dt.date.today().isoformat()
-    open_t = sorted([t for t in tasks if t["status"] != "בוצע"], key=lambda t: (priority_of(t, today), t["public_no"]))
+    open_t = sorted([t for t in tasks if t["status"] not in ("בוצע", "לידיעה")],
+                    key=lambda t: (priority_of(t, today), t["public_no"]))
+    info_t = sorted([t for t in tasks if t["status"] == "לידיעה"], key=lambda t: t["public_no"])
     done_t = [t for t in tasks if t["status"] == "בוצע"]
     month = db().execute("SELECT month_current, month_total, meeting_date FROM meetings WHERE site_id=? AND status='published' AND month_current IS NOT NULL ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
     return page(s["name"], """
@@ -1889,10 +1891,13 @@ def site_view(site_id):
 <td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
+<h3>לידיעה</h3>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
+{% for t in info_t %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, weekdays=WEEKDAYS, open_t=open_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
