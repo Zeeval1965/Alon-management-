@@ -684,5 +684,25 @@ class RolesSyncTests(AppTestCase):
         self.assertEqual(self.login("sup@test").get("/roles/sync").status_code, 403)
 
 
+class RematchTests(AutoAssignTests):
+    def test_name_followed_by_punctuation_matches(self):
+        tid = self.add_task("גיל כהן' ודני")
+        row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=?", (tid,))
+        self.assertEqual((row["confirmed"], row["is_responsible"]), (1, 1))
+
+    def test_task_created_before_contact_is_matched_by_rematch(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'7','x','משה לוי')")
+            A.db().commit()
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='7'").fetchone()[0]
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('moshe@x.test','משה','לוי')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            d.commit()
+        self.login("sup@test").post("/sites/1/assignments/rematch")
+        row = self.db_one("SELECT confirmed FROM task_assignments WHERE task_id=?", (tid,))
+        self.assertEqual(row["confirmed"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -706,7 +706,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks",
+    "site_warnings": "tasks", "assignments_rematch": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -935,6 +935,13 @@ def _full_names(site_id):
     return rows
 
 
+def rematch_site(site_id):
+    """Run name matching again for the site's open tasks (after contacts were imported or changed)."""
+    for t in db().execute("SELECT id FROM tasks WHERE site_id=? AND status!='בוצע'", (site_id,)).fetchall():
+        suggest_assignees(t["id"])
+    db().commit()
+
+
 def suggest_assignees(task_id):
     """Find contacts of the site whose name appears in the task's 'לטיפול' text.
     A full-name match (first and last name) is linked at once; the first confirmed person
@@ -952,7 +959,7 @@ def suggest_assignees(task_id):
             candidates.append((f"{first} {last[:1]}", False))
         candidates.append((first, False))
         for cand, full in candidates:
-            if re.search(rf"(?<!\S){re.escape(cand)}(?!\S)", text):
+            if re.search(rf"(?<!\w){re.escape(cand)}(?!\w)", text):
                 found.append((c["id"], cand, full))
                 break
     for cid, raw, full in found:
@@ -1062,6 +1069,13 @@ def cc_report(site_id):
 """, people=people, s=s, url_for=url_for)
 
 
+@app.route("/sites/<int:site_id>/assignments/rematch", methods=["POST"])
+def assignments_rematch(site_id):
+    db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rematch_site(site_id)
+    return redirect(url_for("assignments", site_id=site_id))
+
+
 @app.route("/sites/<int:site_id>/assignments")
 def assignments(site_id):
     rows = db().execute(
@@ -1092,6 +1106,8 @@ def assignments(site_id):
 <form method="post" action="{{ url_for('toggle_cc', task_id=r['task_id'], contact_id=r['contact_id']) }}">
 <button>{% if r['is_cc'] %}בטל מכותב{% else %}סמן כמכותב{% endif %}</button></form>{% endif %}{% endif %}</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('cc_report', site_id=site_id) }}">דוח מכותבים</a></p>
+<form method="post" action="{{ url_for('assignments_rematch', site_id=site_id) }}">
+<button>חיפוש שיוך מחדש לפי השמות בכל המשימות הפתוחות</button></form>
 """, rows=rows, url_for=url_for, site_id=site_id)
 
 
@@ -1334,6 +1350,7 @@ def roles_sync_confirm():
             db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
                          (site_id, item["contact_id"], role))
     db().commit()
+    rematch_site(site_id)
     return redirect(url_for("site_view", site_id=site_id))
 
 
@@ -1520,6 +1537,7 @@ def contacts_import_confirm():
                 edited[field] = value
         chosen.append(edited)
     added, skipped = import_rows(chosen, site_id=site_id)
+    rematch_site(site_id)
     flash(f"יובאו {added} שורות (איחוד לפי דוא\"ל). שורות שדולגו: {skipped}")
     return redirect(url_for("site_view", site_id=site_id))
 
