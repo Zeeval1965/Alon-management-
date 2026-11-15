@@ -1500,6 +1500,7 @@ button:hover{background:#A31F1F}
 input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radius:3px}
 .note{color:var(--gray);font-size:13px}
 .flash{background:var(--red-light);color:var(--red);padding:8px;border-radius:3px}
+@media (max-width:640px){table.cards,table.cards tbody,table.cards tr,table.cards td{display:block;width:100%}table.cards tr:first-child{display:none}table.cards tr{border:1px solid #ddd;border-radius:6px;margin:0 0 10px;padding:6px;background:#fff}table.cards td{border:0;padding:3px 0;min-width:0!important;white-space:normal!important}table.cards td:empty{display:none}table.cards td::before{content:attr(data-label);display:block;color:#6B6B6B;font-size:12px}}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
@@ -1882,21 +1883,21 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a></p>
 <h3>משימות פתוחות</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
-{% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>
-<td>{{ t['text'] }}</td><td style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td>{{ t['target_text'] }}</td><td>{{ t['status'] }}
+<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
+{% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
+<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>לידיעה</option><option>בוצע</option></select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
-<td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
+<td data-label="הדפסה"><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
 <h3>לידיעה</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in info_t %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
+<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
+{% for t in info_t %}<tr><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in done_t %}<tr class="done"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td><td>{{ t['text'] }}</td><td>{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a>{% if not loop.last %}, {% endif %}{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
+<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
+{% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
