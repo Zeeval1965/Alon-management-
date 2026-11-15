@@ -929,6 +929,8 @@ def assign_task(task_id):
         "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,1)",
         (task_id, cid, ""))
     db().execute("UPDATE task_assignments SET confirmed=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
+    # the supervisor's choice replaces the other pending suggestions for this task
+    db().execute("DELETE FROM task_assignments WHERE task_id=? AND confirmed=0 AND contact_id<>?", (task_id, cid))
     if not db().execute("SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone():
         db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
     db().commit()
@@ -1019,7 +1021,12 @@ def suggest_assignees(task_id):
         auto = kind == "full" or (kind == "first" and firsts.get(first, 0) == 1) \
             or (kind == "initial" and initials.get(ikey, 0) == 1)
         found.append((cid, cand, auto))
+    # once someone is confirmed on the task, only confirmed matches are added again (no new suggestions)
+    already_confirmed = db().execute(
+        "SELECT 1 FROM task_assignments WHERE task_id=? AND confirmed=1", (task_id,)).fetchone() is not None
     for cid, raw, full in found:
+        if already_confirmed and not full:
+            continue
         db().execute(
             "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,?)",
             (task_id, cid, raw, 1 if full else 0))

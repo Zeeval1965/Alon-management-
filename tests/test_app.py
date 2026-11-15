@@ -875,5 +875,26 @@ class ManualAssignTests(AppTestCase):
         self.assertIn("שייך", html)
 
 
+class ChoiceReplacesSuggestionsTests(AppTestCase):
+    def test_manual_choice_removes_other_pending_suggestions_and_they_do_not_return(self):
+        with A.app.app_context():
+            d = A.db()
+            for email, last in (("ys2@x.test", "ישראלי"), ("eg2@x.test", "בניה ירוקה")):
+                cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES (?,'ליאור',?)", (email, last))
+                d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'C1','x','ליאור')")
+            d.commit()
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='C1'").fetchone()[0]
+            A.suggest_assignees(tid)
+            keep = d.execute("SELECT id FROM contacts WHERE email='eg2@x.test'").fetchone()[0]
+            d.commit()
+        self.login("sup@test").post(f"/tasks/{tid}/assign", data={"contact_id": str(keep)})
+        self.login("sup@test").get("/sites/1/warnings")  # runs the re-check again
+        with A.app.app_context():
+            rows = [tuple(r) for r in A.db().execute(
+                "SELECT contact_id, confirmed FROM task_assignments WHERE task_id=?", (tid,)).fetchall()]
+        self.assertEqual(rows, [(keep, 1)])
+
+
 if __name__ == "__main__":
     unittest.main()
