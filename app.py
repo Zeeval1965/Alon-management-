@@ -234,10 +234,12 @@ def _contact_rows(path):
             notes.append('חסר דוא"ל - לא ייובא')
         elif not re.fullmatch(EMAIL_PATTERN, email):
             notes.append('דוא"ל לא תקין - לא ייובא')
+        elif email in seen and seen[email][1] == role:
+            notes.append(f"כפילות זהה לשורה {seen[email][0]} (אותו אדם ואותו תפקיד) - מומלץ למחוק אחת מהשורות")
         elif email in seen:
-            notes.append(f"מופיע גם בשורה {seen[email]} - יתווסף עם התפקיד שבשורה זו")
+            notes.append(f"מופיע גם בשורה {seen[email][0]} - יתווסף עם התפקיד שבשורה זו")
         if email and email not in seen:
-            seen[email] = line
+            seen[email] = (line, role)
         if not first and not last:
             notes.append("חסר שם")
         out.append({"line": line, "email": email, "first": first, "last": last, "role": role,
@@ -270,11 +272,14 @@ def import_rows(rows, site_id=None, site_role=None):
             (email, (row.get("first") or "").strip(), (row.get("last") or "").strip(),
              (row.get("role") or "").strip(), (row.get("org") or "").strip(), (row.get("phone") or "").strip(),
              (row.get("mobile") or "").strip(), (row.get("address") or "").strip()))
-        membership_role = _site_role_of(row.get("role")) or site_role
-        if site_id and membership_role:
+        # a role cell may list several roles ("יועץ קרקע, מפקח"): each one becomes its own membership
+        parts = [_site_role_of(p) for p in (row.get("role") or "").split(",")]
+        membership_roles = [r for r in parts if r] or ([site_role] if site_role else [])
+        if site_id and membership_roles:
             cid = db().execute("SELECT id FROM contacts WHERE email=?", (email,)).fetchone()[0]
-            db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
-                         (site_id, cid, membership_role))
+            for membership_role in dict.fromkeys(membership_roles):
+                db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
+                             (site_id, cid, membership_role))
         added += 1
     db().commit()
     return added, skipped
@@ -701,6 +706,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
+    "site_warnings": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -1089,6 +1095,41 @@ def assignments(site_id):
 """, rows=rows, url_for=url_for, site_id=site_id)
 
 
+@app.route("/sites/<int:site_id>/warnings")
+def site_warnings(site_id):
+    """Things to fix: the same person recorded more than once, and tasks with no one assigned."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    people = db().execute(
+        """SELECT c.id, c.first_name, c.last_name, c.email, c.org, m.site_role
+           FROM memberships m JOIN contacts c ON c.id = m.contact_id WHERE m.site_id=?
+           ORDER BY c.first_name, c.last_name, c.id""", (site_id,)).fetchall()
+    groups = {}
+    for p in people:
+        key = ((p["first_name"] or "").strip(), (p["last_name"] or "").strip())
+        if key[0] and key[1]:
+            groups.setdefault(key, {})
+            groups[key].setdefault(p["id"], {"email": p["email"], "org": p["org"] or "", "roles": []})
+            groups[key][p["id"]]["roles"].append(p["site_role"])
+    duplicates = [{"name": f"{k[0]} {k[1]}", "records": list(v.values())}
+                  for k, v in groups.items() if len(v) > 1]
+    unassigned = db().execute(
+        """SELECT t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
+           WHERE t.site_id=? AND t.status!='בוצע'
+             AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
+           ORDER BY t.public_no""", (site_id,)).fetchall()
+    return page("התרעות - " + s["name"], """
+<h3>אנשי קשר כפולים (אותו שם, יותר מרשומה אחת) - מומלץ למחוק את הכפילות</h3>
+<table><tr><th>שם</th><th>רשומות</th></tr>
+{% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
+{% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
+<h3>משימות פתוחות ללא שיוך לאיש קשר</h3>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
+{% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td><td>{{ t['assignee_text'] or '' }}</td></tr>
+{% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+""", duplicates=duplicates, unassigned=unassigned, s=s, url_for=url_for)
+
+
 @app.route("/sites/<int:site_id>/contacts")
 def site_contacts(site_id):
     """Read-only list of the project's contacts, with the site roles each one holds."""
@@ -1385,7 +1426,7 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט (לצפייה)</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a></p>
 <h3>משימות פתוחות</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>

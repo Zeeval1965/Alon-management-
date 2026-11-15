@@ -603,5 +603,44 @@ class AutoAssignTests(AppTestCase):
         self.assertEqual((row["confirmed"], row["is_responsible"]), (0, 0))
 
 
+class MultiRoleCellTests(AppTestCase):
+    def test_role_cell_with_several_roles_becomes_several_memberships(self):
+        with A.app.app_context():
+            A.import_rows([{"email": "multi@x.test", "first": "אביה", "last": "זאבי",
+                            "role": "יועץ קרקע, מפקח"}], site_id=1)
+            rows = A.db().execute("SELECT m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                                  "WHERE c.email='multi@x.test' ORDER BY m.site_role").fetchall()
+            roles = sorted(r[0] for r in rows)
+        self.assertEqual(roles, ["יועץ קרקע", "מפקח"])
+
+
+class WarningsTests(AppTestCase):
+    def test_same_person_same_role_twice_in_file_is_flagged_for_deletion(self):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "אנשי קשר"
+        ws.append(['דוא"ל', "שם פרטי", "שם משפחה", "תפקיד", "ארגון"])
+        ws.append(["a@x.test", "דני", "לוי", "נציגות", "א"])
+        ws.append(["a@x.test", "דני", "לוי", "נציגות", "א"])
+        path = os.path.join(self.tmp.name, "dup.xlsx")
+        wb.save(path)
+        rows = A._contact_rows(path)
+        self.assertIn("כפילות זהה", rows[1]["notes"][0])
+
+    def test_warnings_page_lists_duplicates_and_unassigned_tasks(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('d1@x.test','דני','לוי')")
+            d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('d2@x.test','דני','לוי')")
+            for cid in d.execute("SELECT id FROM contacts WHERE email IN ('d1@x.test','d2@x.test')").fetchall():
+                d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cid[0],))
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'9','משימה ללא שיוך','ישראל')")
+            d.commit()
+        html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
+        self.assertIn("d1@x.test", html)
+        self.assertIn("משימה ללא שיוך", html)
+
+
 if __name__ == "__main__":
     unittest.main()
