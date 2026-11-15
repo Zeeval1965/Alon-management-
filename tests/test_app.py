@@ -736,5 +736,47 @@ class ContactCardTests(AutoAssignTests):
         self.assertNotIn("/edit", r.get_data(as_text=True))
 
 
+class BulkDeleteTests(AppTestCase):
+    def test_admin_deletes_selected_and_keeps_self_and_admins(self):
+        owner = self.db_val("SELECT id FROM contacts WHERE email='owner@test'")
+        admin = self.db_val("SELECT id FROM contacts WHERE email='admin@test'")
+        cons = self.db_val("SELECT id FROM contacts WHERE email='cons@test'")
+        c = self.login("admin@test")
+        c.post("/contacts/bulk-delete", data={"site_id": "1", "ids": [str(owner), str(admin), str(cons)]})
+        self.assertIsNone(self.db_val("SELECT id FROM contacts WHERE id=?", (owner,)))
+        self.assertIsNone(self.db_val("SELECT id FROM contacts WHERE id=?", (cons,)))
+        self.assertIsNotNone(self.db_val("SELECT id FROM contacts WHERE id=?", (admin,)))
+
+    def test_others_cannot_bulk_delete(self):
+        cons = self.db_val("SELECT id FROM contacts WHERE email='cons@test'")
+        r = self.login("sup@test").post("/contacts/bulk-delete", data={"site_id": "1", "ids": [str(cons)]})
+        self.assertEqual(r.status_code, 403)
+        self.assertIsNotNone(self.db_val("SELECT id FROM contacts WHERE id=?", (cons,)))
+
+    def test_admin_sees_selection_controls_others_do_not(self):
+        html_admin = self.login("admin@test").get("/sites/1/contacts").get_data(as_text=True)
+        html_sup = self.login("sup@test").get("/sites/1/contacts").get_data(as_text=True)
+        self.assertIn("מחיקת הנבחרים", html_admin)
+        self.assertNotIn("מחיקת הנבחרים", html_sup)
+
+
+class AmbiguousFirstNameTests(AutoAssignTests):
+    def test_initial_match_does_not_also_suggest_bare_first_name(self):
+        with A.app.app_context():
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('lior@x.test','דני','ישראלי')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועצים')", (cur.lastrowid,))
+            d.commit()
+        tid = self.add_task("דני י...")
+        rows = self.rows_for_names(tid)
+        self.assertEqual(rows, ["דני ישראלי"])
+
+    def rows_for_names(self, tid):
+        with A.app.app_context():
+            return [r[0] for r in A.db().execute(
+                "SELECT c.first_name || ' ' || COALESCE(c.last_name,'') FROM task_assignments a "
+                "JOIN contacts c ON c.id=a.contact_id WHERE a.task_id=?", (tid,)).fetchall()]
+
+
 if __name__ == "__main__":
     unittest.main()

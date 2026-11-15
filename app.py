@@ -955,20 +955,28 @@ def suggest_assignees(task_id):
     for c in people:
         key = (c["first_name"] or "").strip()
         firsts[key] = firsts.get(key, 0) + 1
+    hits = []  # (contact_id, matched text, first name, kind) with kind: full / initial / first
     for c in people:
         first, last = (c["first_name"] or "").strip(), (c["last_name"] or "").strip()
         if not first:
             continue
         candidates = []
         if last:
-            candidates.append((f"{first} {last}", True))
-            candidates.append((f"{first} {last[:1]}", False))
-        candidates.append((first, False))
-        for cand, full in candidates:
+            candidates.append((f"{first} {last}", "full"))
+            candidates.append((f"{first} {last[:1]}", "initial"))
+        candidates.append((first, "first"))
+        for cand, kind in candidates:
             if re.search(rf"(?<!\w){re.escape(cand)}(?!\w)", text):
-                auto = full or firsts.get(first, 0) == 1
-                found.append((c["id"], cand, auto))
+                hits.append((c["id"], cand, first, kind))
                 break
+    # "ליאור י" fits a person with that initial; a bare "ליאור" must not also be suggested
+    specific_firsts = {first for _, _, first, kind in hits if kind != "first"}
+    for cid, cand, first, kind in hits:
+        if kind == "first" and first in specific_firsts:
+            continue
+        auto = kind == "full" or (kind == "first" and firsts.get(first, 0) == 1) \
+            or (kind == "initial" and firsts.get(first, 0) == 1)
+        found.append((cid, cand, auto))
     for cid, raw, full in found:
         db().execute(
             "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,?)",
@@ -1210,12 +1218,39 @@ def site_contacts(site_id):
 {% if can_edit %}<p class="note">מנהל המערכת והמפקח יכולים לערוך פרטים. מחיקת שדות - למנהל המערכת בלבד.</p>
 <p><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר מקובץ</a></p>
 {% else %}<p class="note">רשימה לצפייה בלבד.</p>{% endif %}
-<table><tr><th>שם</th><th>ארגון</th><th>תפקיד באתר</th><th>טלפון</th><th>נייד</th><th>דוא"ל</th>{% if can_edit %}<th></th>{% endif %}</tr>
-{% for r in rows %}<tr><td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['org'] or '' }}</td>
+{% if is_admin %}<form method="post" action="{{ url_for('contacts_bulk_delete') }}" onsubmit="return confirm('למחוק את האנשים שסומנו? הפעולה אינה הפיכה.')">{% endif %}
+<table><tr>{% if is_admin %}<th><input type="checkbox" onclick="document.querySelectorAll('.pick').forEach(function(c){c.checked=this.checked}, this)" title="בחירת כל הרשומות"></th>{% endif %}
+<th>שם</th><th>ארגון</th><th>תפקיד באתר</th><th>טלפון</th><th>נייד</th><th>דוא"ל</th>{% if can_edit %}<th></th>{% endif %}</tr>
+{% for r in rows %}<tr>{% if is_admin %}<td><input type="checkbox" class="pick" name="ids" value="{{ r['id'] }}"></td>{% endif %}
+<td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['org'] or '' }}</td>
 <td>{{ r['site_roles'] }}</td><td>{{ r['phone'] or '' }}</td><td>{{ r['mobile'] or '' }}</td><td>{{ r['email'] or '' }}</td>
 {% if can_edit %}<td><a href="{{ url_for('contact_edit', contact_id=r['id']) }}">עריכה</a></td>{% endif %}</tr>{% endfor %}</table>
+{% if is_admin %}<input type="hidden" name="site_id" value="{{ s['id'] }}"><p><button>מחיקת הנבחרים</button> <span class="note">המחיקה מוחקת את האדם מכל האתרים. מנהל המערכת לא נמחק.</span></p>{% endif %}
+{% if is_admin %}</form>{% endif %}
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", rows=rows, s=s, url_for=url_for, can_edit=is_manager(current_contact()))
+""", rows=rows, s=s, url_for=url_for, can_edit=is_manager(current_contact()),
+        is_admin=bool(current_contact()["is_admin"]))
+
+
+@app.route("/contacts/bulk-delete", methods=["POST"])
+def contacts_bulk_delete():
+    """Administrator only (not listed in SECTION_OF, so require_access blocks everyone else)."""
+    me = current_contact()
+    site_id = request.form.get("site_id", type=int)
+    ids = [int(x) for x in request.form.getlist("ids") if x.isdigit()]
+    for cid in ids:
+        if cid == me["id"]:
+            continue
+        row = db().execute("SELECT is_admin FROM contacts WHERE id=?", (cid,)).fetchone()
+        if row is None or row["is_admin"]:
+            continue
+        db().execute("DELETE FROM task_assignments WHERE contact_id=?", (cid,))
+        db().execute("DELETE FROM memberships WHERE contact_id=?", (cid,))
+        db().execute("DELETE FROM contacts WHERE id=?", (cid,))
+    db().commit()
+    if site_id:
+        return redirect(url_for("site_contacts", site_id=site_id))
+    return redirect(url_for("sites"))
 
 # ---------- routes ----------
 PAGE = """<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8">
