@@ -847,5 +847,33 @@ class TriageTests(AppTestCase):
         self.assertIsNotNone(self.db_val("SELECT id FROM tasks WHERE id=?", (self.tid,)))
 
 
+class ManualAssignTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, assignee_text) VALUES (1,'M1','לבדוק','')")
+            A.db().commit()
+            self.tid = A.db().execute("SELECT id FROM tasks WHERE public_no='M1'").fetchone()[0]
+            self.cid = A.db().execute("SELECT id FROM contacts WHERE email='cons@test'").fetchone()[0]
+
+    def test_supervisor_assigns_from_list_and_it_becomes_responsible(self):
+        self.login("sup@test").post(f"/tasks/{self.tid}/assign", data={"contact_id": str(self.cid)})
+        row = self.db_one("SELECT confirmed, is_responsible FROM task_assignments WHERE task_id=? AND contact_id=?",
+                          (self.tid, self.cid))
+        self.assertEqual((row["confirmed"], row["is_responsible"]), (1, 1))
+
+    def test_only_members_of_the_site_can_be_assigned(self):
+        with A.app.app_context():
+            outsider = A.db().execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('out@x.test','זר','')").lastrowid
+            A.db().commit()
+        r = self.login("sup@test").post(f"/tasks/{self.tid}/assign", data={"contact_id": str(outsider)})
+        self.assertEqual(r.status_code, 400)
+
+    def test_warnings_page_offers_contact_list(self):
+        html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
+        self.assertIn('name="contact_id"', html)
+        self.assertIn("שייך", html)
+
+
 if __name__ == "__main__":
     unittest.main()

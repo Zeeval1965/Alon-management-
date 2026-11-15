@@ -707,6 +707,7 @@ SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "assign_task": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
@@ -913,6 +914,25 @@ def admin_queue_resolve(qid):
     db().execute("UPDATE admin_queue SET status=? WHERE id=?", (status, qid))
     db().commit()
     return redirect(url_for("admin_queue"))
+
+
+@app.route("/tasks/<int:task_id>/assign", methods=["POST"])
+def assign_task(task_id):
+    """Assign the task to a contact chosen from the site's list (the supervisor's decision)."""
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    cid = request.form.get("contact_id", type=int)
+    member = db().execute("SELECT 1 FROM memberships WHERE site_id=? AND contact_id=?",
+                          (t["site_id"], cid)).fetchone() if cid else None
+    if not member:
+        abort(400)
+    db().execute(
+        "INSERT OR IGNORE INTO task_assignments(task_id, contact_id, raw_name, confirmed) VALUES (?,?,?,1)",
+        (task_id, cid, ""))
+    db().execute("UPDATE task_assignments SET confirmed=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
+    if not db().execute("SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone():
+        db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
+    db().commit()
+    return redirect(url_for("site_warnings", site_id=t["site_id"]))
 
 
 @app.route("/tasks/<int:task_id>/triage", methods=["POST"])
@@ -1177,6 +1197,9 @@ def site_warnings(site_id):
         """SELECT t.id AS task_id, t.public_no, t.topic, t.text, a.raw_name, a.contact_id, c.first_name, c.last_name, c.org
            FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
            WHERE t.site_id=? AND t.status!='בוצע' AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
+    choices = db().execute(
+        """SELECT DISTINCT c.id, c.first_name, c.last_name FROM memberships m JOIN contacts c ON c.id = m.contact_id
+           WHERE m.site_id=? ORDER BY c.first_name, c.last_name""", (site_id,)).fetchall()
     return page("התרעות - " + s["name"], """
 <h3>אנשי קשר כפולים (אותו שם, יותר מרשומה אחת) - מומלץ למחוק את הכפילות</h3>
 <table><tr><th>שם</th><th>רשומות</th></tr>
@@ -1186,18 +1209,23 @@ def site_warnings(site_id):
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
 {% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
 <td>{{ p['raw_name'] }}</td>
-<td><a href="{{ url_for('assignments', site_id=s['id']) }}">{{ p['first_name'] }} {{ p['last_name'] or '' }}</a></td><td>{{ p['org'] or '' }}</td></tr>
+<td><form method="post" action="{{ url_for('assign_task', task_id=p['task_id']) }}">
+<select name="contact_id">{% for c in choices %}<option value="{{ c['id'] }}" {% if c['id'] == p['contact_id'] %}selected{% endif %}>{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
+<button>שייך</button></form></td><td>{{ p['org'] or '' }}</td></tr>
 {% else %}<tr><td colspan="5">אין שיוכים ממתינים. לאישור השיוכים: <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות</a></td></tr>{% endfor %}</table>
 <h3>משימות פתוחות ללא שיוך לאיש קשר</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
 {% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
 <td>{{ t['assignee_text'] or '' }}
+<form method="post" action="{{ url_for('assign_task', task_id=t['id']) }}" style="margin-top:4px">
+<select name="contact_id">{% for c in choices %}<option value="{{ c['id'] }}">{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
+<button>שייך</button></form>
 <form method="post" action="{{ url_for('task_triage', task_id=t['id']) }}" style="margin-top:4px">
 <button name="action" value="info">1 - לידיעה</button>
 <button name="action" value="delete" onclick="return confirm('למחוק את המשימה? הפעולה אינה הפיכה.')">2 - מחק</button></form></td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", duplicates=duplicates, unassigned=unassigned, pending=pending, s=s, url_for=url_for)
+""", duplicates=duplicates, unassigned=unassigned, pending=pending, choices=choices, s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/contacts/<int:contact_id>")
