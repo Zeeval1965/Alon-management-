@@ -1225,6 +1225,118 @@ def _valid_token(token):
     return len(token) == 32 and all(c in "0123456789abcdef" for c in token)
 
 
+def _desired_roles(role_text):
+    parts = [_site_role_of(p) for p in (role_text or "").split(",")]
+    return [r for r in dict.fromkeys(p for p in parts if p)]
+
+
+def _role_plan(rows, site_id):
+    """Compare the file with the site's roles, person by person. People not in the file keep
+    their roles; a row with no role leaves that person's roles alone."""
+    desired_by_contact, plan = {}, {}
+    for r in rows:
+        email = (r.get("email") or "").strip().lower()
+        if not email or not re.fullmatch(EMAIL_PATTERN, email):
+            continue
+        c = db().execute("SELECT id, first_name, last_name FROM contacts WHERE email=?", (email,)).fetchone()
+        if c is None:
+            plan.setdefault(email, {"email": email, "name": "", "contact_id": None,
+                                    "status": "לא קיים במערכת - ידולג"})
+            continue
+        desired = desired_by_contact.setdefault(c["id"], set())
+        desired.update(_desired_roles(r.get("role")))
+        plan[email] = {"email": email, "name": f"{c['first_name'] or ''} {c['last_name'] or ''}".strip(),
+                       "contact_id": c["id"], "status": ""}
+    out = []
+    for item in plan.values():
+        cid = item["contact_id"]
+        if cid is None:
+            out.append(item)
+            continue
+        current = {x[0] for x in db().execute(
+            "SELECT site_role FROM memberships WHERE site_id=? AND contact_id=?", (site_id, cid)).fetchall()}
+        desired = desired_by_contact.get(cid, set())
+        if not desired:
+            item["status"] = "אין תפקיד בקובץ - לא משתנה"
+            item.update(current=sorted(current), add=[], remove=[])
+        else:
+            item.update(current=sorted(current), add=sorted(desired - current), remove=sorted(current - desired),
+                        desired=sorted(desired))
+            item["status"] = "ללא שינוי" if not (desired ^ current) else "ייעודכן"
+        out.append(item)
+    return out
+
+
+@app.route("/roles/sync", methods=["GET"])
+def roles_sync():
+    all_sites = db().execute("SELECT id, name FROM sites ORDER BY id").fetchall()
+    return page("סנכרון תפקידים לפי קובץ (למנהל המערכת)", """
+<p class="note">לכל איש קשר שמופיע בקובץ, התפקידים באתר יהיו בדיוק אלה שבקובץ. אנשים שלא בקובץ לא ישתנו. לפני האישור תראה מה יתווסף ומה יוסר.</p>
+<form method="post" action="{{ url_for('roles_sync_preview') }}" enctype="multipart/form-data">
+<p>אתר <select name="site_id">{% for s in all_sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></p>
+<p>קובץ xlsx <input type="file" name="file" accept=".xlsx" required></p>
+<button>בדיקה</button></form>
+""", all_sites=all_sites, url_for=url_for)
+
+
+@app.route("/roles/sync/preview", methods=["POST"])
+def roles_sync_preview():
+    f = request.files.get("file")
+    site_id = request.form.get("site_id", type=int)
+    if not f or not site_id:
+        flash("יש לבחור אתר וקובץ")
+        return redirect(url_for("roles_sync"))
+    os.makedirs(_import_dir(), exist_ok=True)
+    token = uuid.uuid4().hex
+    tmp_xlsx = os.path.join(_import_dir(), token + ".xlsx")
+    f.save(tmp_xlsx)
+    try:
+        rows = _contact_rows(tmp_xlsx)
+    except ValueError as exc:
+        os.remove(tmp_xlsx)
+        flash(str(exc))
+        return redirect(url_for("roles_sync"))
+    os.remove(tmp_xlsx)
+    with open(_import_rows_file(token), "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False)
+    plan = _role_plan(rows, site_id)
+    site = db().execute("SELECT name FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    return page("בדיקת סנכרון תפקידים", """
+<p>אתר: <b>{{ site_name }}</b>. זו תצוגה מקדימה בלבד: עדיין לא נשמר דבר.</p>
+<table><tr><th>דוא"ל</th><th>שם</th><th>תפקידים היום</th><th>בקובץ</th><th>יתווסף</th><th>יוסר</th><th>סטטוס</th></tr>
+{% for p in plan %}<tr><td dir="ltr">{{ p['email'] }}</td><td>{{ p['name'] }}</td>
+<td>{{ (p['current'] or [])|join(', ') }}</td><td>{{ (p['desired'] or [])|join(', ') }}</td>
+<td>{{ (p['add'] or [])|join(', ') }}</td><td>{{ (p['remove'] or [])|join(', ') }}</td><td>{{ p['status'] }}</td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('roles_sync_confirm') }}">
+<input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="site_id" value="{{ site_id }}">
+<button>אישור הסנכרון</button></form>
+""", plan=plan, token=token, site_id=site_id, site_name=site["name"], url_for=url_for)
+
+
+@app.route("/roles/sync/confirm", methods=["POST"])
+def roles_sync_confirm():
+    token = request.form.get("token", "")
+    site_id = request.form.get("site_id", type=int)
+    path = _import_rows_file(token) if _valid_token(token) else None
+    if not site_id or not path or not os.path.exists(path):
+        flash("הבדיקה פגה, העלה את הקובץ שוב")
+        return redirect(url_for("roles_sync"))
+    with open(path, encoding="utf-8") as fh:
+        rows = json.load(fh)
+    os.remove(path)
+    for item in _role_plan(rows, site_id):
+        if item.get("contact_id") is None or item["status"] != "ייעודכן":
+            continue
+        for role in item["remove"]:
+            db().execute("DELETE FROM memberships WHERE site_id=? AND contact_id=? AND site_role=?",
+                         (site_id, item["contact_id"], role))
+        for role in item["add"]:
+            db().execute("INSERT OR IGNORE INTO memberships(site_id, contact_id, site_role) VALUES (?,?,?)",
+                         (site_id, item["contact_id"], role))
+    db().commit()
+    return redirect(url_for("site_view", site_id=site_id))
+
+
 @app.route("/contacts/<int:contact_id>/edit", methods=["GET", "POST"])
 def contact_edit(contact_id):
     c = db().execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone() or abort(404)

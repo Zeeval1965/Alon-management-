@@ -2,6 +2,7 @@
 Run from the app folder:  python -m unittest discover -s tests -v
 The protocol PDFs are read from SAMPLE_DIR (set env HILEL_SAMPLES) and skipped when missing."""
 import io
+import re
 import json
 import os
 import sys
@@ -640,6 +641,47 @@ class WarningsTests(AppTestCase):
         html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
         self.assertIn("d1@x.test", html)
         self.assertIn("משימה ללא שיוך", html)
+
+
+class RolesSyncTests(AppTestCase):
+    def make_file(self, rows):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "אנשי קשר"
+        ws.append(['דוא"ל', "שם פרטי", "שם משפחה", "תפקיד", "ארגון"])
+        for r in rows:
+            ws.append(r)
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    def test_sync_sets_roles_to_file_and_leaves_others_alone(self):
+        with A.app.app_context():
+            d = A.db()
+            cur = d.execute("INSERT INTO contacts(email, first_name, last_name) VALUES ('yoav@x.test','יואב','ש')")
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'מפקח')", (cur.lastrowid,))
+            d.execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'יועץ קרקע')", (cur.lastrowid,))
+            d.commit()
+        admin = self.login("admin@test")
+        buf = self.make_file([["yoav@x.test", "יואב", "ש", "יועץ קרקע", "א"],
+                              ["nobody@x.test", "לא", "קיים", "יועץ", "ב"]])
+        r = admin.post("/roles/sync/preview", data={"site_id": "1", "file": (buf, "c.xlsx")},
+                       content_type="multipart/form-data")
+        html = r.get_data(as_text=True)
+        self.assertIn("ייעודכן", html)
+        self.assertIn("לא קיים במערכת", html)
+        token = re.search(r'name="token" value="([0-9a-f]{32})"', html).group(1)
+        admin.post("/roles/sync/confirm", data={"token": token, "site_id": "1"})
+        with A.app.app_context():
+            roles = [r[0] for r in A.db().execute(
+                "SELECT m.site_role FROM memberships m JOIN contacts c ON c.id=m.contact_id "
+                "WHERE c.email='yoav@x.test' AND m.site_id=1").fetchall()]
+        self.assertEqual(roles, ["יועץ קרקע"])
+
+    def test_only_administrator_can_sync(self):
+        self.assertEqual(self.login("sup@test").get("/roles/sync").status_code, 403)
 
 
 if __name__ == "__main__":
