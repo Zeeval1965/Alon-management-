@@ -9,6 +9,7 @@ import uuid
 
 import openpyxl
 from flask import Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from protocol_parser import extract_rows, extract_supervision_items
@@ -707,6 +708,7 @@ SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "site_search": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
     "supervision_view": "supervision",
@@ -1174,6 +1176,52 @@ def assignments(site_id):
 <form method="post" action="{{ url_for('assignments_rematch', site_id=site_id) }}">
 <button>חיפוש שיוך מחדש לפי השמות בכל המשימות הפתוחות</button></form>
 """, rows=rows, url_for=url_for, site_id=site_id)
+
+
+def search_terms(q):
+    """Words, or quoted phrases ("ליאור ישראלי"). Every term must appear in the task."""
+    terms = [m.group(1) or m.group(2) for m in re.finditer(r'"([^"]+)"|(\S+)', q or "")]
+    return [t.strip() for t in terms if t and t.strip()]
+
+
+def highlight(value, terms):
+    text = str(value or "")
+    if not terms:
+        return escape(text)
+    pattern = "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True))
+    out, last = [], 0
+    for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+        out.append(escape(text[last:m.start()]))
+        out.append(Markup("<mark>") + escape(m.group(0)) + Markup("</mark>"))
+        last = m.end()
+    out.append(escape(text[last:]))
+    return Markup("").join(out)
+
+
+@app.route("/sites/<int:site_id>/search")
+def site_search(site_id):
+    """Search every task of the site. Quoted phrases match exactly; several words must all appear."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    q = (request.args.get("q") or "").strip()
+    terms = search_terms(q)
+    results = []
+    if terms:
+        for t in db().execute("SELECT * FROM tasks WHERE site_id=? ORDER BY public_no", (site_id,)).fetchall():
+            haystack = " ".join(str(t[k] or "") for k in ("public_no", "topic", "text", "assignee_text",
+                                                          "status", "target_text")).lower()
+            if all(term.lower() in haystack for term in terms):
+                results.append(t)
+    return page("חיפוש משימות - " + s["name"], """
+<form method="get"><input name="q" value="{{ q }}" size="40" placeholder='מילה, או צמד מילים בגרשיים' >
+<button>חיפוש</button></form>
+{% if terms %}<p class="note">נמצאו {{ results|length }} משימות.</p>
+<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th></tr>
+{% for t in results %}<tr><td>{{ hl(t['public_no'], terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
+<td>{{ hl(t['text'], terms) }}</td><td>{{ hl(t['assignee_text'], terms) }}</td>
+<td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td></tr>{% else %}
+<tr><td colspan="6">אין תוצאות</td></tr>{% endfor %}</table>{% endif %}
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+""", q=q, terms=terms, results=results, hl=highlight, s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/warnings")
@@ -1716,7 +1764,7 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a></p>
 <h3>משימות פתוחות</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td>{{ t['public_no'] }}</td><td>{{ t['topic'] }}</td>

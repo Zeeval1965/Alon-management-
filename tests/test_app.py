@@ -896,5 +896,35 @@ class ChoiceReplacesSuggestionsTests(AppTestCase):
         self.assertEqual(rows, [(keep, 1)])
 
 
+class TaskSearchTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text, status) VALUES (1,'S1','דיפון מערבי של המבנה','ליאור י','פתוחה')")
+            d.execute("INSERT INTO tasks(site_id, public_no, text, assignee_text, status) VALUES (1,'S2','תיקון גג','גיא פז','בוצע')")
+            d.commit()
+
+    def search(self, q):
+        return self.login("owner@test").get("/sites/1/search", query_string={"q": q}).get_data(as_text=True)
+
+    def test_single_word_finds_task(self):
+        self.assertIn(">S1<", self.search("דיפון"))
+        self.assertNotIn(">S2<", self.search("דיפון"))
+
+    def test_quoted_phrase_must_match_exactly(self):
+        self.assertIn(">S1<", self.search('"דיפון מערבי"'))
+        self.assertIn("אין תוצאות", self.search('"מערבי דיפון"'))
+
+    def test_several_words_must_all_appear(self):
+        self.assertIn(">S2<", self.search("תיקון גיא"))
+        self.assertIn("אין תוצאות", self.search("תיקון דיפון"))
+
+    def test_status_is_searchable_and_matches_are_highlighted(self):
+        html = self.search("בוצע")
+        self.assertIn(">S2<", html)
+        self.assertIn("<mark>", html)
+
+
 if __name__ == "__main__":
     unittest.main()
