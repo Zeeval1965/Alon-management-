@@ -137,7 +137,8 @@ class ProtocolTests(AppTestCase):
                            (json.dumps(partial, ensure_ascii=False),))
             A.db().commit()
             A.publish_meeting(A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0])
-        self.assertGreater(self.db_val("SELECT COUNT(*) FROM tasks WHERE status='בוצע'"), before)
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM tasks WHERE status='בוצע'"), before)
+        self.assertGreater(self.db_val("SELECT COUNT(*) FROM task_closure_pending"), 0)
 
     def test_queue_new_task_action(self):
         with A.app.app_context():
@@ -860,6 +861,68 @@ class ProtocolAuditTests(AppTestCase):
         html = self.login("sup@test").get("/sites/1/audit").get_data(as_text=True)
         self.assertNotIn("פער של", html)
         self.assertIn("תקין", html)
+
+
+class ClosureApprovalTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'C1','חשמל','משימה לסגירה','בטיפול')")
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='C1'").fetchone()[0]
+            d.execute("INSERT INTO task_closure_pending(task_id, meeting_id, created_at) VALUES (?,1,'2026-11-01')", (tid,))
+            d.commit()
+        with A.app.app_context():
+            self.tid = A.db().execute("SELECT id FROM tasks WHERE public_no='C1'").fetchone()[0]
+
+    def test_approve_closes_and_logs_who(self):
+        self.login("sup@test").post(f"/tasks/{self.tid}/closure/approve")
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.tid,)), "בוצע")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_closure_pending"), 0)
+        self.assertEqual(self.db_val("SELECT changed_by FROM task_status_log WHERE task_id=?", (self.tid,)), "sup@test")
+
+    def test_keep_leaves_task_open(self):
+        self.login("sup@test").post(f"/tasks/{self.tid}/closure/keep")
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.tid,)), "בטיפול")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_closure_pending"), 0)
+
+    def test_owner_cannot_decide_closure(self):
+        r = self.login("owner@test").post(f"/tasks/{self.tid}/closure/approve")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.tid,)), "בטיפול")
+
+    def test_pending_closure_shown_on_warnings_page(self):
+        html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
+        self.assertIn("סגירה ממתינה לאישור המפקח", html)
+        self.assertIn("סגור כבוצע", html)
+
+
+class StatusLogTests(AppTestCase):
+    def test_status_change_records_user_and_time(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, status) VALUES (1,'L1','בדיקה','בטיפול')")
+            A.db().commit()
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='L1'").fetchone()[0]
+        self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "ממתינה לאישור", "by": "גיא"})
+        row = self.db_one("SELECT status, handled_by, changed_by, changed_at FROM task_status_log WHERE task_id=?", (tid,))
+        self.assertEqual(row["status"], "ממתינה לאישור")
+        self.assertEqual(row["handled_by"], "גיא")
+        self.assertEqual(row["changed_by"], "sup@test")
+        self.assertTrue(row["changed_at"])
+
+
+class EmailVisibilityTests(AppTestCase):
+    def test_owner_does_not_see_participant_emails(self):
+        c = self.login("owner@test")
+        self.assertNotIn('<th>דוא"ל</th>', c.get("/sites/1/contacts").get_data(as_text=True))
+        with A.app.app_context():
+            cid = A.db().execute("SELECT id FROM contacts WHERE email='sup@test'").fetchone()[0]
+        self.assertNotIn('דוא"ל</th>', c.get(f"/sites/1/contacts/{cid}").get_data(as_text=True))
+
+    def test_supervisor_sees_participant_emails(self):
+        html = self.login("sup@test").get("/sites/1/contacts").get_data(as_text=True)
+        self.assertIn('<th>דוא"ל</th>', html)
+        self.assertIn("<td>owner@test</td>", html)
 
 
 class InitialIdentifiesPersonTests(AppTestCase):

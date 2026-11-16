@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS supervision_items (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, report_date TEXT, item_no TEXT,
   text TEXT, photo TEXT, UNIQUE(site_id, report_date, item_no)
 );
+CREATE TABLE IF NOT EXISTS task_status_log (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, status TEXT, handled_by TEXT,
+  changed_by TEXT, changed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS task_closure_pending (
+  task_id INTEGER PRIMARY KEY, meeting_id INTEGER, created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
@@ -402,8 +409,10 @@ def publish_meeting(meeting_id):
             (site_id, m["kind"], meeting_id)).fetchall()
         for t in gone:
             if t["id"] not in listed_ids:
-                db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (t["id"],))
+                db().execute("INSERT OR IGNORE INTO task_closure_pending(task_id, meeting_id, created_at) VALUES (?,?,?)",
+                             (t["id"], meeting_id, dt.datetime.now().isoformat(timespec="minutes")))
     for task_id in published:
+        db().execute("DELETE FROM task_closure_pending WHERE task_id=?", (task_id,))
         suggest_assignees(task_id)
     db().execute("UPDATE meetings SET status='published' WHERE id=?", (meeting_id,))
     db().commit()
@@ -711,7 +720,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks", "site_audit": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -751,6 +760,27 @@ def roles_on_site(contact, site_id):
     rows = db().execute("SELECT site_role FROM memberships WHERE site_id=? AND contact_id=?",
                         (site_id, contact["id"])).fetchall()
     return {r["site_role"] for r in rows}
+
+
+EMAIL_ROLES = {"מפקח", "יזם", "נציגות"}
+
+
+def can_see_emails(site_id):
+    """Participants' email addresses are shown only to administrators and to the supervisor,
+    the developer and the committee on this site."""
+    me = current_contact()
+    if me is None:
+        return False
+    return bool(me["is_admin"]) or bool(roles_on_site(me, site_id) & EMAIL_ROLES)
+
+
+def log_task_status(task_id, status, handled_by=""):
+    """Record who changed a task's status and when."""
+    me = current_contact()
+    who = (f"{me['first_name'] or ''} {me['last_name'] or ''}".strip() or me["email"]) if me else "מערכת"
+    db().execute(
+        "INSERT INTO task_status_log(task_id, status, handled_by, changed_by, changed_at) VALUES (?,?,?,?,?)",
+        (task_id, status, handled_by, who, dt.datetime.now().isoformat(timespec="minutes")))
 
 
 @app.before_request
@@ -988,6 +1018,7 @@ def task_triage(task_id):
     action = request.form.get("action")
     if action == "info":
         db().execute("UPDATE tasks SET status='לידיעה' WHERE id=?", (task_id,))
+        log_task_status(task_id, "לידיעה")
     elif action == "delete":
         db().execute("DELETE FROM task_assignments WHERE task_id=?", (task_id,))
         db().execute("DELETE FROM task_targets WHERE task_id=?", (task_id,))
@@ -1004,6 +1035,7 @@ def task_status(task_id):
     new_status = request.form["status"]
     by_name = request.form.get("by", "לא צוין")
     db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, task_id))
+    log_task_status(task_id, new_status, request.form.get("by", ""))
     db().commit()
     if new_status != "פתוחה":
         notify_supervisors_task_handled(t, by_name, new_status)
@@ -1400,6 +1432,21 @@ def site_audit(site_id):
 """, s=s, items=items, problems=problems)
 
 
+@app.route("/tasks/<int:task_id>/closure/<action>", methods=["POST"])
+def task_closure(task_id, action):
+    """A task that dropped out of a full protocol waits for the supervisor: close it or keep it open."""
+    if action not in ("approve", "keep"):
+        abort(400)
+    t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    if db().execute("SELECT 1 FROM task_closure_pending WHERE task_id=?", (task_id,)).fetchone():
+        db().execute("DELETE FROM task_closure_pending WHERE task_id=?", (task_id,))
+        if action == "approve":
+            db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (task_id,))
+            log_task_status(task_id, "בוצע", "נסגרה לאחר היעלמה מפרוטוקול מלא")
+        db().commit()
+    return redirect(url_for("site_warnings", site_id=t["site_id"]))
+
+
 @app.route("/sites/<int:site_id>/warnings")
 def site_warnings(site_id):
     """Things to fix: the same person recorded more than once, tasks with no one assigned, and
@@ -1431,11 +1478,20 @@ def site_warnings(site_id):
     choices = db().execute(
         """SELECT DISTINCT c.id, c.first_name, c.last_name FROM memberships m JOIN contacts c ON c.id = m.contact_id
            WHERE m.site_id=? ORDER BY c.first_name, c.last_name""", (site_id,)).fetchall()
+    closures = db().execute(
+        """SELECT t.id, t.public_no, t.topic, t.text FROM task_closure_pending p
+           JOIN tasks t ON t.id = p.task_id WHERE t.site_id=? ORDER BY t.public_no""", (site_id,)).fetchall()
     return page("התרעות - " + s["name"], """
 <h3>אנשי קשר כפולים (אותו שם, יותר מרשומה אחת) - מומלץ למחוק את הכפילות</h3>
 <table><tr><th>שם</th><th>רשומות</th></tr>
-{% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
+{% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] if show_email else '' }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
+<h3>סגירה ממתינה לאישור המפקח (המשימה לא הופיעה בפרוטוקול מלא)</h3>
+<table><tr><th>משימה</th><th>תיאור</th><th>פעולה</th></tr>
+{% for c in closures %}<tr><td>{{ c['public_no'] }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
+<td><form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
+<form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="display:inline"><button>השאר פתוחה</button></form></td></tr>
+{% else %}<tr><td colspan="3">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
 {% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
@@ -1456,7 +1512,8 @@ def site_warnings(site_id):
 <button name="action" value="delete" onclick="return confirm('למחוק את המשימה? הפעולה אינה הפיכה.')">2 - מחק</button></form></td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", duplicates=duplicates, unassigned=unassigned, pending=pending, choices=choices, s=s, url_for=url_for)
+""", duplicates=duplicates, unassigned=unassigned, pending=pending, choices=choices, closures=closures,
+        show_email=can_see_emails(site_id), s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/contacts/<int:contact_id>")
@@ -1480,7 +1537,7 @@ def contact_card(site_id, contact_id):
 <tr><th>תפקיד באתר</th><td>{{ roles|join(', ') }}</td></tr>
 <tr><th>טלפון</th><td>{{ c['phone'] or '' }}</td></tr>
 <tr><th>נייד</th><td>{{ c['mobile'] or '' }}</td></tr>
-<tr><th>דוא"ל</th><td dir="ltr">{{ c['email'] or '' }}</td></tr>
+{% if show_email %}<tr><th>דוא"ל</th><td dir="ltr">{{ c['email'] or '' }}</td></tr>{% endif %}
 <tr><th>כתובת</th><td>{{ c['address'] or '' }}</td></tr>
 </table>
 <h3>משימות</h3>
@@ -1489,7 +1546,7 @@ def contact_card(site_id, contact_id):
 <td>{% if not t['confirmed'] %}ממתין לאישור{% elif t['is_responsible'] %}אחראי לביצוע{% elif t['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td></tr>
 {% else %}<tr><td colspan="3">אין משימות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_contacts', site_id=s['id']) }}">חזרה לרשימת אנשי הקשר</a></p>
-""", c=c, roles=roles, tasks=tasks, s=s, url_for=url_for)
+""", c=c, roles=roles, tasks=tasks, show_email=can_see_emails(site_id), s=s, url_for=url_for)
 
 
 @app.route("/sites/<int:site_id>/contacts")
@@ -1507,15 +1564,15 @@ def site_contacts(site_id):
 {% else %}<p class="note">רשימה לצפייה בלבד.</p>{% endif %}
 {% if is_admin %}<form method="post" action="{{ url_for('contacts_bulk_delete') }}" onsubmit="return confirm('למחוק את האנשים שסומנו? הפעולה אינה הפיכה.')">{% endif %}
 <table><tr>{% if is_admin %}<th><input type="checkbox" onclick="document.querySelectorAll('.pick').forEach(function(c){c.checked=this.checked}, this)" title="בחירת כל הרשומות"></th>{% endif %}
-<th>שם</th><th>ארגון</th><th>תפקיד באתר</th><th>טלפון</th><th>נייד</th><th>דוא"ל</th>{% if can_edit %}<th></th>{% endif %}</tr>
+<th>שם</th><th>ארגון</th><th>תפקיד באתר</th><th>טלפון</th><th>נייד</th>{% if show_email %}<th>דוא"ל</th>{% endif %}{% if can_edit %}<th></th>{% endif %}</tr>
 {% for r in rows %}<tr>{% if is_admin %}<td><input type="checkbox" class="pick" name="ids" value="{{ r['id'] }}"></td>{% endif %}
 <td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['org'] or '' }}</td>
-<td>{{ r['site_roles'] }}</td><td>{{ r['phone'] or '' }}</td><td>{{ r['mobile'] or '' }}</td><td>{{ r['email'] or '' }}</td>
+<td>{{ r['site_roles'] }}</td><td>{{ r['phone'] or '' }}</td><td>{{ r['mobile'] or '' }}</td>{% if show_email %}<td>{{ r['email'] or '' }}</td>{% endif %}
 {% if can_edit %}<td><a href="{{ url_for('contact_edit', contact_id=r['id']) }}">עריכה</a></td>{% endif %}</tr>{% endfor %}</table>
 {% if is_admin %}<input type="hidden" name="site_id" value="{{ s['id'] }}"><p><button>מחיקת הנבחרים</button> <span class="note">המחיקה מוחקת את האדם מכל האתרים. מנהל המערכת לא נמחק.</span></p>{% endif %}
 {% if is_admin %}</form>{% endif %}
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
-""", rows=rows, s=s, url_for=url_for, can_edit=is_manager(current_contact()),
+""", rows=rows, s=s, url_for=url_for, can_edit=is_manager(current_contact()), show_email=can_see_emails(site_id),
         is_admin=bool(current_contact()["is_admin"]))
 
 
@@ -1950,6 +2007,14 @@ def site_view(site_id):
     info_t = sorted([t for t in tasks if t["status"] == "לידיעה"], key=lambda t: t["public_no"])
     done_t = [t for t in tasks if t["status"] == "בוצע"]
     month = db().execute("SELECT month_current, month_total, meeting_date FROM meetings WHERE site_id=? AND status='published' AND month_current IS NOT NULL ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
+    closure_ids = {r[0] for r in db().execute(
+        "SELECT p.task_id FROM task_closure_pending p JOIN tasks t ON t.id = p.task_id WHERE t.site_id=?",
+        (site_id,)).fetchall()}
+    last = {}
+    for r in db().execute(
+            """SELECT l.task_id, l.changed_by, l.changed_at FROM task_status_log l
+               JOIN tasks t ON t.id = l.task_id WHERE t.site_id=? ORDER BY l.id""", (site_id,)).fetchall():
+        last[r[0]] = {"changed_by": r[1], "changed_at": r[2]}
     return page(s["name"], """
 <form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
 שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
@@ -1968,7 +2033,7 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}{% if t['id'] in closure_ids %}<br><span class="note">סגירה ממתינה לאישור המפקח</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>לידיעה</option><option>בוצע</option></select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
@@ -1981,7 +2046,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, sort=sort, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, sort=sort, closure_ids=closure_ids, last=last, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
