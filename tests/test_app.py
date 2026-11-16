@@ -1112,6 +1112,20 @@ class DecisionChangesTests(AppTestCase):
                          "בדיקת לוח חשמל")
 
 
+class SiteDashboardTests(AppTestCase):
+    def test_dashboard_shows_kpis_status_bars_and_site_image(self):
+        with A.app.app_context():
+            A.db().execute("UPDATE sites SET name='הלל הזקן 14' WHERE id=1")
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'Z1','חשמל','בדיקה','בטיפול')")
+            A.db().commit()
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        self.assertIn("התפלגות סטטוסים", html)
+        self.assertIn("אחוז סגירה", html)
+        self.assertIn("site-hilel14.jpg", html)
+        self.assertIn('class="pill s-prog"', html)
+        self.assertEqual(self.login("sup@test").get("/static/site-hilel14.jpg").status_code, 200)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

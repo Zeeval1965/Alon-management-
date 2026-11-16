@@ -1974,6 +1974,17 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .note{color:var(--gray);font-size:13px}
 .flash{background:var(--red-light);color:var(--red);padding:8px;border-radius:3px}
 @media (max-width:640px){table.cards,table.cards tbody,table.cards tr,table.cards td{display:block;width:100%}table.cards tr:first-child{display:none}table.cards tr{border:1px solid #ddd;border-radius:6px;margin:0 0 10px;padding:6px;background:#fff}table.cards td{border:0;padding:3px 0;min-width:0!important;white-space:normal!important}table.cards td:empty{display:none}table.cards td::before{content:attr(data-label);display:block;color:#6B6B6B;font-size:12px}}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#E9ECEF;color:#333;white-space:nowrap}
+.s-open{background:#E3F0FF;color:#1B4F8C}.s-prog{background:#E0F5F1;color:#0E6B5B}.s-appr{background:#FFF4D6;color:#8A5A00}
+.s-spec{background:#EFE7FB;color:#5B2C91}.s-recheck{background:#FDE7D2;color:#A04A00}.s-review{background:#DDF3F7;color:#11657A}
+.s-hold{background:#E4E4E4;color:#444}.s-info{background:#F4F4F4;color:#666}.s-done{background:#DFF5E3;color:#1D6B33}
+.s-cancel{background:#F0F0F0;color:#888;text-decoration:line-through}
+.hero{margin:0 0 12px;border-radius:6px;overflow:hidden}.hero img{width:100%;height:260px;object-fit:cover;display:block}
+.kpis{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.kpi{flex:1 1 150px;border:1px solid var(--gray-line);border-radius:6px;padding:10px;background:#fff}
+.kpi b{display:block;font-size:26px;color:#222}.kpi.warn b{color:var(--red)}.kpi span{color:var(--gray);font-size:13px}
+.brow{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:14px}.brow .lbl{width:160px}
+.brow .track{flex:1;background:var(--gray-light);height:12px;border-radius:6px;overflow:hidden}
+.brow .fill{display:block;height:100%;background:#7A8699}.brow .n{width:40px;text-align:left}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
@@ -2338,6 +2349,14 @@ def _linked_people(site_id):
     return out
 
 
+STATUS_CLASS = {
+    "פתוחה": "s-open", "בטיפול": "s-prog", "ממתינה לאישור": "s-appr", "ממתין למפרט": "s-spec",
+    "לבדיקה חוזרת": "s-recheck", "ממתינה לבדיקה": "s-review", "מעוכבת": "s-hold",
+    "לידיעה": "s-info", "בוצע": "s-done", "בוטלה": "s-cancel",
+}
+SITE_IMAGES = {"הלל הזקן 14": "site-hilel14.jpg"}  # rendering shown in the site header
+
+
 @app.route("/sites/<int:site_id>")
 def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -2369,7 +2388,25 @@ def site_view(site_id):
             """SELECT l.task_id, l.changed_by, l.changed_at FROM task_status_log l
                JOIN tasks t ON t.id = l.task_id WHERE t.site_id=? ORDER BY l.id""", (site_id,)).fetchall():
         last[r[0]] = {"changed_by": r[1], "changed_at": r[2]}
+    kp = site_kpis(site_id)
+    total = kp["open"] + kp["closed"]
+    pct = round(100 * kp["closed"] / total) if total else 0
+    counts = Counter(t["status"] for t in tasks)
+    top = max(counts.values(), default=1)
+    status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
+    site_image = next((url_for("static", filename=f) for k, f in SITE_IMAGES.items() if k in s["name"]), None)
     return page(s["name"], """
+{% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
+<div class="kpis">
+<div class="kpi"><b>{{ kp.open }}</b><span>משימות פתוחות</span></div>
+<div class="kpi"><b>{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></div>
+<div class="kpi warn"><b>{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></div>
+<div class="kpi warn"><b>{{ kp.repeats_open }}</b><span>פתוחות שחזרו בפרוטוקולים</span></div>
+<div class="kpi"><b>{{ kp.closed }}</b><span>נסגרו</span></div>
+<div class="kpi"><b>{{ pct }}%</b><span>אחוז סגירה</span></div>
+</div>
+<h3>התפלגות סטטוסים</h3>
+<div>{% for r in status_rows %}<div class="brow"><span class="lbl"><span class="pill {{ sclass.get(r.name, '') }}">{{ r.name }}</span></span><span class="track"><span class="fill" style="width:{{ r.w }}%"></span></span><span class="n">{{ r.n }}</span></div>{% endfor %}</div>
 <form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
 שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
@@ -2387,7 +2424,7 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
@@ -2400,7 +2437,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
