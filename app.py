@@ -850,7 +850,7 @@ SECTION_OF = {
     "decisions_view": "decisions",
     "supervision_view": "supervision",
     "plans_view": "plans", "plan_file": "plans",
-    "meeting_upload": "protocols", "meeting_review": "protocols",
+    "meeting_upload": "protocols", "meeting_review": "protocols", "meeting_view": "protocols",
     "progress_view": "progress", "progress_save": "progress",
 }
 # task_link_view is open to anyone holding a valid link; it shows and changes only that one task
@@ -2845,6 +2845,35 @@ def admin_site_delete_approve(token):
 <form method="post"><button>אישור מחיקה סופית</button></form>""", name=name)
 
 
+def reset_site_protocols(site_id):
+    """Remove every protocol of a site, its drafts, and the tasks that came from them with
+    everything recorded against those tasks. Contacts, the site, plans and manual decisions stay."""
+    d = db()
+    task_ids = [r[0] for r in d.execute("SELECT id FROM tasks WHERE site_id=?", (site_id,)).fetchall()]
+    for table in ("task_status_log", "task_comments", "task_docs", "task_links", "task_assignments",
+                  "task_closure_pending", "task_targets", "task_occurrences"):
+        for tid in task_ids:
+            d.execute(f"DELETE FROM {table} WHERE task_id=?", (tid,))
+    d.execute("DELETE FROM admin_queue WHERE site_id=?", (site_id,))
+    d.execute("DELETE FROM tasks WHERE site_id=?", (site_id,))
+    d.execute("DELETE FROM meetings WHERE site_id=?", (site_id,))
+    d.commit()
+
+
+@app.route("/sites/<int:site_id>/protocols/reset", methods=["POST"])
+def site_protocols_reset(site_id):
+    """Administrator only (not listed in SECTION_OF). Needs the typed confirmation."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    s_row = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    if request.form.get("confirm", "").strip() != "מחק הכול":
+        return page("מחיקת פרוטוקולים", """<p>לא נמחק דבר. כדי לאשר יש לכתוב בדיוק: מחק הכול</p>
+<p><a href="{{ url_for('site_protocols', site_id=s['id']) }}">חזרה למאגר הפרוטוקולים</a></p>""",
+                    s=s_row, url_for=url_for), 400
+    reset_site_protocols(site_id)
+    return redirect(url_for("site_protocols", site_id=site_id))
+
+
 @app.route("/sites/<int:site_id>/protocols")
 def site_protocols(site_id):
     """Published protocols, newest protocol date first; sort by publish time or filter to this month."""
@@ -2852,9 +2881,15 @@ def site_protocols(site_id):
     sort = request.args.get("sort", "date")
     this_month = request.args.get("month") == "current"
     month_key = dt.date.today().strftime("%Y-%m")
+    on_date = request.args.get("on", "")  # exact protocol date, ISO
+    ym = request.args.get("ym", "") if not this_month else month_key  # a month, YYYY-MM
     items = []
     for m in db().execute("SELECT * FROM meetings WHERE site_id=? AND status='published'", (site_id,)).fetchall():
         if this_month and not (m["meeting_date"] or "").startswith(month_key):
+            continue
+        if on_date and m["meeting_date"] != on_date:
+            continue
+        if ym and not (m["meeting_date"] or "").startswith(ym):
             continue
         rows = [r for r in json.loads(m["staged_rows"] or "[]") if not r.get("skip")]
         items.append({"m": m, "rows": len(rows)})
@@ -2876,39 +2911,96 @@ def site_protocols(site_id):
 <option value="date" {% if sort != 'published' %}selected{% endif %}>תאריך הפרוטוקול (החדשים קודם)</option>
 <option value="published" {% if sort == 'published' %}selected{% endif %}>זמן הפרסום (החדשים קודם)</option>
 </select> <button>מיון</button></form>
-<table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>זמן הפרסום</th><th>קובץ</th><th>שורות</th></tr>
+<form method="get" style="margin-bottom:8px">תאריך מסוים <input type="date" name="on" value="{{ on_date }}"> חודש <input type="month" name="ym" value="{{ ym }}"> <button>הצג</button> <a href="{{ url_for('site_protocols', site_id=s['id']) }}">הצג הכול</a></form>
+<table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>זמן הפרסום</th><th>קובץ</th><th>שורות</th><th></th></tr>
 {% for i in items %}<tr><td data-label="סוג">{{ i['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ i['m']['meeting_date'] or 'לא זוהה' }}</td>
-<td data-label="זמן הפרסום">{{ i['m']['published_at'] or '' }}</td><td data-label="קובץ">{{ i['m']['source_name'] or '' }}</td><td data-label="שורות">{{ i['rows'] }}</td></tr>
-{% else %}<tr><td colspan="5">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
+<td data-label="זמן הפרסום">{{ i['m']['published_at'] or '' }}</td><td data-label="קובץ">{{ i['m']['source_name'] or '' }}</td><td data-label="שורות">{{ i['rows'] }}</td>
+<td data-label=""><a href="{{ url_for('meeting_view', meeting_id=i['m']['id']) }}">פתיחה</a></td></tr>
+{% else %}<tr><td colspan="6">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
 <h3>הועלו ולא פורסמו (טיוטות)</h3>
 <table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
 {% for d in drafts %}<tr><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
 <td data-label="קובץ">{{ d['m']['source_name'] or '' }}</td><td data-label="שורות שזוהו">{{ d['rows'] }}{% if d['rows'] == 0 %} <span class="note">לא זוהו שורות - בדקו את הקובץ</span>{% endif %}</td>
 <td data-label=""><a href="{{ url_for('meeting_review', meeting_id=d['m']['id']) }}">בדיקה ופרסום</a></td></tr>
 {% else %}<tr><td colspan="6">אין טיוטות</td></tr>{% endfor %}</table>
-""", s=s, items=items, sort=sort, this_month=this_month, drafts=drafts)
+{% if is_admin %}<h3>מחיקת כל הפרוטוקולים (למנהל בלבד)</h3>
+<form method="post" action="{{ url_for('site_protocols_reset', site_id=s['id']) }}" onsubmit="return confirm('למחוק את כל הפרוטוקולים והמשימות של האתר? הפעולה אינה הפיכה.')">
+<p class="note">ימחקו כל הפרוטוקולים והטיוטות, המשימות שנוצרו מהם, ההיסטוריה, השיוכים, ההערות והקבצים המקושרים למשימות. אנשי הקשר, האתר, התוכניות והחלטות שנרשמו ידנית נשארים.</p>
+<input name="confirm" placeholder='כתבו "מחק הכול"'> <button>מחיקה</button></form>{% endif %}
+""", s=s, items=items, sort=sort, this_month=this_month, drafts=drafts, on_date=on_date, ym=ym, is_admin=current_contact()["is_admin"])
+
+
+FILE_DATE = re.compile(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?!\d)")
+
+
+def date_from_filename(name):
+    """A date written in a file name (dd.mm.yy or dd.mm.yyyy) as an ISO date, or None."""
+    m = FILE_DATE.search(name or "")
+    if not m:
+        return None
+    year = int(m.group(3)) + (2000 if len(m.group(3)) == 2 else 0)
+    try:
+        return dt.date(year, int(m.group(2)), int(m.group(1))).isoformat()
+    except ValueError:
+        return None
 
 
 @app.route("/sites/<int:site_id>/meetings/new", methods=["GET", "POST"])
 def meeting_upload(site_id):
     if request.method == "POST":
-        f = request.files["file"]
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        f.save(tmp.name)
-        rows = extract_rows(tmp.name)
+        kind = request.form.get("kind", "ביצוע")
         ids = []
-        for day, group in split_rows_by_date(rows):
-            cur = db().execute(
-                "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
-                (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(group, ensure_ascii=False), day))
-            ids.append(cur.lastrowid)
+        for f in request.files.getlist("file"):
+            if not f or not f.filename:
+                continue
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            f.save(tmp.name)
+            rows = extract_rows(tmp.name)
+            # a page with no date of its own takes the date written in the file name
+            named = date_from_filename(f.filename)
+            for r in rows:
+                if not r.get("meeting_date") and named:
+                    r["meeting_date"] = dt.date.fromisoformat(named).strftime("%d.%m.%y")
+            for day, group in split_rows_by_date(rows):
+                cur = db().execute(
+                    "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
+                    (site_id, kind, f.filename, json.dumps(group, ensure_ascii=False), day))
+                ids.append(cur.lastrowid)
         db().commit()
-        # the oldest protocol opens first; the others are listed as drafts in the protocol repository
-        return redirect(url_for("meeting_review", meeting_id=ids[0]))
-    return page("העלאת פרוטוקול", STEPPER_TPL + """
+        if not ids:
+            return redirect(url_for("meeting_upload", site_id=site_id))
+        if len(ids) == 1:
+            return redirect(url_for("meeting_review", meeting_id=ids[0]))
+        # several protocols: they wait as drafts in the protocol repository, filed by date
+        return redirect(url_for("site_protocols", site_id=site_id))
+    return page("העלאת פרוטוקולים", STEPPER_TPL + """
 <form method="post" enctype="multipart/form-data">
 <p>סוג פגישה <select name="kind"><option>ביצוע</option><option>שבועית</option><option>סופרפוזיציה</option></select></p>
-<input type="file" name="file" accept=".pdf" required> <button>העלאה לבדיקה</button></form>""", url_for=url_for, active=1, step_names=PROTOCOL_STEPS)
+<p>אפשר לבחור כמה קבצים בבת אחת. תאריך הפרוטוקול נקבע לפי התאריך שבקובץ, ואם אין כזה - לפי התאריך שבשם הקובץ.</p>
+<input type="file" name="file" accept=".pdf" multiple required> <button>העלאה לבדיקה</button></form>""", url_for=url_for, active=1, step_names=PROTOCOL_STEPS)
+
+
+@app.route("/meetings/<int:meeting_id>/view")
+def meeting_view(meeting_id):
+    """A published protocol as it was written: its own rows, with the status each task has today."""
+    m = db().execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone() or abort(404)
+    rows = db().execute(
+        """SELECT o.number, o.topic, o.text, o.target, t.status, t.id AS task_id
+           FROM task_occurrences o JOIN tasks t ON t.id = o.task_id WHERE o.meeting_id=? ORDER BY o.id""",
+        (meeting_id,)).fetchall()
+    try:
+        date_txt = dt.date.fromisoformat(m["meeting_date"]).strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        date_txt = "לא זוהה"
+    return page(f"פרוטוקול {date_txt}", """
+<p><a href="{{ url_for('site_protocols', site_id=m['site_id']) }}">חזרה למאגר הפרוטוקולים</a></p>
+<p>סוג: {{ m['kind'] }} · תאריך: {{ date_txt }} · קובץ: {{ m['source_name'] or '' }}</p>
+<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס היום</th></tr>
+{% for r in rows %}<tr><td data-label="#">{{ r['number'] }}</td><td data-label="נושא">{{ r['topic'] or '' }}</td>
+<td data-label="משימה" style="width:100%">{{ r['text'] }}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
+<td data-label="סטטוס היום"><span class="pill {{ sclass.get(r['status'], '') }}">{{ r['status'] }}</span></td></tr>
+{% else %}<tr><td colspan="5">אין שורות בפרוטוקול זה</td></tr>{% endfor %}</table>""",
+        m=m, rows=rows, date_txt=date_txt, sclass=STATUS_CLASS)
 
 
 @app.route("/meetings/<int:meeting_id>/review", methods=["GET", "POST"])

@@ -1565,3 +1565,60 @@ class RepeatedUploadTests(AppTestCase):
                 mid = A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
                 A.publish_meeting(mid)
             self.assertEqual(A.db().execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+
+class MultiUploadTests(AppTestCase):
+    def test_date_from_file_name(self):
+        self.assertEqual(A.date_from_filename("הלל הזקן 14 - סיכום פגישה שבועית 26.10.2026.pdf"), "2026-10-26")
+        self.assertEqual(A.date_from_filename("סיכום 14.04.26.pdf"), "2026-04-14")
+        self.assertIsNone(A.date_from_filename("no date here.pdf"))
+        self.assertIsNone(A.date_from_filename("31.02.26.pdf"))
+
+    def test_several_files_become_dated_drafts_and_open_by_date(self):
+        c = self.login("admin@test")
+        for name in ("f1.pdf",):
+            c.post("/sites/1/meetings/new", data={"kind": "ביצוע", "file": (open("/home/claude/in/" + name, "rb"), name)},
+                   content_type="multipart/form-data")
+        with A.app.app_context():
+            n = A.db().execute("SELECT COUNT(*) FROM meetings WHERE status='draft'").fetchone()[0]
+            self.assertEqual(n, 4)
+            mid = A.db().execute("SELECT id FROM meetings WHERE status='draft' AND meeting_date='2026-11-10'").fetchone()[0]
+        A.app.config["TESTING"] = True
+        with A.app.app_context():
+            A.publish_meeting(mid)
+        html = c.get("/sites/1/protocols?on=2026-11-10").get_data(as_text=True)
+        table = html.split('<table class="cards">', 1)[1].split("</table>", 1)[0]
+        self.assertIn("2026-11-10", table)
+        self.assertNotIn("2026-11-04", table)
+        view = c.get(f"/meetings/{mid}/view").get_data(as_text=True)
+        self.assertIn("10.11.2026", view)
+        self.assertIn("סטטוס היום", view)
+
+
+class ResetProtocolsTests(AppTestCase):
+    def _seed(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO meetings(site_id, kind, staged_rows, status, meeting_date) VALUES (1,'ביצוע','[]','published','2026-11-10')")
+            mid = d.execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'R1','חשמל','בדיקה','פתוחה')")
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='R1'").fetchone()[0]
+            d.execute("INSERT INTO task_occurrences(task_id, meeting_id, number, topic, text, target, created_at) VALUES (?,?,?,?,?,?,?)",
+                      (tid, mid, "1", "חשמל", "בדיקה", "", "2026-11-10"))
+            d.commit()
+
+    def test_reset_needs_admin_and_typed_confirmation(self):
+        self._seed()
+        self.login("owner@test").post("/sites/1/protocols/reset", data={"confirm": "מחק הכול"})
+        c = self.login("admin@test")
+        self.assertEqual(c.post("/sites/1/protocols/reset", data={"confirm": "כן"}).status_code, 400)
+        with A.app.app_context():
+            self.assertEqual(A.db().execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+        self.assertEqual(c.post("/sites/1/protocols/reset", data={"confirm": "מחק הכול"}).status_code, 302)
+        with A.app.app_context():
+            d = A.db()
+            self.assertEqual(d.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(d.execute("SELECT COUNT(*) FROM meetings").fetchone()[0], 0)
+            self.assertEqual(d.execute("SELECT COUNT(*) FROM task_occurrences").fetchone()[0], 0)
+            self.assertGreater(d.execute("SELECT COUNT(*) FROM contacts").fetchone()[0], 0)
+            self.assertEqual(d.execute("SELECT COUNT(*) FROM sites").fetchone()[0], 1)
