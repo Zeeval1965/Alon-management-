@@ -1229,6 +1229,17 @@ class DashboardLinksTests(AppTestCase):
         self.assertNotIn(">L1<", awaiting)
 
 
+class TaskNumberDisplayTests(AppTestCase):
+    def test_task_number_shows_protocol_date_only(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'01.07.25#2','חשמל','בדיקה','פתוחה')")
+            A.db().commit()
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        self.assertIn(">01.07.25<", html)
+        self.assertNotIn("01.07.25#2", html)
+        self.assertEqual(self.db_val("SELECT public_no FROM tasks WHERE text='בדיקה'"), "01.07.25#2")
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

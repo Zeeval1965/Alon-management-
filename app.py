@@ -112,6 +112,14 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET", "dev-only")
 
 
+def short_no(value):
+    """How a task number is shown: the protocol date only. The stored number is unchanged."""
+    return (value or "").split("#")[0]
+
+
+app.jinja_env.filters["pubno"] = short_no
+
+
 def db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
@@ -579,7 +587,7 @@ def notify_task_event(task, text):
 
 
 def notify_supervisors_task_handled(task, by_name, new_status):
-    text = (f"משימה {task['public_no']} ({task['topic'] or 'ללא נושא'}): {task['text'][:120]} "
+    text = (f"משימה {short_no(task['public_no'])} ({task['topic'] or 'ללא נושא'}): {task['text'][:120]} "
             f"- עודכנה לסטטוס '{new_status}' על ידי {by_name}.")
     notify_task_event(task, text)
 
@@ -593,7 +601,7 @@ def send_task_reminders(site_id, today=None):
            AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
-        text = (f"תזכורת: משימה {t['public_no']} ({t['topic'] or 'ללא נושא'}): {t['text'][:120]} - {when}.")
+        text = (f"תזכורת: משימה {short_no(t['public_no'])} ({t['topic'] or 'ללא נושא'}): {t['text'][:120]} - {when}.")
         # reminders go to the site's recipients (by their settings) and to the task's responsible
         # party only; other people on the task (view-only, or copied) keep their link but get no copy
         assignees = db().execute(
@@ -1225,7 +1233,7 @@ def site_print(site_id):
 <button onclick="return confirm('לבטל את כל הסימונים להדפסה?')">ביטול כל הסימונים</button></form></p>
 <h3>משימות להדפסה ({{ rows|length }})</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th></tr>
-{% for t in rows %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
+{% for t in rows %}<tr><td>{{ t['public_no']|pubno }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
 <td>{{ t['assignee_text'] or '' }}</td><td>{{ t['target_text'] or '' }}</td><td>{{ t['status'] }}</td></tr>
 {% else %}<tr><td colspan="6">לא סומנו משימות להדפסה</td></tr>{% endfor %}</table>
 """, rows=rows, s=s, url_for=url_for)
@@ -1445,7 +1453,7 @@ def cc_report(site_id):
         key = (r["first_name"], r["last_name"] or "")
         people.setdefault(key, {"name": f"{r['first_name']} {r['last_name'] or ''}".strip(),
                                 "role": r["role"] or "", "org": r["org"] or "", "tasks": []})
-        people[key]["tasks"].append(f"{r['public_no']} ({r['topic'] or 'ללא נושא'})")
+        people[key]["tasks"].append(f"{short_no(r['public_no'])} ({r['topic'] or 'ללא נושא'})")
     return page("דוח מכותבים - " + s["name"], """
 <p class="note">מספר המשימות שבהן איש הקשר סומן כמכותב. המכותבים לא מקבלים תזכורות.</p>
 <table><tr><th>איש קשר</th><th>תפקיד</th><th>ארגון</th><th>מספר פעמים</th><th>משימות</th></tr>
@@ -1478,7 +1486,7 @@ def assignments(site_id):
 <p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.
 בכל משימה יש אדם אחד אחראי לביצוע, והאחרים מקבלים גישה לצפייה בלבד.</p>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
-{% for r in rows %}<tr><td>{{ r['public_no'] }}</td><td style="min-width:260px">{{ r['topic'] or '' }}: {{ r['text'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
+{% for r in rows %}<tr><td>{{ r['public_no']|pubno }}</td><td style="min-width:260px">{{ r['topic'] or '' }}: {{ r['text'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
 <td><a href="{{ url_for('contact_card', site_id=site_id, contact_id=r['contact_id']) }}">{{ r['first_name'] }} {{ r['last_name'] or '' }}</a> ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
 <td>{% if not r['confirmed'] %}ממתין לאישור{% elif r['is_responsible'] %}אחראי לביצוע{% elif r['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td>
 <td>{% if not r['confirmed'] %}
@@ -1610,7 +1618,7 @@ def site_search(site_id):
 {% if shown or active or kind == 'החלטות' %}<p class="note">נמצאו {{ shown|length }} {{ kind }}.</p>{% endif %}
 {% if kind == 'משימות' and (active or not q) %}
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
-{% for t in tasks %}<tr><td>{{ hl(t['public_no'], terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
+{% for t in tasks %}<tr><td>{{ hl(t['public_no']|pubno, terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
 <td>{{ hl(t['text'], terms) }}</td><td>{{ hl(t['assignee_text'], terms) }}</td>
 <td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td>
 <td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
@@ -1766,7 +1774,7 @@ def task_link_view(token):
         db().commit()
         t = db().execute("SELECT * FROM tasks WHERE id=?", (t["id"],)).fetchone()
     return page("עדכון משימה", """
-<h2>עדכון משימה {{ t['public_no'] }}</h2>
+<h2>עדכון משימה {{ t['public_no']|pubno }}</h2>
 <p><b>{{ t['topic'] or '' }}</b></p><p>{{ t['text'] }}</p>
 <p class="note">סטטוס נוכחי: {{ t['status'] }}</p>
 {% if message %}<p class="flash">{{ message }}</p>{% endif %}
@@ -1809,7 +1817,7 @@ def site_send_links(site_id):
             for it in items:
                 token = make_task_link(it["task_id"], contact_id)
                 links += 1
-                lines.append(f"{it['public_no']} – {it['topic'] or ''}: {(it['text'] or '')[:120]}")
+                lines.append(f"{short_no(it['public_no'])} – {it['topic'] or ''}: {(it['text'] or '')[:120]}")
                 lines.append(f"לעדכון: {base}/u/{token}")
             enqueue(site_id, c, "\n".join(lines), "מיידי", channel=ch)
             messages += 1
@@ -1821,7 +1829,7 @@ def site_send_links(site_id):
 {% if sent %}<p class="flash">נוצרו {{ sent[0] }} הודעות ו-{{ sent[1] }} קישורים.</p>{% endif %}
 <form method="post">
 <table><tr><th>אחראי</th><th>משימה</th><th>נושא</th><th>שליחה</th></tr>
-{% for r in rows %}<tr><td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['public_no'] }}</td><td>{{ r['topic'] or '' }}: {{ r['text'][:80] }}</td>
+{% for r in rows %}<tr><td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['public_no']|pubno }}</td><td>{{ r['topic'] or '' }}: {{ r['text'][:80] }}</td>
 <td><select name="ch_{{ r['task_id'] }}_{{ r['contact_id'] }}"><option value="email">דוא"ל</option><option value="mobile">נייד</option><option value="none">לא לשלוח</option></select></td></tr>
 {% else %}<tr><td colspan="4">אין משימות פתוחות עם אחראי מאושר</td></tr>{% endfor %}</table>
 <p><button>שליחה</button></p>
@@ -1895,13 +1903,13 @@ def site_warnings(site_id):
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
 <h3>לבדיקה: לא הופיעה בפרוטוקול המלא האחרון (לא נסגרה אוטומטית)</h3>
 <table><tr><th>משימה</th><th>תיאור</th><th>פעולה</th></tr>
-{% for c in closures %}<tr><td>{{ c['public_no'] }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
+{% for c in closures %}<tr><td>{{ c['public_no']|pubno }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
 <td><form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
 <form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="display:inline"><button>השאר פתוחה</button></form></td></tr>
 {% else %}<tr><td colspan="3">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
-{% for p in pending %}<tr><td>{{ p['public_no'] }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
+{% for p in pending %}<tr><td>{{ p['public_no']|pubno }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
 <td>{{ p['raw_name'] }}</td>
 <td><form method="post" action="{{ url_for('assign_task', task_id=p['task_id']) }}">
 <select name="contact_id">{% for c in choices %}<option value="{{ c['id'] }}" {% if c['id'] == p['contact_id'] %}selected{% endif %}>{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
@@ -1909,7 +1917,7 @@ def site_warnings(site_id):
 {% else %}<tr><td colspan="5">אין שיוכים ממתינים. לאישור השיוכים: <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות</a></td></tr>{% endfor %}</table>
 <h3>משימות פתוחות ללא שיוך לאיש קשר</h3>
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
-{% for t in unassigned %}<tr><td>{{ t['public_no'] }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
+{% for t in unassigned %}<tr><td>{{ t['public_no']|pubno }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
 <td>{{ t['assignee_text'] or '' }}
 <form method="post" action="{{ url_for('assign_task', task_id=t['id']) }}" style="margin-top:4px">
 <select name="contact_id">{% for c in choices %}<option value="{{ c['id'] }}">{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
@@ -1949,7 +1957,7 @@ def contact_card(site_id, contact_id):
 </table>
 <h3>משימות</h3>
 <table><tr><th>משימה</th><th>סטטוס</th><th>תפקיד בשיוך</th></tr>
-{% for t in tasks %}<tr><td>{{ t['public_no'] }} {{ t['topic'] or '' }}</td><td>{{ t['status'] }}</td>
+{% for t in tasks %}<tr><td>{{ t['public_no']|pubno }} {{ t['topic'] or '' }}</td><td>{{ t['status'] }}</td>
 <td>{% if not t['confirmed'] %}ממתין לאישור{% elif t['is_responsible'] %}אחראי לביצוע{% elif t['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td></tr>
 {% else %}<tr><td colspan="3">אין משימות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_contacts', site_id=s['id']) }}">חזרה לרשימת אנשי הקשר</a></p>
@@ -2478,7 +2486,7 @@ def site_view(site_id):
 <option value="status" {% if sort == 'status' %}selected{% endif %}>סטטוס</option>
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
-{% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
+{% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td>
 <td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
@@ -2488,10 +2496,10 @@ def site_view(site_id):
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
 <h3>לידיעה</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in info_t %}<tr><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
+{% for t in info_t %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
+{% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
