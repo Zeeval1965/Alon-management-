@@ -1278,6 +1278,31 @@ class InPlaceUpdateTests(AppTestCase):
         self.assertIn("ajax-toast", html)
 
 
+class SearchSortTests(AppTestCase):
+    def test_columns_sort_and_reverse(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'S1','ב','משימה ב','פתוחה')")
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'S2','א','משימה א','בטיפול')")
+            A.db().commit()
+        c = self.login("sup@test")
+        asc = c.get("/sites/1/search?view=&sort=topic&dir=asc").get_data(as_text=True)
+        self.assertLess(asc.index(">משימה א<"), asc.index(">משימה ב<"))
+        desc = c.get("/sites/1/search?sort=topic&dir=desc").get_data(as_text=True)
+        self.assertLess(desc.index(">משימה ב<"), desc.index(">משימה א<"))
+        self.assertIn("sort=topic", asc)
+
+
+class SearchStatusPopupTests(AppTestCase):
+    def test_search_rows_offer_a_status_popup(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'Q1','חשמל','בדיקת חלון','פתוחה')")
+            A.db().commit()
+        html = self.login("sup@test").get("/sites/1/search").get_data(as_text=True)
+        self.assertIn("<dialog", html)
+        self.assertIn("showModal()", html)
+        self.assertIn("data-ajax", html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

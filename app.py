@@ -1605,6 +1605,42 @@ def site_search(site_id):
             if all(term.lower() in haystack for term in terms):
                 decisions.append(d)
 
+    sort = request.args.get("sort", "")
+    direction = "desc" if request.args.get("dir") == "desc" else "asc"
+    task_keys = {
+        "number": lambda t: (parse_date((t["public_no"] or "").split("#")[0]) or "", t["public_no"] or ""),
+        "topic": lambda t: (t["topic"] or "").lower(),
+        "text": lambda t: (t["text"] or "").lower(),
+        "assignee": lambda t: (t["assignee_text"] or "").lower(),
+        "target": lambda t: (t["target_date"] or "9999-99-99", t["target_text"] or ""),
+        "status": lambda t: t["status"] or "",
+        "print": lambda t: t["print_flag"] or 0,
+    }
+    dec_keys = {
+        "topic": lambda d: (d["topic"] or "").lower(),
+        "text": lambda d: (d["text"] or "").lower(),
+        "date": lambda d: parse_date(d["decided_on"]) or (d["decided_on"] or ""),
+        "source": lambda d: d["source"] or "",
+    }
+    if kind == "משימות" and sort in task_keys:
+        tasks.sort(key=task_keys[sort], reverse=(direction == "desc"))
+    if kind == "החלטות" and sort in dec_keys:
+        decisions.sort(key=dec_keys[sort], reverse=(direction == "desc"))
+
+    def heads(columns):
+        """Column headers that sort: the same column again reverses the order."""
+        args = {k: v for k, v in request.args.items() if k not in ("sort", "dir")}
+        out = []
+        for label, key in columns:
+            nd = "desc" if (sort == key and direction == "asc") else "asc"
+            arrow = ("▲" if direction == "asc" else "▼") if sort == key else ""
+            out.append({"label": label, "arrow": arrow,
+                        "url": url_for("site_search", site_id=s["id"], sort=key, dir=nd, **args)})
+        return out
+    task_heads = heads([("#", "number"), ("נושא", "topic"), ("משימה", "text"), ("לטיפול (כפי שכתוב)", "assignee"),
+                        ("יעד", "target"), ("סטטוס", "status"), ("הדפסה", "print")])
+    dec_heads = heads([("נושא", "topic"), ("החלטה", "text"), ("תאריך", "date"), ("מקור", "source")])
+
     shown = tasks if kind == "משימות" else decisions
     return page("חיפוש וחיתוך - " + s["name"], """
 <p>
@@ -1630,22 +1666,29 @@ def site_search(site_id):
 נושא <select name="topic"><option value="">הכול</option>
 {% for tp in topics %}<option {% if tp == topic %}selected{% endif %}>{{ tp }}</option>{% endfor %}</select>
 <input type="hidden" name="view" value="{{ view }}">
+<input type="hidden" name="sort" value="{{ sort }}"><input type="hidden" name="dir" value="{{ direction }}">
 <button>חיפוש</button>
 </form>
 {% if kind == 'החלטות' %}<p class="note">להחלטות אין שיוך לאנשי קשר, ולכן הסינון לפי סטטוס ואיש קשר לא חל עליהן.</p>{% endif %}
 {% if shown or active or kind == 'החלטות' %}<p class="note">נמצאו {{ shown|length }} {{ kind }}.</p>{% endif %}
 {% if kind == 'משימות' and (active or not q) %}
-<table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
+<table><tr>{% for h in task_heads %}<th><a href="{{ h['url'] }}">{{ h['label'] }} {{ h['arrow'] }}</a></th>{% endfor %}</tr>
 {% for t in tasks %}<tr><td>{{ hl(t['public_no']|pubno, terms) }}</td><td>{{ hl(t['topic'], terms) }}</td>
 <td>{{ hl(t['text'], terms) }}</td><td>{{ hl(t['assignee_text'], terms) }}</td>
-<td>{{ hl(t['target_text'], terms) }}</td><td>{{ hl(t['status'], terms) }}</td>
+<td>{{ hl(t['target_text'], terms) }}</td><td><span class="pill {{ sclass.get(t['status'], '') }}" role="button" tabindex="0" title="שינוי סטטוס" onclick="this.nextElementSibling.showModal()">{{ hl(t['status'], terms) }}</span><dialog style="text-align:right;min-width:260px">
+<form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
+<p><b>{{ t['public_no']|pubno }}</b> {{ t['text'] }}</p>
+<p><select name="status" style="width:100%">{% for o in status_options %}<option {% if o == t['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select></p>
+<p><input name="by" placeholder="מי טיפל" style="width:100%"></p>
+<p><button>עדכון</button> <button type="button" onclick="this.closest('dialog').close()">ביטול</button></p>
+</form></dialog></td>
 <td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>
 {% else %}<tr><td colspan="7">אין תוצאות</td></tr>{% endfor %}</table>
 {% endif %}
 {% if kind == 'החלטות' %}
-<table><tr><th>נושא</th><th>החלטה</th><th>תאריך</th><th>מקור</th></tr>
+<table><tr>{% for h in dec_heads %}<th><a href="{{ h['url'] }}">{{ h['label'] }} {{ h['arrow'] }}</a></th>{% endfor %}</tr>
 {% for d in decisions %}<tr><td>{{ hl(d['topic'], terms) }}</td><td>{{ hl(d['text'], terms) }}</td>
 <td>{{ d['decided_on'] or '' }}</td><td>{{ d['source'] or '' }}</td></tr>
 {% else %}<tr><td colspan="4">אין החלטות תואמות</td></tr>{% endfor %}</table>
@@ -1653,7 +1696,8 @@ def site_search(site_id):
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 """, q=q, kind=kind, view=view, status=status, topic=topic, contact_id=contact_id, terms=terms,
         active=active, statuses=statuses, topics=topics, contacts=contacts, tasks=tasks, decisions=decisions,
-        shown=shown, hl=highlight, s=s, url_for=url_for)
+        shown=shown, hl=highlight, s=s, url_for=url_for, sort=sort, direction=direction,
+        task_heads=task_heads, dec_heads=dec_heads, sclass=STATUS_CLASS, status_options=task_status_names())
 
 
 @app.route("/sites/<int:site_id>/audit")
@@ -2069,6 +2113,8 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .brow .fill{display:block;height:100%;background:#7A8699}.brow .n{width:40px;text-align:left}
 .stepper{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 14px}.step{border:1px solid var(--gray-line);border-radius:14px;padding:3px 10px;font-size:13px;color:var(--gray);background:#fff}
 .step.done{background:var(--gray-light);color:#444}.step.active{background:var(--red);border-color:var(--red);color:#fff;font-weight:bold}
+.pill[role=button]{cursor:pointer;text-decoration:underline dotted}
+dialog{border:1px solid var(--gray-line);border-radius:8px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.2)}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
@@ -2087,6 +2133,8 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
     clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 3500);
   }
   function applyResult(form, d){
+    var dlg = form.closest('dialog');
+    if (dlg) { dlg.close(); }
     var row = form.closest('tr');
     if (d.hide && row) {
       row.style.transition = 'opacity .3s'; row.style.opacity = '0';
@@ -2549,10 +2597,10 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
-<select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
-<input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
+<select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
+<input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td>
 <td data-label="הדפסה"><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
