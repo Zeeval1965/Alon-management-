@@ -1126,6 +1126,51 @@ class SiteDashboardTests(AppTestCase):
         self.assertEqual(self.login("sup@test").get("/static/site-hilel14.jpg").status_code, 200)
 
 
+class AdminAndDeleteTests(AppTestCase):
+    def _site_with_task(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'X1','חשמל','בדיקה','פתוחה')")
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='X1'").fetchone()[0]
+            A.db().execute("INSERT INTO task_status_log(task_id, status, handled_by, changed_by, changed_at) VALUES (?,?,?,?,?)",
+                           (tid, "בטיפול", "", "", ""))
+            A.db().commit()
+        return tid
+
+    def test_general_admin_screen_is_for_administrators(self):
+        self.assertEqual(self.login("owner@test").get("/admin").status_code, 403)
+        self.assertEqual(self.login("admin@test").get("/admin").status_code, 200)
+
+    def test_site_deletion_waits_for_approval_link(self):
+        tid = self._site_with_task()
+        self.login("admin@test").post("/admin/sites/1/delete")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM sites WHERE id=1"), 1)
+        mail = self.db_val("SELECT o.body FROM outbox o WHERE o.mode='מחיקת אתר' ORDER BY o.id DESC LIMIT 1")
+        self.assertEqual(self.db_val("SELECT c.email FROM outbox o JOIN contacts c ON c.id=o.contact_id WHERE o.mode='מחיקת אתר' ORDER BY o.id DESC LIMIT 1"),
+                         A.DEV_EMAIL)
+        token = re.search(r"/admin/approve-delete/([\w-]+)", mail).group(1)
+        anon = A.app.test_client()
+        self.assertEqual(anon.get(f"/admin/approve-delete/{token}").status_code, 200)
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM sites WHERE id=1"), 1)
+        anon.post(f"/admin/approve-delete/{token}")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM sites WHERE id=1"), 0)
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM tasks WHERE id=?", (tid,)), 0)
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_status_log WHERE task_id=?", (tid,)), 0)
+
+    def test_existing_login_users_become_administrators_once(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO contacts(email, first_name, last_name, password_hash, is_admin) VALUES ('new@test','נ','',?,0)",
+                           (generate_password_hash("pw"),))
+            A.db().execute("DELETE FROM app_settings WHERE key='all_users_admin'")
+            A.db().commit()
+        A.init_db()
+        self.assertEqual(self.db_val("SELECT is_admin FROM contacts WHERE email='new@test'"), 1)
+
+    def test_protocol_screens_show_the_six_steps(self):
+        html = self.login("admin@test").get("/sites/1/meetings/new").get_data(as_text=True)
+        self.assertIn("עדכון כלל המשתמשים", html)
+        self.assertIn('class="step active"', html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

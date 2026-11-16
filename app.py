@@ -98,6 +98,10 @@ CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
 );
+CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS site_delete_requests (
+  token_hash TEXT PRIMARY KEY, site_id INTEGER NOT NULL, requested_by TEXT, created_at TEXT, expires_at TEXT
+);
 CREATE TABLE IF NOT EXISTS stage_status (
   site_id INTEGER NOT NULL, level TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
   PRIMARY KEY(site_id, level, stage)
@@ -164,6 +168,10 @@ def init_db():
             c.execute(stmt)
         except sqlite3.OperationalError:
             pass  # column already exists
+    if not c.execute("SELECT 1 FROM app_settings WHERE key='all_users_admin'").fetchone():
+        c.execute("UPDATE contacts SET is_admin=1 WHERE password_hash IS NOT NULL")
+        c.execute("INSERT INTO app_settings(key, value) VALUES ('all_users_admin', ?)",
+                  (dt.datetime.now().isoformat(timespec="minutes"),))
     c.commit()
     c.close()
 
@@ -783,7 +791,7 @@ SECTION_OF = {
     "progress_view": "progress", "progress_save": "progress",
 }
 # task_link_view is open to anyone holding a valid link; it shows and changes only that one task
-PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view"}
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view", "admin_site_delete_approve"}
 # contact import and editing: administrator and supervisors (deleting field values: administrator only)
 MANAGER_ENDPOINTS = {"contacts_import", "contacts_import_preview", "contacts_import_confirm", "contact_edit",
                      "contact_role_add", "contact_role_remove", "contact_delete"}
@@ -1985,6 +1993,8 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .brow{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:14px}.brow .lbl{width:160px}
 .brow .track{flex:1;background:var(--gray-light);height:12px;border-radius:6px;overflow:hidden}
 .brow .fill{display:block;height:100%;background:#7A8699}.brow .n{width:40px;text-align:left}
+.stepper{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 14px}.step{border:1px solid var(--gray-line);border-radius:14px;padding:3px 10px;font-size:13px;color:var(--gray);background:#fff}
+.step.done{background:var(--gray-light);color:#444}.step.active{background:var(--red);border-color:var(--red);color:#fff;font-weight:bold}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
@@ -2002,7 +2012,7 @@ def page(title, body, **ctx):
 def sites():
     rows = db().execute("SELECT * FROM sites ORDER BY id").fetchall()
     return page("אתרים", """
-<p><a href="{{ url_for('site_new') }}">אתר חדש</a></p>
+<p><a href="{{ url_for('site_new') }}">אתר חדש</a> · <a href="{{ url_for('admin_overview') }}">ניהול כללי</a></p>
 <table><tr><th>אתר</th><th>עלייה לקרקע</th><th>מסירה</th><th>חודשי ביצוע (חוזה)</th><th></th></tr>
 {% for s in rows %}<tr><td>{{ s['name'] }}</td><td>{{ s['land_date'] }}</td><td>{{ s['delivery_date'] }}</td>
 <td>{{ s['months_total'] }}</td><td><a href="{{ url_for('site_view', site_id=s['id']) }}">פתיחה</a></td></tr>{% endfor %}</table>
@@ -2441,6 +2451,92 @@ def site_view(site_id):
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
+PROTOCOL_STEPS = ["העלאת מסמך", "פענוח תוכן", "השוואה להיסטוריה", "בקרת קליטה", "אישור הפיקוח", "עדכון כלל המשתמשים"]
+STEPPER_TPL = """<div class="stepper">{% for n in range(1, 7) %}<span class="step {% if n < active %}done{% elif n == active %}active{% endif %}">{{ n }}. {{ step_names[n-1] }}</span>{% endfor %}</div>"""
+
+
+def delete_site_data(site_id):
+    """Remove a site and every record that belongs to it. Child rows (by task) go first,
+    while the tasks still exist; then rows that carry site_id; then the site itself."""
+    d = db()
+    tables = [r[0] for r in d.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    for t in tables:
+        cols = [r[1] for r in d.execute(f"PRAGMA table_info({t})").fetchall()]
+        if "task_id" in cols and "site_id" not in cols:
+            d.execute(f"DELETE FROM {t} WHERE task_id IN (SELECT id FROM tasks WHERE site_id=?)", (site_id,))
+    for t in tables:
+        cols = [r[1] for r in d.execute(f"PRAGMA table_info({t})").fetchall()]
+        if t != "sites" and "site_id" in cols:
+            d.execute(f"DELETE FROM {t} WHERE site_id=?", (site_id,))
+    d.execute("DELETE FROM sites WHERE id=?", (site_id,))
+    d.commit()
+
+
+@app.route("/admin")
+def admin_overview():
+    """General administration: every site, its figures, deletion requests and users with a login."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    rows = []
+    for s_row in db().execute("SELECT * FROM sites ORDER BY id").fetchall():
+        kp = site_kpis(s_row["id"])
+        total = kp["open"] + kp["closed"]
+        meetings = db().execute("SELECT COUNT(*) FROM meetings WHERE site_id=? AND status='published'",
+                                (s_row["id"],)).fetchone()[0]
+        rows.append({"s": s_row, "kp": kp, "pct": round(100 * kp["closed"] / total) if total else 0, "meetings": meetings})
+    users = db().execute("SELECT first_name, last_name, email FROM contacts WHERE password_hash IS NOT NULL ORDER BY email").fetchall()
+    return page("ניהול כללי", """
+<p><a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
+<h3>אתרים</h3>
+<table class="cards"><tr><th>אתר</th><th>פתוחות</th><th>נסגרו</th><th>אחוז סגירה</th><th>פרוטוקולים שפורסמו</th><th>מחיקה</th></tr>
+{% for r in rows %}<tr><td data-label="אתר"><a href="{{ url_for('site_view', site_id=r['s']['id']) }}">{{ r['s']['name'] }}</a></td>
+<td data-label="פתוחות">{{ r['kp']['open'] }}</td><td data-label="נסגרו">{{ r['kp']['closed'] }}</td><td data-label="אחוז סגירה">{{ r['pct'] }}%</td><td data-label="פרוטוקולים">{{ r['meetings'] }}</td>
+<td data-label="מחיקה"><form method="post" action="{{ url_for('admin_site_delete_request', site_id=r['s']['id']) }}" onsubmit="return confirm('לשלוח בקשת מחיקה לאישור? האתר יימחק רק לאחר אישור בקישור שיישלח לבעל הפרויקט.')"><button>בקשת מחיקה</button></form></td></tr>{% endfor %}</table>
+<h3>משתמשים עם גישת מנהל</h3>
+<p class="note">{{ users|length }} משתמשים עם חשבון במערכת.</p>
+<table class="cards"><tr><th>שם</th><th>דוא"ל</th></tr>{% for u in users %}<tr><td data-label="שם">{{ u['first_name'] or '' }} {{ u['last_name'] or '' }}</td><td data-label='דוא"ל'>{{ u['email'] }}</td></tr>{% endfor %}</table>
+""", rows=rows, users=users, url_for=url_for)
+
+
+@app.route("/admin/sites/<int:site_id>/delete", methods=["POST"])
+def admin_site_delete_request(site_id):
+    """Deleting a site needs approval: a link goes to the owner's mailbox and nothing is deleted yet."""
+    me = current_contact()
+    if not me["is_admin"]:
+        abort(403)
+    s_row = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    token = secrets.token_urlsafe(24)
+    now = dt.datetime.now()
+    db().execute("INSERT INTO site_delete_requests(token_hash, site_id, requested_by, created_at, expires_at) VALUES (?,?,?,?,?)",
+                 (hashlib.sha256(token.encode()).hexdigest(), site_id, me["email"],
+                  now.isoformat(timespec="minutes"), (now + dt.timedelta(days=2)).isoformat(timespec="minutes")))
+    link = url_for("admin_site_delete_approve", token=token, _external=True)
+    body = (f'בקשה למחיקת האתר "{s_row["name"]}" נשלחה על ידי {me["email"]}. '
+            f"כל נתוני האתר יימחקו לצמיתות לאחר אישור. לאישור פתחו את הקישור (בתוקף יומיים): {link}")
+    enqueue(site_id, dev_contact(), body, "מחיקת אתר", channel="email")
+    db().commit()
+    return page("בקשת המחיקה נשלחה", '<p>הבקשה נשלחה לאישור בעל הפרויקט. האתר לא יימחק לפני האישור.</p><p><a href="/admin">חזרה לניהול כללי</a></p>')
+
+
+@app.route("/admin/approve-delete/<token>", methods=["GET", "POST"])
+def admin_site_delete_approve(token):
+    row = db().execute("SELECT * FROM site_delete_requests WHERE token_hash=?",
+                       (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+    if row is None or row["expires_at"] < dt.datetime.now().isoformat(timespec="minutes"):
+        abort(404)
+    s_row = db().execute("SELECT * FROM sites WHERE id=?", (row["site_id"],)).fetchone()
+    name = s_row["name"] if s_row else ""
+    if request.method == "POST":
+        if s_row is not None:
+            delete_site_data(row["site_id"])
+        return page("האתר נמחק", f'<p>האתר "{name}" וכל נתוניו נמחקו.</p>')
+    if s_row is None:
+        abort(404)
+    return page("אישור מחיקת אתר", """
+<p>לאישור מחיקת האתר "{{ name }}" וכל נתוניו (משימות, פרוטוקולים, תוכניות ויומנים) לחצו על האישור. הפעולה אינה הפיכה.</p>
+<form method="post"><button>אישור מחיקה סופית</button></form>""", name=name)
+
+
 @app.route("/sites/<int:site_id>/meetings/new", methods=["GET", "POST"])
 def meeting_upload(site_id):
     if request.method == "POST":
@@ -2453,10 +2549,10 @@ def meeting_upload(site_id):
             (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(rows, ensure_ascii=False)))
         db().commit()
         return redirect(url_for("meeting_review", meeting_id=cur.lastrowid))
-    return page("העלאת פרוטוקול", """
+    return page("העלאת פרוטוקול", STEPPER_TPL + """
 <form method="post" enctype="multipart/form-data">
 <p>סוג פגישה <select name="kind"><option>ביצוע</option><option>שבועית</option><option>סופרפוזיציה</option></select></p>
-<input type="file" name="file" accept=".pdf" required> <button>העלאה לבדיקה</button></form>""", url_for=url_for)
+<input type="file" name="file" accept=".pdf" required> <button>העלאה לבדיקה</button></form>""", url_for=url_for, active=1, step_names=PROTOCOL_STEPS)
 
 
 @app.route("/meetings/<int:meeting_id>/review", methods=["GET", "POST"])
@@ -2478,7 +2574,7 @@ def meeting_review(meeting_id):
             return redirect(url_for("site_view", site_id=m["site_id"]))
         db().commit()
         flash("נשמר כטיוטה")
-    return page("בדיקת פרוטוקול לפני פרסום", """
+    return page("בדיקת פרוטוקול לפני פרסום", STEPPER_TPL + """
 <p>ערכו כל שורה לפני הפרסום. סמנו 'לא לפרסם' לשורות שחולצו בצורה שגויה.</p>
 <form method="post"><table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול</th><th>יעד</th><th>לא לפרסם</th></tr>
 {% for r in rows %}{% set i = loop.index0 %}<tr>
@@ -2489,7 +2585,7 @@ def meeting_review(meeting_id):
 <td><input name="target_{{i}}" value="{{ r['target'] }}"></td>
 <td><input type="checkbox" name="skip_{{i}}" {% if r.get('skip') %}checked{% endif %}></td></tr>{% endfor %}</table>
 <p><button name="action" value="save">שמירה כטיוטה</button> <button name="action" value="publish">אישור ופרסום</button></p></form>
-""", rows=rows)
+""", rows=rows, active=4, step_names=PROTOCOL_STEPS)
 
 
 # Render (gunicorn) imports this module and never runs the __main__ block,
