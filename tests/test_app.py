@@ -1211,6 +1211,24 @@ class ProtocolDatesTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT meeting_date FROM meetings WHERE id=?", (mid,)), "2026-11-10")
 
 
+class DashboardLinksTests(AppTestCase):
+    def test_kpi_cards_open_the_matching_task_lists(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status, created_at) VALUES (1,'L1','חשמל','ישן','פתוחה','2020-01-01')")
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'L2','חשמל','ממתינה','ממתינה לאישור')")
+            A.db().commit()
+        c = self.login("sup@test")
+        html = c.get("/sites/1").get_data(as_text=True)
+        for view in ("open", "awaiting", "aged", "repeat2", "done"):
+            self.assertIn(f"view={view}", html)
+        aged = c.get("/sites/1/search?view=aged").get_data(as_text=True)
+        self.assertIn(">L1<", aged)
+        self.assertNotIn(">L2<", aged)
+        awaiting = c.get("/sites/1/search?view=awaiting").get_data(as_text=True)
+        self.assertIn(">L2<", awaiting)
+        self.assertNotIn(">L1<", awaiting)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

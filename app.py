@@ -935,6 +935,14 @@ def short(text, n=90):
     return s if len(s) <= n else s[:n] + "…"
 
 
+def aged_over_30(task):
+    """Open for more than 30 days, by the recorded opening date."""
+    try:
+        return bool(task["created_at"]) and (dt.date.today() - dt.date.fromisoformat(task["created_at"])).days > 30
+    except ValueError:
+        return False
+
+
 def site_kpis(site_id):
     open_names = task_status_names("open")
     closed_names = task_status_names("closed")
@@ -1516,7 +1524,7 @@ def site_search(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     q = (request.args.get("q") or "").strip()
     kind = request.args.get("kind") if request.args.get("kind") in ("משימות", "החלטות") else "משימות"
-    view = request.args.get("view") if request.args.get("view") in ("open", "done", "info", "repeat3") else ""
+    view = request.args.get("view") if request.args.get("view") in ("open", "done", "info", "repeat3", "awaiting", "aged", "repeat2") else ""
     status = request.args.get("status") or ""
     topic = request.args.get("topic") or ""
     contact_id = request.args.get("contact", type=int)
@@ -1536,8 +1544,15 @@ def site_search(site_id):
         if contact_id:
             linked = {r[0] for r in db().execute(
                 "SELECT task_id FROM task_assignments WHERE contact_id=?", (contact_id,)).fetchall()}
+        open_names = task_status_names("open")
         for t in db().execute("SELECT * FROM tasks WHERE site_id=? ORDER BY public_no", (site_id,)).fetchall():
             if view == "open" and t["status"] in CLOSED_STATUSES + INFO_STATUSES:
+                continue
+            if view == "awaiting" and t["status"] != "ממתינה לאישור":
+                continue
+            if view == "aged" and not (t["status"] in open_names and aged_over_30(t)):
+                continue
+            if view == "repeat2" and not (t["status"] in open_names and task_repeat_count(t["id"]) >= 2):
                 continue
             if view == "done" and t["status"] != "בוצע":
                 continue
@@ -2018,7 +2033,7 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .s-hold{background:#E4E4E4;color:#444}.s-info{background:#F4F4F4;color:#666}.s-done{background:#DFF5E3;color:#1D6B33}
 .s-cancel{background:#F0F0F0;color:#888;text-decoration:line-through}
 .hero{margin:0 0 12px;border-radius:6px;overflow:hidden}.hero img{width:100%;height:260px;object-fit:cover;display:block}
-.kpis{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.kpi{flex:1 1 150px;border:1px solid var(--gray-line);border-radius:6px;padding:10px;background:#fff}
+.kpis{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.kpi{flex:1 1 150px;border:1px solid var(--gray-line);border-radius:6px;padding:10px;background:#fff;display:block;color:inherit;text-decoration:none}a.kpi:hover{border-color:#999}
 .kpi b{display:block;font-size:26px;color:#222}.kpi.warn b{color:var(--red)}.kpi span{color:var(--gray);font-size:13px}
 .brow{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:14px}.brow .lbl{width:160px}
 .brow .track{flex:1;background:var(--gray-light);height:12px;border-radius:6px;overflow:hidden}
@@ -2438,11 +2453,11 @@ def site_view(site_id):
     return page(s["name"], """
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div class="kpis">
-<div class="kpi"><b>{{ kp.open }}</b><span>משימות פתוחות</span></div>
-<div class="kpi"><b>{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></div>
-<div class="kpi warn"><b>{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></div>
-<div class="kpi warn"><b>{{ kp.repeats_open }}</b><span>פתוחות שחזרו בפרוטוקולים</span></div>
-<div class="kpi"><b>{{ kp.closed }}</b><span>נסגרו</span></div>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b>{{ kp.open }}</b><span>משימות פתוחות</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='awaiting') }}"><b>{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></a>
+<a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='aged') }}"><b>{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></a>
+<a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='repeat2') }}"><b>{{ kp.repeats_open }}</b><span>פתוחות שחזרו בפרוטוקולים</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='done') }}"><b>{{ kp.closed }}</b><span>נסגרו</span></a>
 <div class="kpi"><b>{{ pct }}%</b><span>אחוז סגירה</span></div>
 </div>
 <h3>התפלגות סטטוסים</h3>
