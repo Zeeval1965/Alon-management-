@@ -844,7 +844,7 @@ SECTION_OF = {
     "site_view": "tasks", "site_live": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -2881,6 +2881,26 @@ def site_protocols_reset(site_id):
     return redirect(url_for("site_protocols", site_id=site_id))
 
 
+@app.route("/sites/<int:site_id>/protocols/publish", methods=["POST"])
+def site_protocols_publish(site_id):
+    """Publish the chosen drafts (or every draft with all=1), oldest protocol date first."""
+    db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    if request.form.get("all"):
+        ids = [r[0] for r in db().execute(
+            "SELECT id FROM meetings WHERE site_id=? AND status!='published'", (site_id,)).fetchall()]
+    else:
+        ids = [int(x) for x in request.form.getlist("ids") if x.isdigit()]
+    if not ids:
+        return redirect(url_for("site_protocols", site_id=site_id))
+    marks = ",".join("?" * len(ids))
+    drafts = db().execute(
+        f"SELECT id FROM meetings WHERE site_id=? AND status!='published' AND id IN ({marks}) "
+        "ORDER BY meeting_date IS NULL, meeting_date, id", (site_id, *ids)).fetchall()
+    for r in drafts:
+        publish_meeting(r["id"])
+    return redirect(url_for("site_protocols", site_id=site_id))
+
+
 @app.route("/sites/<int:site_id>/protocols")
 def site_protocols(site_id):
     """Published protocols, newest protocol date first; sort by publish time or filter to this month."""
@@ -2925,11 +2945,13 @@ def site_protocols(site_id):
 <td data-label=""><a href="{{ url_for('meeting_view', meeting_id=i['m']['id']) }}">פתיחה</a></td></tr>
 {% else %}<tr><td colspan="6">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
 <h3>הועלו ולא פורסמו (טיוטות)</h3>
-<table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
-{% for d in drafts %}<tr><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
+<form method="post" action="{{ url_for('site_protocols_publish', site_id=s['id']) }}">
+<p><button>פרסם את הנבחרים</button> <button name="all" value="1" onclick="return confirm('לפרסם את כל הטיוטות לפי סדר התאריכים?')">פרסם הכל</button> <span class="note">מסומנים: הפרוטוקולים יפורסמו מהישן לחדש.</span></p>
+<table class="cards"><tr><th></th><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
+{% for d in drafts %}<tr><td data-label="בחירה"><input type="checkbox" name="ids" value="{{ d['m']['id'] }}"></td><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
 <td data-label="קובץ">{{ d['m']['source_name'] or '' }}</td><td data-label="שורות שזוהו">{{ d['rows'] }}{% if d['rows'] == 0 %} <span class="note">לא זוהו שורות - בדקו את הקובץ</span>{% endif %}</td>
 <td data-label=""><a href="{{ url_for('meeting_review', meeting_id=d['m']['id']) }}">בדיקה ופרסום</a></td></tr>
-{% else %}<tr><td colspan="6">אין טיוטות</td></tr>{% endfor %}</table>
+{% else %}<tr><td colspan="6">אין טיוטות</td></tr>{% endfor %}</table></form>
 {% if is_admin %}<h3>מחיקת כל הפרוטוקולים (למנהל בלבד)</h3>
 <form method="post" action="{{ url_for('site_protocols_reset', site_id=s['id']) }}" onsubmit="return confirm('למחוק את כל הפרוטוקולים והמשימות של האתר? הפעולה אינה הפיכה.')">
 <p class="note">ימחקו כל הפרוטוקולים והטיוטות, המשימות שנוצרו מהם, ההיסטוריה, השיוכים, ההערות והקבצים המקושרים למשימות. אנשי הקשר, האתר, התוכניות והחלטות שנרשמו ידנית נשארים.</p>

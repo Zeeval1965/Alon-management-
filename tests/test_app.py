@@ -1622,3 +1622,24 @@ class ResetProtocolsTests(AppTestCase):
             self.assertEqual(d.execute("SELECT COUNT(*) FROM task_occurrences").fetchone()[0], 0)
             self.assertGreater(d.execute("SELECT COUNT(*) FROM contacts").fetchone()[0], 0)
             self.assertEqual(d.execute("SELECT COUNT(*) FROM sites").fetchone()[0], 1)
+
+
+class BulkPublishTests(AppTestCase):
+    def _draft(self, day, text):
+        row = {"number": "1", "topic": "חשמל", "task": text, "assignee": "חשמלאי", "target": "", "meeting_date": day, "flags": []}
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status, meeting_date) VALUES (1,'ביצוע',?,'draft',?)",
+                           (json.dumps([row], ensure_ascii=False), A.parse_date(day)))
+            A.db().commit()
+            return A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+
+    def test_selected_drafts_publish_and_others_stay(self):
+        a = self._draft("02.11.26", "בדיקת חשמל לקומה ראשונה בבניין")
+        b = self._draft("09.11.26", "בדיקת חשמל לקומה שנייה בבניין")
+        c = self._draft("16.11.26", "בדיקת חשמל לקומה שלישית בבניין")
+        self.login("admin@test").post("/sites/1/protocols/publish", data={"ids": [str(b), str(a)]})
+        with A.app.app_context():
+            st = {r[0]: r[1] for r in A.db().execute("SELECT id, status FROM meetings").fetchall()}
+        self.assertEqual(st[a], "published")
+        self.assertEqual(st[b], "published")
+        self.assertEqual(st[c], "draft")
