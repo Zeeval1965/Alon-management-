@@ -1240,6 +1240,44 @@ class TaskNumberDisplayTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT public_no FROM tasks WHERE text='בדיקה'"), "01.07.25#2")
 
 
+class InPlaceUpdateTests(AppTestCase):
+    def _task(self, no):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,?,'חשמל','בדיקה','פתוחה')", (no,))
+            A.db().commit()
+            return A.db().execute("SELECT id FROM tasks WHERE public_no=?", (no,)).fetchone()[0]
+
+    def test_script_request_gets_json_and_task_is_closed(self):
+        tid = self._task("P1")
+        r = self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "בוצע"},
+                                        headers={"X-Requested-With": "fetch"})
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["hide"])
+        self.assertEqual(d["status"], "בוצע")
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בוצע")
+
+    def test_plain_request_still_redirects(self):
+        tid = self._task("P2")
+        r = self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "בטיפול"})
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בטיפול")
+
+    def test_delete_from_script_returns_delete_message_and_removes_task(self):
+        tid = self._task("P4")
+        d = self.login("sup@test").post(f"/tasks/{tid}/triage", data={"action": "delete"},
+                                        headers={"X-Requested-With": "fetch"}).get_json()
+        self.assertTrue(d["hide"])
+        self.assertEqual(d["message"], "המשימה נמחקה.")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM tasks WHERE id=?", (tid,)), 0)
+
+    def test_site_page_marks_task_forms_for_in_place_update(self):
+        self._task("P3")
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        self.assertIn("data-ajax", html)
+        self.assertIn("ajax-toast", html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

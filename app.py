@@ -11,7 +11,7 @@ import uuid
 from collections import Counter
 
 import openpyxl
-from flask import has_request_context, Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from flask import has_request_context, Flask, abort, flash, g, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
 from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -1205,7 +1205,8 @@ def assign_task(task_id):
     if not db().execute("SELECT 1 FROM task_assignments WHERE task_id=? AND is_responsible=1", (task_id,)).fetchone():
         db().execute("UPDATE task_assignments SET is_responsible=1 WHERE task_id=? AND contact_id=?", (task_id, cid))
     db().commit()
-    return redirect(url_for("site_warnings", site_id=t["site_id"]))
+    return _task_reply(task_id, url_for("site_warnings", site_id=t["site_id"]), hide=True,
+                       message="המשימה שויכה.")
 
 
 def _safe_next(url, fallback):
@@ -1246,6 +1247,21 @@ def site_print_clear(site_id):
     return redirect(url_for("site_print", site_id=site_id))
 
 
+def _wants_json():
+    """Forms sent by the page's script (fetch) want a result, not a redirect."""
+    return request.headers.get("X-Requested-With") == "fetch"
+
+
+def _task_reply(task_id, redirect_to, message="", hide=False):
+    """Browser forms keep the usual redirect. Script forms get the new state so the row updates in place."""
+    if not _wants_json():
+        return redirect(redirect_to)
+    row = db().execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    st = row["status"] if row else None
+    hide = hide or st is None or st in CLOSED_STATUSES + INFO_STATUSES
+    return jsonify(ok=True, status=st, css=STATUS_CLASS.get(st, ""), hide=hide, message=message)
+
+
 @app.route("/tasks/<int:task_id>/triage", methods=["POST"])
 def task_triage(task_id):
     """For a task with no one to assign: 'info' marks it for information only, 'delete' removes it."""
@@ -1261,7 +1277,8 @@ def task_triage(task_id):
     else:
         abort(400)
     db().commit()
-    return redirect(url_for("site_warnings", site_id=t["site_id"]))
+    return _task_reply(task_id, url_for("site_warnings", site_id=t["site_id"]), hide=True,
+                       message="המשימה נמחקה." if action == "delete" else "המשימה סומנה לידיעה.")
 
 
 @app.route("/tasks/<int:task_id>/status", methods=["POST"])
@@ -1280,7 +1297,8 @@ def task_status(task_id):
                          (task_id, t["last_meeting_id"], dt.datetime.now().isoformat(timespec="minutes")))
             log_task_status(task_id, "בוצע", "בקשת סגירה ממתינה לאישור המפקח")
             db().commit()
-            return redirect(url_for("site_view", site_id=t["site_id"]))
+            return _task_reply(task_id, url_for("site_view", site_id=t["site_id"]),
+                               message="נשלחה בקשת סגירה למפקח לאישור.")
         if new_status in LINK_STATUSES_EXCLUDED:
             abort(400)
     by_name = request.form.get("by", "לא צוין")
@@ -1293,7 +1311,7 @@ def task_status(task_id):
     db().commit()
     if new_status != "פתוחה":
         notify_supervisors_task_handled(t, by_name, new_status)
-    return redirect(url_for("site_view", site_id=t["site_id"]))
+    return _task_reply(task_id, url_for("site_view", site_id=t["site_id"]), message="הסטטוס עודכן.")
 
 
 # ---------- assignee linking: text in 'לטיפול' -> contacts (supervisor confirms) ----------
@@ -1709,7 +1727,8 @@ def task_closure(task_id, action):
             db().execute("UPDATE tasks SET status='בוצע', closed_at=? WHERE id=?", (dt.date.today().isoformat(), task_id))
             log_task_status(task_id, "בוצע", "נסגרה לאחר היעלמה מפרוטוקול מלא")
         db().commit()
-    return redirect(url_for("site_warnings", site_id=t["site_id"]))
+    return _task_reply(task_id, url_for("site_warnings", site_id=t["site_id"]), hide=True,
+                       message="הסגירה נשמרה." if action == "approve" else "המשימה נשארה פתוחה.")
 
 
 @app.route("/tasks/<int:task_id>/comments", methods=["POST"])
@@ -1773,12 +1792,14 @@ def task_link_view(token):
                          (t["id"], c["id"], comment, dt.datetime.now().isoformat(timespec="minutes")))
         db().commit()
         t = db().execute("SELECT * FROM tasks WHERE id=?", (t["id"],)).fetchone()
+        if _wants_json():
+            return jsonify(ok=True, status=t["status"], css=STATUS_CLASS.get(t["status"], ""), message=message or "העדכון נשמר.")
     return page("עדכון משימה", """
 <h2>עדכון משימה {{ t['public_no']|pubno }}</h2>
 <p><b>{{ t['topic'] or '' }}</b></p><p>{{ t['text'] }}</p>
-<p class="note">סטטוס נוכחי: {{ t['status'] }}</p>
+<p class="note">סטטוס נוכחי: <span id="status-now">{{ t['status'] }}</span></p>
 {% if message %}<p class="flash">{{ message }}</p>{% endif %}
-<form method="post">
+<form method="post" data-ajax>
 <label>סטטוס חדש <select name="status">{% for o in allowed %}<option>{{ o }}</option>{% endfor %}<option>בוצע</option></select></label>
 <p class="note">בחירה ב"בוצע" שולחת בקשת סגירה למפקח; המשימה תיסגר רק לאחר אישורו.</p>
 <label>אסמכתא (לא חובה: שם מסמך או קישור)<br><input name="doc" style="width:100%"></label>
@@ -1904,8 +1925,8 @@ def site_warnings(site_id):
 <h3>לבדיקה: לא הופיעה בפרוטוקול המלא האחרון (לא נסגרה אוטומטית)</h3>
 <table><tr><th>משימה</th><th>תיאור</th><th>פעולה</th></tr>
 {% for c in closures %}<tr><td>{{ c['public_no']|pubno }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
-<td><form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
-<form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="display:inline"><button>השאר פתוחה</button></form></td></tr>
+<td><form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
+<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="display:inline"><button>השאר פתוחה</button></form></td></tr>
 {% else %}<tr><td colspan="3">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
@@ -1919,10 +1940,10 @@ def site_warnings(site_id):
 <table><tr><th>#</th><th>נושא</th><th>משימה</th><th>לטיפול (כפי שכתוב)</th></tr>
 {% for t in unassigned %}<tr><td>{{ t['public_no']|pubno }}</td><td>{{ t['topic'] or '' }}</td><td>{{ t['text'] }}</td>
 <td>{{ t['assignee_text'] or '' }}
-<form method="post" action="{{ url_for('assign_task', task_id=t['id']) }}" style="margin-top:4px">
+<form method="post" data-ajax action="{{ url_for('assign_task', task_id=t['id']) }}" style="margin-top:4px">
 <select name="contact_id">{% for c in choices %}<option value="{{ c['id'] }}">{{ c['first_name'] }} {{ c['last_name'] or '' }}</option>{% endfor %}</select>
 <button>שייך</button></form>
-<form method="post" action="{{ url_for('task_triage', task_id=t['id']) }}" style="margin-top:4px">
+<form method="post" data-ajax action="{{ url_for('task_triage', task_id=t['id']) }}" style="margin-top:4px">
 <button name="action" value="info">1 - לידיעה</button>
 <button name="action" value="delete" onclick="return confirm('למחוק את המשימה? הפעולה אינה הפיכה.')">2 - מחק</button></form></td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
@@ -2053,7 +2074,48 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
 <main><h2>{{ title }}</h2>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
-{{ body|safe }}</main></body></html>"""
+{{ body|safe }}</main>
+<script>
+(function(){
+  function toast(text, bad){
+    var t=document.getElementById('ajax-toast');
+    if(!t){ t=document.createElement('div'); t.id='ajax-toast';
+      t.style.cssText='position:fixed;bottom:16px;left:16px;right:16px;max-width:360px;margin:auto;padding:10px 14px;border-radius:6px;color:#fff;z-index:9999;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.2)';
+      document.body.appendChild(t); }
+    t.style.background = bad ? '#C62828' : '#2E7D32';
+    t.textContent = text; t.style.display = 'block';
+    clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 3500);
+  }
+  function applyResult(form, d){
+    var row = form.closest('tr');
+    if (d.hide && row) {
+      row.style.transition = 'opacity .3s'; row.style.opacity = '0';
+      setTimeout(function(){ row.remove(); }, 300);
+    } else if (row && d.status) {
+      var pill = row.querySelector('.pill');
+      if (pill) { pill.textContent = d.status; pill.className = 'pill ' + (d.css || ''); }
+    }
+    var now = document.getElementById('status-now');
+    if (now && d.status) { now.textContent = d.status; }
+  }
+  document.addEventListener('submit', function(e){
+    var f = e.target;
+    if (!f.matches || !f.matches('form[data-ajax]')) return;
+    e.preventDefault();
+    var fd = new FormData(f);
+    if (e.submitter && e.submitter.name) { fd.append(e.submitter.name, e.submitter.value); }
+    var buttons = f.querySelectorAll('button');
+    buttons.forEach(function(b){ b.disabled = true; });
+    fetch(f.action || window.location.href, {method: 'POST', body: fd, credentials: 'same-origin',
+        headers: {'X-Requested-With': 'fetch', 'Accept': 'application/json'}})
+      .then(function(r){ if (!r.ok) throw new Error('העדכון לא נשמר, נסו שוב'); return r.json(); })
+      .then(function(d){ applyResult(f, d); toast(d.message || 'העדכון נשמר', false); })
+      .catch(function(err){ toast(err.message || 'העדכון לא נשמר', true); })
+      .finally(function(){ buttons.forEach(function(b){ b.disabled = false; }); });
+  });
+})();
+</script>
+</body></html>"""
 
 
 def page(title, body, **ctx):
@@ -2488,7 +2550,7 @@ def site_view(site_id):
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td>
 <td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
-<form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
+<form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
 <select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
 <td data-label="הדפסה"><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
