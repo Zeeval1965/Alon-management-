@@ -3027,9 +3027,12 @@ def meeting_view(meeting_id):
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס היום</th></tr>
 {% for r in rows %}<tr><td data-label="#">{{ r['number'] }}</td><td data-label="נושא">{{ r['topic'] or '' }}</td>
 <td data-label="משימה" style="width:100%">{{ r['text'] }}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
-<td data-label="סטטוס היום"><span class="pill {{ sclass.get(r['status'], '') }}">{{ r['status'] }}</span></td></tr>
+<td data-label="סטטוס היום"><span class="pill {{ sclass.get(r['status'], '') }}">{{ r['status'] }}</span>
+<form method="post" action="{{ url_for('task_status', task_id=r['task_id']) }}" data-ajax>
+<select name="status" style="width:100%;min-width:150px">{% for o in options %}<option {% if o == r['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
+<input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>
 {% else %}<tr><td colspan="5">אין שורות בפרוטוקול זה</td></tr>{% endfor %}</table>""",
-        m=m, rows=rows, date_txt=date_txt, sclass=STATUS_CLASS)
+        m=m, rows=rows, date_txt=date_txt, sclass=STATUS_CLASS, options=task_status_names())
 
 
 @app.route("/meetings/<int:meeting_id>/review", methods=["GET", "POST"])

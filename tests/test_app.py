@@ -1643,3 +1643,23 @@ class BulkPublishTests(AppTestCase):
         self.assertEqual(st[a], "published")
         self.assertEqual(st[b], "published")
         self.assertEqual(st[c], "draft")
+
+
+class ProtocolViewStatusTests(AppTestCase):
+    def test_status_can_be_changed_from_the_protocol_view(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO meetings(site_id, kind, staged_rows, status, meeting_date) VALUES (1,'ביצוע','[]','published','2026-11-10')")
+            mid = d.execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,'V1','חשמל','בדיקה','פתוחה')")
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='V1'").fetchone()[0]
+            d.execute("INSERT INTO task_occurrences(task_id, meeting_id, number, topic, text, target, created_at) VALUES (?,?,?,?,?,?,?)",
+                      (tid, mid, "1", "חשמל", "בדיקה", "", "2026-11-10"))
+            d.commit()
+        c = self.login("admin@test")
+        html = c.get(f"/meetings/{mid}/view").get_data(as_text=True)
+        self.assertIn(f"/tasks/{tid}/status", html)
+        self.assertIn('data-ajax', html)
+        c.post(f"/tasks/{tid}/status", data={"status": "בטיפול", "by": "בדיקה"})
+        with A.app.app_context():
+            self.assertEqual(A.db().execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0], "בטיפול")
