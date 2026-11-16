@@ -1543,3 +1543,25 @@ class LiveHomeTests(AppTestCase):
         data = c.get("/sites/1/live").get_json()
         self.assertEqual(data["kpis"]["late"], 1)
         self.assertEqual(data["latest_meeting_id"], mid)
+
+
+class SplitMergedUploadTests(unittest.TestCase):
+    def test_rows_are_grouped_by_their_own_date_oldest_first(self):
+        rows = [{"meeting_date": "10.11.26", "task": "א"}, {"meeting_date": "20.10.26", "task": "ב"},
+                {"meeting_date": "10.11.26", "task": "ג"}, {"meeting_date": None, "task": "ד"}]
+        groups = A.split_rows_by_date(rows)
+        self.assertEqual([d for d, _ in groups], ["2026-10-20", "2026-11-10", None])
+        self.assertEqual([r["task"] for r in groups[1][1]], ["א", "ג"])
+
+
+class RepeatedUploadTests(AppTestCase):
+    def test_same_protocol_date_uploaded_twice_does_not_duplicate_tasks(self):
+        row = {"number": "1", "topic": "חשמל", "task": "בדיקת חיבור חשמל לכל הדירות בקומה השלישית",
+               "assignee": "חשמלאי", "target": "", "meeting_date": "10.11.26", "flags": []}
+        with A.app.app_context():
+            for _ in range(2):
+                A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status, meeting_date) VALUES (1,'ביצוע',?, 'draft', '2026-11-10')",
+                               (json.dumps([row], ensure_ascii=False),))
+                mid = A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+                A.publish_meeting(mid)
+            self.assertEqual(A.db().execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)

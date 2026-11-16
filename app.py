@@ -151,6 +151,15 @@ def meeting_day(rows):
     return dates.most_common(1)[0][0] if dates else None
 
 
+def split_rows_by_date(rows):
+    """A merged file holds several protocols, one per meeting date. Split its rows so each date
+    becomes its own staged protocol, oldest first; rows with no readable date stay together last."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(parse_date(r.get("meeting_date")), []).append(r)
+    return sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or ""))
+
+
 def backfill_dates(c):
     """Fill dates that older records never had: meeting dates from their rows, task opening
     dates from the earliest protocol that mentioned them, and publish times from those dates."""
@@ -411,6 +420,14 @@ def to_queue(site_id, meeting_id, row, reason):
          dt.datetime.now().isoformat(timespec="minutes")))
 
 
+def protocol_already_has(task_id, iso_date):
+    if not iso_date:
+        return False
+    return db().execute(
+        """SELECT 1 FROM task_occurrences o JOIN meetings mm ON mm.id = o.meeting_id
+           WHERE o.task_id=? AND mm.meeting_date=?""", (task_id, iso_date)).fetchone() is not None
+
+
 def publish_meeting(meeting_id):
     """Publish approved rows. Anything the system cannot match with confidence goes to
     the admin queue instead of being guessed. Rows are processed in meeting-date order."""
@@ -439,6 +456,14 @@ def publish_meeting(meeting_id):
         candidates = [t for t in db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
                       if (t["id"], day) not in used]
         hits = [t for t in candidates if same_task(t, r)]
+        if len(hits) > 1:  # a repeated upload of the same protocol date points at the task it already made
+            seen = [t for t in hits if protocol_already_has(t["id"], parse_date(day))]
+            if len(seen) == 1:
+                hits = seen
+        if not hits and _words(r.get("task")):
+            # Same wording already published from this same protocol date: a repeated upload, not a new item.
+            hits = [t for t in candidates if _words(t["text"]) == _words(r.get("task"))
+                    and protocol_already_has(t["id"], parse_date(day))]
         if len(hits) > 1:
             to_queue(site_id, meeting_id, r, "התאמה מרובה למשימות קיימות - לאשר לאיזו משימה זה שייך")
             queued.append(number)
@@ -2596,7 +2621,8 @@ def site_live_data(site_id):
         f"SELECT COUNT(*) FROM tasks WHERE site_id=? AND target_date IS NOT NULL AND target_date < ? AND status IN ({marks})",
         (site_id, today, *open_names)).fetchone()[0]
     latest = db().execute(
-        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
+        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY published_at DESC, id DESC LIMIT 1",
+        (site_id,)).fetchone()
     return kp, latest
 
 
@@ -2673,7 +2699,7 @@ def site_view(site_id):
 <h3>משימות מהפרוטוקול האחרון{% if latest_date %} · {{ latest_date }}{% endif %}</h3>
 {% if latest_tasks %}<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
 {% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span></td></tr>{% endfor %}</table>
-{% else %}<p class="note">אין פרוטוקול מפורסם לאתר.</p>{% endif %}
+{% elif latest %}<p class="note">בפרוטוקול זה אין משימות מקושרות.</p>{% else %}<p class="note">אין פרוטוקול מפורסם לאתר.</p>{% endif %}
 <script>
 (function () {
   var url = {{ url_for('site_live', site_id=s['id'])|tojson }};
@@ -2870,11 +2896,15 @@ def meeting_upload(site_id):
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         f.save(tmp.name)
         rows = extract_rows(tmp.name)
-        cur = db().execute(
-            "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
-            (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(rows, ensure_ascii=False), meeting_day(rows)))
+        ids = []
+        for day, group in split_rows_by_date(rows):
+            cur = db().execute(
+                "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
+                (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(group, ensure_ascii=False), day))
+            ids.append(cur.lastrowid)
         db().commit()
-        return redirect(url_for("meeting_review", meeting_id=cur.lastrowid))
+        # the oldest protocol opens first; the others are listed as drafts in the protocol repository
+        return redirect(url_for("meeting_review", meeting_id=ids[0]))
     return page("העלאת פרוטוקול", STEPPER_TPL + """
 <form method="post" enctype="multipart/form-data">
 <p>סוג פגישה <select name="kind"><option>ביצוע</option><option>שבועית</option><option>סופרפוזיציה</option></select></p>
