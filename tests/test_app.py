@@ -925,6 +925,75 @@ class EmailVisibilityTests(AppTestCase):
         self.assertIn("<td>owner@test</td>", html)
 
 
+class BacklogDataTests(AppTestCase):
+    def _publish_rows(self, kind, rows):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status) VALUES (1,?,?, 'draft')",
+                           (kind, json.dumps(rows, ensure_ascii=False)))
+            A.db().commit()
+            mid = A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            A.publish_meeting(mid)
+
+    def test_global_lists_are_seeded(self):
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM severity_levels"), 4)
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM item_types"), 7)
+        self.assertEqual(self.db_val("SELECT kind FROM task_status_options WHERE name='לא רלוונטי'"), "closed")
+
+    def test_suggestions_from_text(self):
+        self.assertEqual(A.suggest_severity("תיקון דחוף בחזית"), "גבוה")
+        self.assertEqual(A.suggest_severity("סיכון בטיחות"), "קריטי")
+        self.assertEqual(A.suggest_item_type("בדיקת חזית הבניין"), "נושא חזית")
+        self.assertEqual(A.suggest_item_type("אין התאמה למפרט"), "בקשה למפרט")
+
+    def test_unknown_status_is_rejected(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, status) VALUES (1,'S70','בדיקה','פתוחה')")
+            A.db().commit()
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='S70'").fetchone()[0]
+        c = self.login("sup@test")
+        self.assertEqual(c.post(f"/tasks/{tid}/status", data={"status": "שגיאה"}).status_code, 400)
+        self.assertEqual(c.post(f"/tasks/{tid}/status", data={"status": "ממתין למפרט"}).status_code, 302)
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "ממתין למפרט")
+
+    def test_closed_task_reappearing_is_reopened_and_counted(self):
+        row = {"number": "1", "topic": "חשמל", "task": "החלפת לוח חשמל קריטי", "assignee": "",
+               "target": "", "meeting_date": "01.11.26"}
+        self._publish_rows("שבועית", [row])
+        tid = self.db_val("SELECT id FROM tasks WHERE public_no LIKE '%#1'")
+        self.assertEqual(self.db_val("SELECT severity FROM tasks WHERE id=?", (tid,)), "קריטי")
+        with A.app.app_context():
+            A.db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (tid,))
+            A.db().commit()
+        self._publish_rows("שבועית", [dict(row, meeting_date="08.11.26")])
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "לבדיקה חוזרת")
+        self.assertEqual(self.db_val(
+            "SELECT COUNT(DISTINCT meeting_id) FROM task_targets WHERE task_id=?", (tid,)), 2)
+
+    def test_kpis_and_recommendations(self):
+        row = {"number": "1", "topic": "חשמל", "task": "החלפת לוח חשמל קריטי", "assignee": "",
+               "target": "", "meeting_date": "01.11.26"}
+        self._publish_rows("שבועית", [row])
+        self._publish_rows("שבועית", [dict(row, meeting_date="08.11.26")])
+        with A.app.app_context():
+            k = A.site_kpis(1)
+            recs = A.site_recommendations(1)
+        self.assertEqual(k["open"], 1)
+        self.assertEqual(k["repeats_open"], 1)
+        self.assertEqual(k["critical_open"], 1)
+        self.assertTrue(any("לסגור סופית" in r for r in recs))
+
+    def test_comment_and_document_by_supervisor_only(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, text, status) VALUES (1,'S71','בדיקה','פתוחה')")
+            A.db().commit()
+            tid = A.db().execute("SELECT id FROM tasks WHERE public_no='S71'").fetchone()[0]
+        self.login("sup@test").post(f"/tasks/{tid}/comments", data={"text": "הערה לבדיקה"})
+        self.login("sup@test").post(f"/tasks/{tid}/docs", data={"name": "תכנית ב-3"})
+        self.assertEqual(self.db_val("SELECT text FROM task_comments WHERE task_id=?", (tid,)), "הערה לבדיקה")
+        self.assertEqual(self.db_val("SELECT name FROM task_docs WHERE task_id=?", (tid,)), "תכנית ב-3")
+        self.assertEqual(self.login("owner@test").post(f"/tasks/{tid}/comments", data={"text": "x"}).status_code, 403)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

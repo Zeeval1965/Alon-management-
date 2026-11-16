@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 
 import openpyxl
-from flask import Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from flask import has_request_context, Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
 from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS task_status_log (
 CREATE TABLE IF NOT EXISTS task_closure_pending (
   task_id INTEGER PRIMARY KEY, meeting_id INTEGER, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_status_options (
+  name TEXT PRIMARY KEY, kind TEXT NOT NULL, sort INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS severity_levels (name TEXT PRIMARY KEY, sort INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS item_types (name TEXT PRIMARY KEY, sort INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS task_comments (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, contact_id INTEGER, text TEXT NOT NULL, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS task_docs (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, name TEXT NOT NULL, created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
@@ -103,9 +114,24 @@ def _close(_):
         d.close()
 
 
+TASK_STATUS_SEED = [("פתוחה", "open"), ("בטיפול", "open"), ("ממתינה לאישור", "open"),
+                    ("ממתין למפרט", "open"), ("לבדיקה חוזרת", "open"), ("לידיעה", "info"),
+                    ("בוצע", "closed"), ("לא רלוונטי", "closed")]
+SEVERITY_SEED = ["קריטי", "גבוה", "בינוני", "נמוך"]
+ITEM_TYPE_SEED = ["הערה", "אי-דיוק", "בקשה למפרט", "נושא חזית", "חניית יועץ", "ליקוי ביצוע", "פריט פתוח"]
+CLOSED_STATUSES = ("בוצע", "לא רלוונטי")
+INFO_STATUSES = ("לידיעה",)
+
+
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
+    for i, (name, kind) in enumerate(TASK_STATUS_SEED):
+        c.execute("INSERT OR IGNORE INTO task_status_options(name, kind, sort) VALUES (?,?,?)", (name, kind, i))
+    for i, name in enumerate(SEVERITY_SEED):
+        c.execute("INSERT OR IGNORE INTO severity_levels(name, sort) VALUES (?,?)", (name, i))
+    for i, name in enumerate(ITEM_TYPE_SEED):
+        c.execute("INSERT OR IGNORE INTO item_types(name, sort) VALUES (?,?)", (name, i))
     for stmt in ("ALTER TABLE task_assignments ADD COLUMN is_responsible INTEGER DEFAULT 0",
                  "ALTER TABLE tasks ADD COLUMN print_flag INTEGER DEFAULT 0",
                  "ALTER TABLE task_assignments ADD COLUMN is_cc INTEGER DEFAULT 0",
@@ -117,7 +143,9 @@ def init_db():
                  "ALTER TABLE contacts ADD COLUMN is_admin INTEGER DEFAULT 0",
                  "ALTER TABLE sites ADD COLUMN levels TEXT",
                  "ALTER TABLE sites ADD COLUMN stages TEXT",
-                 "ALTER TABLE tasks ADD COLUMN created_at TEXT"):
+                 "ALTER TABLE tasks ADD COLUMN created_at TEXT",
+                 "ALTER TABLE tasks ADD COLUMN severity TEXT",
+                 "ALTER TABLE tasks ADD COLUMN item_type TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -368,10 +396,11 @@ def publish_meeting(meeting_id):
                 n += 1
             cur = db().execute(
                 """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
-                       target_text, target_date, last_meeting_id, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       target_text, target_date, last_meeting_id, created_at, severity, item_type)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (site_id, public, r["number"], r["topic"], r["task"], r["assignee"],
-                 r["target"], target_date, meeting_id, dt.date.today().isoformat()))
+                 r["target"], target_date, meeting_id, dt.date.today().isoformat(),
+                 suggest_severity(r["task"]), suggest_item_type(r["task"])))
             task_id = cur.lastrowid
         else:
             task_id = match["id"]
@@ -379,9 +408,13 @@ def publish_meeting(meeting_id):
                 db().execute(
                     "UPDATE tasks SET target_text=?, target_date=?, last_meeting_id=? WHERE id=?",
                     (r["target"], target_date, meeting_id, task_id))
+        done_here = bool(re.search(r"(^|\s)בוצע$", (r.get("target") or "").strip()))  # 'בוצע' or 'dd.mm.yy בוצע'
+        if match is not None and match["status"] in CLOSED_STATUSES and not done_here:
+            db().execute("UPDATE tasks SET status='לבדיקה חוזרת' WHERE id=?", (task_id,))
+            log_task_status(task_id, "לבדיקה חוזרת", "הופיעה שוב בפרוטוקול לאחר סגירה")
         db().execute("INSERT INTO task_targets(task_id, target_text, meeting_id) VALUES (?,?,?)",
                      (task_id, r["target"], meeting_id))
-        if re.search(r"(^|\s)בוצע$", (r.get("target") or "").strip()):  # 'בוצע' or 'dd.mm.yy בוצע'
+        if done_here:
             db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (task_id,))
         published.append(task_id)
         used.add((task_id, day))
@@ -405,7 +438,7 @@ def publish_meeting(meeting_id):
         # only tasks from the same kind of protocol: a weekly report does not close execution items
         gone = db().execute(
             """SELECT t.id FROM tasks t JOIN meetings lm ON lm.id = t.last_meeting_id
-               WHERE t.site_id=? AND t.status!='בוצע' AND lm.kind=? AND t.last_meeting_id != ?""",
+               WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לא רלוונטי') AND lm.kind=? AND t.last_meeting_id != ?""",
             (site_id, m["kind"], meeting_id)).fetchall()
         for t in gone:
             if t["id"] not in listed_ids:
@@ -499,7 +532,7 @@ def send_task_reminders(site_id, today=None):
     today = today or dt.date.today()
     limit = (today + dt.timedelta(days=1)).isoformat()
     tasks = db().execute(
-        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה')
+        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה', 'לא רלוונטי')
            AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
@@ -720,7 +753,8 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -774,9 +808,109 @@ def can_see_emails(site_id):
     return bool(me["is_admin"]) or bool(roles_on_site(me, site_id) & EMAIL_ROLES)
 
 
+def task_status_names(kind=None):
+    if kind:
+        rows = db().execute("SELECT name FROM task_status_options WHERE kind=? ORDER BY sort", (kind,)).fetchall()
+    else:
+        rows = db().execute("SELECT name FROM task_status_options ORDER BY sort").fetchall()
+    return [r[0] for r in rows]
+
+
+def suggest_severity(text):
+    """Suggested severity from the text only; the supervisor can change it."""
+    t = text or ""
+    if re.search(r"קריטי|מיידי|בטיחות", t):
+        return "קריטי"
+    if re.search(r"דחוף|גבוה", t):
+        return "גבוה"
+    return "בינוני"
+
+
+def suggest_item_type(text):
+    t = text or ""
+    if "חזית" in t:
+        return "נושא חזית"
+    if re.search(r"חני(?:ית|ה)", t):
+        return "חניית יועץ"
+    if re.search(r"אי[- ]?דיוק|סתירה|אי התאמה", t):
+        return "אי-דיוק"
+    if "מפרט" in t:
+        return "בקשה למפרט"
+    if re.search(r"ליקוי|פגם|תיקון", t):
+        return "ליקוי ביצוע"
+    return "הערה"
+
+
+def task_repeat_count(task_id):
+    """How many different protocols mention this task."""
+    return db().execute("SELECT COUNT(DISTINCT meeting_id) FROM task_targets WHERE task_id=?",
+                        (task_id,)).fetchone()[0]
+
+
+def short(text, n=90):
+    s = text or ""
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def site_kpis(site_id):
+    open_names = task_status_names("open")
+    closed_names = task_status_names("closed")
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+    today = dt.date.today()
+    open_t = [t for t in tasks if t["status"] in open_names]
+
+    def aged(t):
+        try:
+            return bool(t["created_at"]) and (today - dt.date.fromisoformat(t["created_at"])).days > 30
+        except ValueError:
+            return False
+    reps = {t["id"]: task_repeat_count(t["id"]) for t in open_t}
+    return {
+        "open": len(open_t),
+        "repeats_open": sum(1 for t in open_t if reps[t["id"]] >= 2),
+        "critical_open": sum(1 for t in open_t if t["severity"] == "קריטי"),
+        "awaiting_spec": sum(1 for t in open_t if t["status"] == "ממתין למפרט"),
+        "awaiting_approval": sum(1 for t in open_t if t["status"] == "ממתינה לאישור"),
+        "aged_over_30": sum(1 for t in open_t if aged(t)),
+        "closed": sum(1 for t in tasks if t["status"] in closed_names),
+    }
+
+
+def site_recommendations(site_id):
+    """Action suggestions in the same order the review tool used."""
+    open_names = task_status_names("open")
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+    open_t = [t for t in tasks if t["status"] in open_names]
+    reps = {t["id"]: task_repeat_count(t["id"]) for t in open_t}
+    today = dt.date.today()
+
+    def line(t):
+        return short(t["text"])
+    recs = []
+    for t in sorted([t for t in open_t if reps[t["id"]] >= 2], key=lambda t: -reps[t["id"]])[:6]:
+        recs.append(f'לסגור סופית את "{line(t)}" – הופיעה {reps[t["id"]]} פעמים')
+    for t in [t for t in open_t if t["severity"] == "קריטי"][:5]:
+        recs.append(f"טיפול דחוף בפריט קריטי: {line(t)}")
+    for t in [t for t in open_t if t["status"] == "ממתין למפרט"][:5]:
+        recs.append(f"להשלים מפרט: {line(t)}")
+    for t in [t for t in open_t if t["status"] == "ממתינה לאישור"][:5]:
+        recs.append(f"לקבל אישור: {line(t)}")
+    aged = []
+    for t in open_t:
+        try:
+            if t["created_at"] and (today - dt.date.fromisoformat(t["created_at"])).days > 30:
+                aged.append(t)
+        except ValueError:
+            pass
+    for t in aged[:5]:
+        recs.append(f"לעדכן סטטוס או לסגור (פתוח מעל 30 יום): {line(t)}")
+    return recs[:20]
+
+
 def log_task_status(task_id, status, handled_by=""):
-    """Record who changed a task's status and when."""
-    me = current_contact()
+    """Record who changed a task's status and when. Outside a request (scheduled work) the
+    change is recorded as made by the system."""
+    me = current_contact() if has_request_context() else None
     who = (f"{me['first_name'] or ''} {me['last_name'] or ''}".strip() or me["email"]) if me else "מערכת"
     db().execute(
         "INSERT INTO task_status_log(task_id, status, handled_by, changed_by, changed_at) VALUES (?,?,?,?,?)",
@@ -1033,6 +1167,8 @@ def task_triage(task_id):
 def task_status(task_id):
     t = db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
     new_status = request.form["status"]
+    if new_status not in task_status_names():
+        abort(400)
     by_name = request.form.get("by", "לא צוין")
     db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, task_id))
     log_task_status(task_id, new_status, request.form.get("by", ""))
@@ -1052,7 +1188,7 @@ def _full_names(site_id):
 
 def rematch_site(site_id):
     """Run name matching again for the site's open tasks (after contacts were imported or changed)."""
-    for t in db().execute("SELECT id FROM tasks WHERE site_id=? AND status!='בוצע'", (site_id,)).fetchall():
+    for t in db().execute("SELECT id FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לא רלוונטי')", (site_id,)).fetchall():
         suggest_assignees(t["id"])
     db().commit()
 
@@ -1299,7 +1435,7 @@ def site_search(site_id):
             linked = {r[0] for r in db().execute(
                 "SELECT task_id FROM task_assignments WHERE contact_id=?", (contact_id,)).fetchall()}
         for t in db().execute("SELECT * FROM tasks WHERE site_id=? ORDER BY public_no", (site_id,)).fetchall():
-            if view == "open" and t["status"] in ("בוצע", "לידיעה"):
+            if view == "open" and t["status"] in CLOSED_STATUSES + INFO_STATUSES:
                 continue
             if view == "done" and t["status"] != "בוצע":
                 continue
@@ -1447,6 +1583,29 @@ def task_closure(task_id, action):
     return redirect(url_for("site_warnings", site_id=t["site_id"]))
 
 
+@app.route("/tasks/<int:task_id>/comments", methods=["POST"])
+def task_comment_add(task_id):
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    text = (request.form.get("text") or "").strip()
+    if text:
+        me = current_contact()
+        db().execute("INSERT INTO task_comments(task_id, contact_id, text, created_at) VALUES (?,?,?,?)",
+                     (task_id, me["id"] if me else None, text, dt.datetime.now().isoformat(timespec="minutes")))
+        db().commit()
+    return redirect(url_for("site_view", site_id=t["site_id"]))
+
+
+@app.route("/tasks/<int:task_id>/docs", methods=["POST"])
+def task_doc_add(task_id):
+    t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    name = (request.form.get("name") or "").strip()
+    if name:
+        db().execute("INSERT INTO task_docs(task_id, name, created_at) VALUES (?,?,?)",
+                     (task_id, name, dt.datetime.now().isoformat(timespec="minutes")))
+        db().commit()
+    return redirect(url_for("site_view", site_id=t["site_id"]))
+
+
 @app.route("/sites/<int:site_id>/warnings")
 def site_warnings(site_id):
     """Things to fix: the same person recorded more than once, tasks with no one assigned, and
@@ -1468,13 +1627,13 @@ def site_warnings(site_id):
                   for k, v in groups.items() if len(v) > 1]
     unassigned = db().execute(
         """SELECT t.id, t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
-           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה')
+           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה', 'לא רלוונטי')
              AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
            ORDER BY t.public_no""", (site_id,)).fetchall()
     pending = db().execute(
         """SELECT t.id AS task_id, t.public_no, t.topic, t.text, a.raw_name, a.contact_id, c.first_name, c.last_name, c.org
            FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
-           WHERE t.site_id=? AND t.status!='בוצע' AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
+           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לא רלוונטי') AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
     choices = db().execute(
         """SELECT DISTINCT c.id, c.first_name, c.last_name FROM memberships m JOIN contacts c ON c.id = m.contact_id
            WHERE m.site_id=? ORDER BY c.first_name, c.last_name""", (site_id,)).fetchall()
@@ -1996,7 +2155,7 @@ def site_view(site_id):
         "target": lambda t: (t["target_date"] or "9999-99-99", t["public_no"] or ""),
         "status": lambda t: (t["status"] or "", t["public_no"] or ""),
     }
-    open_t = [t for t in tasks if t["status"] not in ("בוצע", "לידיעה")]
+    open_t = [t for t in tasks if t["status"] not in CLOSED_STATUSES + INFO_STATUSES]
     if sort == "added":  # newest first; tasks without a recorded date go last
         open_t.sort(key=lambda t: t["public_no"] or "")
         open_t.sort(key=lambda t: t["created_at"] or "", reverse=True)
@@ -2035,7 +2194,7 @@ def site_view(site_id):
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
 <td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}{% if t['id'] in closure_ids %}<br><span class="note">סגירה ממתינה לאישור המפקח</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
-<select name="status"><option>בטיפול</option><option>ממתינה לאישור</option><option>לידיעה</option><option>בוצע</option></select>
+<select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
 <td data-label="הדפסה"><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
@@ -2046,7 +2205,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, sort=sort, closure_ids=closure_ids, last=last, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
