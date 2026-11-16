@@ -1171,6 +1171,46 @@ class AdminAndDeleteTests(AppTestCase):
         self.assertIn('class="step active"', html)
 
 
+class ProtocolDatesTests(AppTestCase):
+    def test_publishing_records_protocol_date_and_publish_time(self):
+        today = __import__("datetime").date.today()
+        row = {"number": "1", "topic": "חשמל", "task": "משימה לחודש הנוכחי", "assignee": "",
+               "target": "", "meeting_date": today.strftime("%d.%m.%y")}
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status) VALUES (1,'ביצוע',?, 'draft')",
+                           (json.dumps([row], ensure_ascii=False),))
+            A.db().commit()
+            A.publish_meeting(A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0])
+        self.assertEqual(self.db_val("SELECT meeting_date FROM meetings ORDER BY id DESC LIMIT 1"), today.isoformat())
+        self.assertIsNotNone(self.db_val("SELECT published_at FROM meetings ORDER BY id DESC LIMIT 1"))
+        html = self.login("sup@test").get("/sites/1/protocols?month=current").get_data(as_text=True)
+        self.assertIn(today.isoformat(), html)
+        self.assertEqual(self.login("sup@test").get("/sites/1/protocols?sort=published").status_code, 200)
+        self.assertEqual(self.login("owner@test").get("/sites/1/protocols").status_code, 403)
+
+    def test_uploaded_but_unpublished_protocols_are_listed_as_drafts(self):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, source_name, staged_rows, status) VALUES (1,'שבועית','merged.pdf','[]','draft')")
+            A.db().commit()
+        html = self.login("sup@test").get("/sites/1/protocols").get_data(as_text=True)
+        self.assertIn("הועלו ולא פורסמו", html)
+        self.assertIn("merged.pdf", html)
+        self.assertIn("לא זוהו שורות", html)
+
+    def test_existing_records_get_dates_from_their_protocol_rows(self):
+        row = {"number": "1", "topic": "חשמל", "task": "ישן", "assignee": "", "target": "", "meeting_date": "10.11.26"}
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status) VALUES (1,'ביצוע',?, 'published')",
+                           (json.dumps([row], ensure_ascii=False),))
+            mid = A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status, last_meeting_id) VALUES (1,'OLD','חשמל','ישן','פתוחה',?)", (mid,))
+            A.db().commit()
+        A.init_db()
+        self.assertEqual(self.db_val("SELECT created_at FROM tasks WHERE public_no='OLD'"), "2026-11-10")
+        self.assertEqual(self.db_val("SELECT published_at FROM tasks WHERE public_no='OLD'"), "2026-11-10")
+        self.assertEqual(self.db_val("SELECT meeting_date FROM meetings WHERE id=?", (mid,)), "2026-11-10")
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

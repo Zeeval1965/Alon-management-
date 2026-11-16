@@ -136,6 +136,31 @@ CLOSED_STATUSES = ("בוצע", "בוטלה")
 INFO_STATUSES = ("לידיעה",)
 
 
+def meeting_day(rows):
+    """The protocol's own date (ISO): the most common date among its rows, or None."""
+    dates = Counter(parse_date(r.get("meeting_date")) for r in rows if r.get("meeting_date"))
+    dates.pop(None, None)
+    return dates.most_common(1)[0][0] if dates else None
+
+
+def backfill_dates(c):
+    """Fill dates that older records never had: meeting dates from their rows, task opening
+    dates from the earliest protocol that mentioned them, and publish times from those dates."""
+    for mid, staged in c.execute("SELECT id, staged_rows FROM meetings WHERE meeting_date IS NULL").fetchall():
+        day = meeting_day(json.loads(staged or "[]"))
+        if day:
+            c.execute("UPDATE meetings SET meeting_date=? WHERE id=?", (day, mid))
+    c.execute("UPDATE meetings SET published_at=meeting_date WHERE published_at IS NULL AND status='published'")
+    days = {mid: d for mid, d in c.execute("SELECT id, meeting_date FROM meetings").fetchall()}
+    for tid, last in c.execute("SELECT id, last_meeting_id FROM tasks WHERE created_at IS NULL").fetchall():
+        ids = {r[0] for r in c.execute("SELECT meeting_id FROM task_targets WHERE task_id=?", (tid,)).fetchall()}
+        ids.add(last)
+        found = sorted(days[i] for i in ids if days.get(i))
+        if found:
+            c.execute("UPDATE tasks SET created_at=? WHERE id=?", (found[0], tid))
+    c.execute("UPDATE tasks SET published_at=created_at WHERE published_at IS NULL")
+
+
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
@@ -162,12 +187,15 @@ def init_db():
                  "ALTER TABLE tasks ADD COLUMN severity TEXT",
                  "ALTER TABLE tasks ADD COLUMN item_type TEXT",
                  "ALTER TABLE tasks ADD COLUMN sub_topic TEXT",
+                 "ALTER TABLE tasks ADD COLUMN published_at TEXT",
+                 "ALTER TABLE meetings ADD COLUMN published_at TEXT",
                  "ALTER TABLE tasks ADD COLUMN approver TEXT",
                  "ALTER TABLE tasks ADD COLUMN closed_at TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
             pass  # column already exists
+    backfill_dates(c)
     if not c.execute("SELECT 1 FROM app_settings WHERE key='all_users_admin'").fetchone():
         c.execute("UPDATE contacts SET is_admin=1 WHERE password_hash IS NOT NULL")
         c.execute("INSERT INTO app_settings(key, value) VALUES ('all_users_admin', ?)",
@@ -418,12 +446,13 @@ def publish_meeting(meeting_id):
                 n += 1
             cur = db().execute(
                 """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
-                       target_text, target_date, last_meeting_id, created_at, severity, item_type)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       target_text, target_date, last_meeting_id, created_at, severity, item_type, published_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (site_id, public, r["number"], r["topic"], r["task"], r["assignee"],
                  r["target"], target_date, meeting_id,
                  parse_date(r.get("meeting_date")) or dt.date.today().isoformat(),
-                 suggest_severity(r["task"]), suggest_item_type(r["task"])))
+                 suggest_severity(r["task"]), suggest_item_type(r["task"]),
+                 dt.datetime.now().isoformat(timespec="minutes")))
             task_id = cur.lastrowid
         else:
             task_id = match["id"]
@@ -474,7 +503,8 @@ def publish_meeting(meeting_id):
     for task_id in published:
         db().execute("DELETE FROM task_closure_pending WHERE task_id=?", (task_id,))
         suggest_assignees(task_id)
-    db().execute("UPDATE meetings SET status='published' WHERE id=?", (meeting_id,))
+    db().execute("UPDATE meetings SET status='published', published_at=?, meeting_date=COALESCE(meeting_date, ?) WHERE id=?",
+                 (dt.datetime.now().isoformat(timespec="minutes"), meeting_day(rows), meeting_id))
     db().commit()
     return {"published": len(published), "queued": len(queued)}
 
@@ -781,7 +811,7 @@ SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -2382,7 +2412,7 @@ def site_view(site_id):
     open_t = [t for t in tasks if t["status"] not in CLOSED_STATUSES + INFO_STATUSES]
     if sort == "added":  # newest first; tasks without a recorded date go last
         open_t.sort(key=lambda t: t["public_no"] or "")
-        open_t.sort(key=lambda t: t["created_at"] or "", reverse=True)
+        open_t.sort(key=lambda t: t["published_at"] or t["created_at"] or "", reverse=True)
     elif sort in sort_keys:
         open_t.sort(key=sort_keys[sort])
     else:
@@ -2422,11 +2452,11 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
 <option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
-<option value="added" {% if sort == 'added' %}selected{% endif %}>תאריך הוספה (החדשות קודם)</option>
+<option value="added" {% if sort == 'added' %}selected{% endif %}>זמן פרסום (החדשים קודם)</option>
 <option value="number" {% if sort == 'number' %}selected{% endif %}>מספר</option>
 <option value="topic" {% if sort == 'topic' %}selected{% endif %}>נושא</option>
 <option value="target" {% if sort == 'target' %}selected{% endif %}>יעד</option>
@@ -2537,6 +2567,50 @@ def admin_site_delete_approve(token):
 <form method="post"><button>אישור מחיקה סופית</button></form>""", name=name)
 
 
+@app.route("/sites/<int:site_id>/protocols")
+def site_protocols(site_id):
+    """Published protocols, newest protocol date first; sort by publish time or filter to this month."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    sort = request.args.get("sort", "date")
+    this_month = request.args.get("month") == "current"
+    month_key = dt.date.today().strftime("%Y-%m")
+    items = []
+    for m in db().execute("SELECT * FROM meetings WHERE site_id=? AND status='published'", (site_id,)).fetchall():
+        if this_month and not (m["meeting_date"] or "").startswith(month_key):
+            continue
+        rows = [r for r in json.loads(m["staged_rows"] or "[]") if not r.get("skip")]
+        items.append({"m": m, "rows": len(rows)})
+    if sort == "published":
+        items.sort(key=lambda i: (i["m"]["published_at"] or "", i["m"]["id"]), reverse=True)
+    else:
+        items.sort(key=lambda i: (i["m"]["meeting_date"] or "", i["m"]["published_at"] or ""), reverse=True)
+    drafts = []
+    for m in db().execute("SELECT * FROM meetings WHERE site_id=? AND status!='published' ORDER BY id DESC", (site_id,)).fetchall():
+        drafts.append({"m": m, "rows": len([r for r in json.loads(m["staged_rows"] or "[]") if not r.get("skip")])})
+    return page("מאגר פרוטוקולים - " + s["name"], """
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+<p>
+<a href="{{ url_for('site_protocols', site_id=s['id'], sort=sort) }}" {% if not this_month %}style="font-weight:bold"{% endif %}>כל הפרוטוקולים</a> ·
+<a href="{{ url_for('site_protocols', site_id=s['id'], sort=sort, month='current') }}" {% if this_month %}style="font-weight:bold"{% endif %}>החודש</a>
+</p>
+<form method="get" style="margin-bottom:8px">{% if this_month %}<input type="hidden" name="month" value="current">{% endif %}
+מיון לפי <select name="sort">
+<option value="date" {% if sort != 'published' %}selected{% endif %}>תאריך הפרוטוקול (החדשים קודם)</option>
+<option value="published" {% if sort == 'published' %}selected{% endif %}>זמן הפרסום (החדשים קודם)</option>
+</select> <button>מיון</button></form>
+<table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>זמן הפרסום</th><th>קובץ</th><th>שורות</th></tr>
+{% for i in items %}<tr><td data-label="סוג">{{ i['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ i['m']['meeting_date'] or 'לא זוהה' }}</td>
+<td data-label="זמן הפרסום">{{ i['m']['published_at'] or '' }}</td><td data-label="קובץ">{{ i['m']['source_name'] or '' }}</td><td data-label="שורות">{{ i['rows'] }}</td></tr>
+{% else %}<tr><td colspan="5">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
+<h3>הועלו ולא פורסמו (טיוטות)</h3>
+<table class="cards"><tr><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
+{% for d in drafts %}<tr><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
+<td data-label="קובץ">{{ d['m']['source_name'] or '' }}</td><td data-label="שורות שזוהו">{{ d['rows'] }}{% if d['rows'] == 0 %} <span class="note">לא זוהו שורות - בדקו את הקובץ</span>{% endif %}</td>
+<td data-label=""><a href="{{ url_for('meeting_review', meeting_id=d['m']['id']) }}">בדיקה ופרסום</a></td></tr>
+{% else %}<tr><td colspan="6">אין טיוטות</td></tr>{% endfor %}</table>
+""", s=s, items=items, sort=sort, this_month=this_month, drafts=drafts)
+
+
 @app.route("/sites/<int:site_id>/meetings/new", methods=["GET", "POST"])
 def meeting_upload(site_id):
     if request.method == "POST":
@@ -2545,8 +2619,8 @@ def meeting_upload(site_id):
         f.save(tmp.name)
         rows = extract_rows(tmp.name)
         cur = db().execute(
-            "INSERT INTO meetings(site_id, kind, source_name, staged_rows) VALUES (?,?,?,?)",
-            (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(rows, ensure_ascii=False)))
+            "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
+            (site_id, request.form.get("kind", "ביצוע"), f.filename, json.dumps(rows, ensure_ascii=False), meeting_day(rows)))
         db().commit()
         return redirect(url_for("meeting_review", meeting_id=cur.lastrowid))
     return page("העלאת פרוטוקול", STEPPER_TPL + """
