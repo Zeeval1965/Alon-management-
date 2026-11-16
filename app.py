@@ -2140,18 +2140,18 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .step.done{background:var(--gray-light);color:#444}.step.active{background:var(--red);border-color:var(--red);color:#fff;font-weight:bold}
 .pill[role=button]{cursor:pointer;text-decoration:underline dotted}
 dialog{border:1px solid var(--gray-line);border-radius:8px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.2)}
-.shell{display:flex;align-items:stretch}
-.side{flex:0 0 210px;background:#F4F4F4;border-left:1px solid #E0E0E0;padding:12px 0;min-height:calc(100vh - 50px)}
-.side a{display:block;padding:9px 18px;color:#333;text-decoration:none;font-size:14px}
+.shell{display:flex;flex-direction:column;align-items:stretch}
+.side{flex:none;background:#F4F4F4;border-bottom:1px solid #E0E0E0;padding:6px 10px;display:flex;flex-wrap:wrap;align-items:center;gap:2px}
+.side a{display:block;padding:7px 12px;color:#333;text-decoration:none;font-size:14px;border-radius:4px}
 .side a:hover{background:#E9E9E9}
 .side a.on{background:var(--red);color:#fff;font-weight:bold}
-.side-title{padding:4px 18px 10px;color:var(--red);font-weight:bold;font-size:14px}
+.side-title{padding:4px 12px;color:var(--red);font-weight:bold;font-size:14px;margin-left:8px}
 .side-sep{border-top:1px solid #DDD;margin:8px 0}
 main{flex:1;min-width:0}
 @media (max-width:640px){.shell{flex-direction:column}.side{flex:none;min-height:0;display:flex;flex-wrap:wrap;padding:6px}.side a{padding:6px 10px}.side-title,.side-sep{display:none}}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
-<a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
+{% if home_url %}<a href="{{ home_url }}">לוח בקרה</a>{% endif %}<a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
 <div class="shell">{% if side or side_admin %}<aside class="side">{% if side_title %}<div class="side-title">{{ side_title }}</div>{% endif %}
 {% for it in side %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}
 {% if side_admin %}<div class="side-sep"></div>{% for it in side_admin %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}{% endif %}
@@ -2244,7 +2244,14 @@ def _side_menu():
         admin = [{"label": "ניהול כללי", "url": url_for("admin_overview"), "on": request.endpoint == "admin_overview"},
                  {"label": "אתר חדש", "url": url_for("site_new"), "on": request.endpoint == "site_new"},
                  {"label": "כל האתרים", "url": url_for("sites"), "on": request.endpoint == "sites"}]
-    return {"side": side, "side_admin": admin, "side_title": title}
+    home_url = ""
+    if side:
+        home_url = url_for("site_view", site_id=site_id)
+    else:
+        first = db().execute("SELECT id FROM sites ORDER BY id LIMIT 1").fetchone()
+        if first is not None:
+            home_url = url_for("site_view", site_id=first["id"])
+    return {"side": side, "side_admin": admin, "side_title": title, "home_url": home_url}
 
 
 def page(title, body, **ctx):
