@@ -2628,7 +2628,7 @@ def site_live_data(site_id):
         f"SELECT COUNT(*) FROM tasks WHERE site_id=? AND target_date IS NOT NULL AND target_date < ? AND status IN ({marks})",
         (site_id, today, *open_names)).fetchone()[0]
     latest = db().execute(
-        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY published_at DESC, id DESC LIMIT 1",
+        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY meeting_date DESC, published_at DESC, id DESC LIMIT 1",
         (site_id,)).fetchone()
     return kp, latest
 
@@ -2705,7 +2705,10 @@ def site_view(site_id):
 <p class="note live-strip"><span class="live-dot"></span> חי · עודכן <span id="live-time">{{ now_txt }}</span> · מתרענן כל דקה</p>
 <h3>משימות מהפרוטוקול האחרון{% if latest_date %} · {{ latest_date }}{% endif %}</h3>
 {% if latest_tasks %}<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
-{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span></td></tr>{% endfor %}</table>
+{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>
+<form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
+<select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option {% if o == t['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
+<input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>{% endfor %}</table>
 {% elif latest %}<p class="note">בפרוטוקול זה אין משימות מקושרות.</p>{% else %}<p class="note">אין פרוטוקול מפורסם לאתר.</p>{% endif %}
 <script>
 (function () {
