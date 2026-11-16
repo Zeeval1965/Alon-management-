@@ -816,7 +816,7 @@ ROLE_WRITE = {
 
 # endpoint -> section it belongs to; endpoints not listed are administrator-only
 SECTION_OF = {
-    "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
+    "site_view": "tasks", "site_live": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
     "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
@@ -2586,6 +2586,31 @@ STATUS_CLASS = {
 SITE_IMAGES = {"הלל הזקן 14": "site-hilel14.jpg"}  # rendering shown in the site header
 
 
+def site_live_data(site_id):
+    """Figures shown on the site home page; also polled by the page so it stays current."""
+    kp = dict(site_kpis(site_id))
+    today = dt.date.today().isoformat()
+    open_names = task_status_names("open")
+    marks = ",".join("?" * len(open_names))
+    kp["late"] = db().execute(
+        f"SELECT COUNT(*) FROM tasks WHERE site_id=? AND target_date IS NOT NULL AND target_date < ? AND status IN ({marks})",
+        (site_id, today, *open_names)).fetchone()[0]
+    latest = db().execute(
+        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
+    return kp, latest
+
+
+@app.route("/sites/<int:site_id>/live")
+def site_live(site_id):
+    db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    kp, latest = site_live_data(site_id)
+    return jsonify({
+        "kpis": {k: kp[k] for k in ("open", "awaiting_approval", "aged_over_30", "closed", "late")},
+        "latest_meeting_id": latest["id"] if latest else 0,
+        "time": dt.datetime.now().strftime("%H:%M:%S"),
+    })
+
+
 @app.route("/sites/<int:site_id>")
 def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -2617,9 +2642,18 @@ def site_view(site_id):
             """SELECT l.task_id, l.changed_by, l.changed_at FROM task_status_log l
                JOIN tasks t ON t.id = l.task_id WHERE t.site_id=? ORDER BY l.id""", (site_id,)).fetchall():
         last[r[0]] = {"changed_by": r[1], "changed_at": r[2]}
-    kp = site_kpis(site_id)
+    kp, latest = site_live_data(site_id)
     total = kp["open"] + kp["closed"]
     pct = round(100 * kp["closed"] / total) if total else 0
+    latest_tasks = db().execute(
+        "SELECT DISTINCT t.* FROM task_occurrences o JOIN tasks t ON t.id = o.task_id WHERE o.meeting_id=? ORDER BY t.public_no",
+        (latest["id"],)).fetchall() if latest else []
+    latest_date = ""
+    if latest:
+        try:
+            latest_date = dt.date.fromisoformat(latest["meeting_date"]).strftime("%d.%m.%Y")
+        except (TypeError, ValueError):
+            latest_date = latest["meeting_date"] or ""
     counts = Counter(t["status"] for t in tasks)
     top = max(counts.values(), default=1)
     status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
@@ -2627,13 +2661,41 @@ def site_view(site_id):
     return page(s["name"], """
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div class="kpis">
-<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b>{{ kp.open }}</b><span>משימות פתוחות</span></a>
-<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='awaiting') }}"><b>{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></a>
-<a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='aged') }}"><b>{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b data-live="open">{{ kp.open }}</b><span>משימות פתוחות</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='awaiting') }}"><b data-live="awaiting_approval">{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></a>
+<a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='aged') }}"><b data-live="aged_over_30">{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></a>
+<a class="kpi warn" href="{{ url_for('site_view', site_id=s['id'], sort='target') }}"><b data-live="late">{{ kp.late }}</b><span>באיחור (מועד היעד עבר)</span></a>
 <a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='repeat2') }}"><b>{{ kp.repeats_open }}</b><span>פתוחות שחזרו בפרוטוקולים</span></a>
-<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='done') }}"><b>{{ kp.closed }}</b><span>נסגרו</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='done') }}"><b data-live="closed">{{ kp.closed }}</b><span>נסגרו</span></a>
 <div class="kpi"><b>{{ pct }}%</b><span>אחוז סגירה</span></div>
 </div>
+<p class="note live-strip"><span class="live-dot"></span> חי · עודכן <span id="live-time">{{ now_txt }}</span> · מתרענן כל דקה</p>
+<h3>משימות מהפרוטוקול האחרון{% if latest_date %} · {{ latest_date }}{% endif %}</h3>
+{% if latest_tasks %}<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
+{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span></td></tr>{% endfor %}</table>
+{% else %}<p class="note">אין פרוטוקול מפורסם לאתר.</p>{% endif %}
+<script>
+(function () {
+  var url = {{ url_for('site_live', site_id=s['id'])|tojson }};
+  var known = {{ latest['id'] if latest else 0 }};
+  function tick() {
+    fetch(url, {credentials: 'same-origin', headers: {'X-Requested-With': 'fetch'}})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        if (d.latest_meeting_id !== known) { location.reload(); return; }
+        document.querySelectorAll('[data-live]').forEach(function (el) {
+          var k = el.getAttribute('data-live');
+          if (k in d.kpis) el.textContent = d.kpis[k];
+        });
+        document.getElementById('live-time').textContent = d.time;
+      })
+      .catch(function () {});
+  }
+  setInterval(tick, 60000);
+})();
+</script>
+<style>.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
 <h3>התפלגות סטטוסים</h3>
 <div>{% for r in status_rows %}<div class="brow"><span class="lbl"><span class="pill {{ sclass.get(r.name, '') }}">{{ r.name }}</span></span><span class="track"><span class="fill" style="width:{{ r.w }}%"></span></span><span class="n">{{ r.n }}</span></div>{% endfor %}</div>
 <form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
@@ -2667,7 +2729,8 @@ def site_view(site_id):
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
-        month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
+        month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"),
+        latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
 
 
 PROTOCOL_STEPS = ["העלאת מסמך", "פענוח תוכן", "השוואה להיסטוריה", "בקרת קליטה", "אישור הפיקוח", "עדכון כלל המשתמשים"]

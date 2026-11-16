@@ -1522,3 +1522,24 @@ class FilterTests(AppTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveHomeTests(AppTestCase):
+    def test_home_shows_latest_protocol_tasks_and_live_figures(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO meetings(site_id, kind, status, published_at, meeting_date) VALUES (1,'ביצוע','published','2026-11-16T10:00','2026-11-16')")
+            mid = d.execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status, target_date) VALUES (1,'L1','אלומיניום','העברת תוכניות','פתוחה','2020-01-01')")
+            tid = d.execute("SELECT id FROM tasks WHERE public_no='L1'").fetchone()[0]
+            d.execute("INSERT INTO task_occurrences(task_id, meeting_id, number, topic, text, target, created_at) VALUES (?,?,?,?,?,?,?)",
+                      (tid, mid, "1", "אלומיניום", "העברת תוכניות", "", "2026-11-16"))
+            d.commit()
+        c = self.login("sup@test")
+        html = c.get("/sites/1").get_data(as_text=True)
+        self.assertIn("משימות מהפרוטוקול האחרון", html)
+        self.assertIn("העברת תוכניות", html)
+        self.assertIn('data-live="late"', html)
+        data = c.get("/sites/1/live").get_json()
+        self.assertEqual(data["kpis"]["late"], 1)
+        self.assertEqual(data["latest_meeting_id"], mid)
