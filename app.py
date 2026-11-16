@@ -2115,12 +2115,25 @@ input,select,textarea{border:1px solid var(--gray-line);padding:4px;border-radiu
 .step.done{background:var(--gray-light);color:#444}.step.active{background:var(--red);border-color:var(--red);color:#fff;font-weight:bold}
 .pill[role=button]{cursor:pointer;text-decoration:underline dotted}
 dialog{border:1px solid var(--gray-line);border-radius:8px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.2)}
+.shell{display:flex;align-items:stretch}
+.side{flex:0 0 210px;background:#F4F4F4;border-left:1px solid #E0E0E0;padding:12px 0;min-height:calc(100vh - 50px)}
+.side a{display:block;padding:9px 18px;color:#333;text-decoration:none;font-size:14px}
+.side a:hover{background:#E9E9E9}
+.side a.on{background:var(--red);color:#fff;font-weight:bold}
+.side-title{padding:4px 18px 10px;color:var(--red);font-weight:bold;font-size:14px}
+.side-sep{border-top:1px solid #DDD;margin:8px 0}
+main{flex:1;min-width:0}
+@media (max-width:640px){.shell{flex-direction:column}.side{flex:none;min-height:0;display:flex;flex-wrap:wrap;padding:6px}.side a{padding:6px 10px}.side-title,.side-sep{display:none}}
 </style></head><body>
 <header><b>הלל הזקן 14</b>
 <a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
+<div class="shell">{% if side or side_admin %}<aside class="side">{% if side_title %}<div class="side-title">{{ side_title }}</div>{% endif %}
+{% for it in side %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}
+{% if side_admin %}<div class="side-sep"></div>{% for it in side_admin %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}{% endif %}
+</aside>{% endif %}
 <main><h2>{{ title }}</h2>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
-{{ body|safe }}</main>
+{{ body|safe }}</main></div>
 <script>
 (function(){
   function toast(text, bad){
@@ -2166,9 +2179,52 @@ dialog{border:1px solid var(--gray-line);border-radius:8px;padding:16px;box-shad
 </body></html>"""
 
 
+SIDE_SITE_ITEMS = [
+    ("לוח בקרה", "site_view", "tasks"),
+    ("משימות וחיפוש", "site_search", "tasks"),
+    ("ללא שיוך", "site_warnings", "tasks"),
+    ("שיוך משימות", "assignments", "tasks"),
+    ("אנשי קשר של הפרויקט", "site_contacts", "tasks"),
+    ("שליחת קישורי עדכון", "site_send_links", "tasks"),
+    ("להדפסה", "site_print", "tasks"),
+    ("מאגר פרוטוקולים", "site_protocols", "protocols"),
+    ("העלאת פרוטוקול", "meeting_upload", "protocols"),
+    ("ביקורת פרוטוקולים", "site_audit", "protocols"),
+]
+
+
+def _side_menu():
+    """Side menu for signed-in people: the site's screens they may open, then general administration."""
+    if not has_request_context():
+        return {}
+    me = current_contact()
+    if me is None or request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return {}
+    site_id = (request.view_args or {}).get("site_id")
+    side, title = [], ""
+    if site_id is not None:
+        row = db().execute("SELECT name FROM sites WHERE id=?", (site_id,)).fetchone()
+        if row is not None:
+            title = row["name"]
+            sections = set()
+            if not me["is_admin"]:
+                for role in roles_on_site(me, site_id):
+                    sections |= role_sections(role)
+            for label, endpoint, section in SIDE_SITE_ITEMS:
+                if me["is_admin"] or section in sections:
+                    side.append({"label": label, "url": url_for(endpoint, site_id=site_id),
+                                 "on": request.endpoint == endpoint})
+    admin = []
+    if me["is_admin"]:
+        admin = [{"label": "ניהול כללי", "url": url_for("admin_overview"), "on": request.endpoint == "admin_overview"},
+                 {"label": "אתר חדש", "url": url_for("site_new"), "on": request.endpoint == "site_new"},
+                 {"label": "כל האתרים", "url": url_for("sites"), "on": request.endpoint == "sites"}]
+    return {"side": side, "side_admin": admin, "side_title": title}
+
+
 def page(title, body, **ctx):
     return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
-                                  url_for=url_for, get_flashed_messages=lambda: [])
+                                  url_for=url_for, get_flashed_messages=lambda: [], **_side_menu())
 
 
 @app.route("/")
@@ -2649,7 +2705,7 @@ def admin_overview():
         rows.append({"s": s_row, "kp": kp, "pct": round(100 * kp["closed"] / total) if total else 0, "meetings": meetings})
     users = db().execute("SELECT first_name, last_name, email FROM contacts WHERE password_hash IS NOT NULL ORDER BY email").fetchall()
     return page("ניהול כללי", """
-<p><a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
+<p><a href="{{ url_for('site_new') }}">+ אתר חדש</a> · <a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
 <h3>אתרים</h3>
 <table class="cards"><tr><th>אתר</th><th>פתוחות</th><th>נסגרו</th><th>אחוז סגירה</th><th>פרוטוקולים שפורסמו</th><th>מחיקה</th></tr>
 {% for r in rows %}<tr><td data-label="אתר"><a href="{{ url_for('site_view', site_id=r['s']['id']) }}">{{ r['s']['name'] }}</a></td>

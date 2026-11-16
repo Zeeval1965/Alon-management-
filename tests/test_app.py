@@ -1303,6 +1303,25 @@ class SearchStatusPopupTests(AppTestCase):
         self.assertIn("data-ajax", html)
 
 
+class SideMenuTests(AppTestCase):
+    def test_administrator_sees_general_menu_with_new_site(self):
+        html = self.login("admin@test").get("/sites/1").get_data(as_text=True)
+        self.assertIn('class="side"', html)
+        self.assertIn("ניהול כללי", html)
+        self.assertIn("אתר חדש", html)
+
+    def test_menu_shows_only_screens_the_role_may_open(self):
+        html = self.login("owner@test").get("/sites/1").get_data(as_text=True)
+        side = html[html.index('<aside class="side">'):html.index("</aside>")]
+        self.assertIn("לוח בקרה", side)
+        self.assertNotIn("העלאת פרוטוקול", side)
+        self.assertNotIn("ניהול כללי", side)
+
+    def test_no_menu_on_public_or_signed_out_pages(self):
+        html = A.app.test_client().get("/login").get_data(as_text=True)
+        self.assertNotIn('class="side"', html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()
