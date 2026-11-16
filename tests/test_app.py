@@ -808,6 +808,33 @@ class InformationOnlyTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "לידיעה")
 
 
+class OpenTasksSortTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1, 'S90', 'ת-נושא', 'א', 'בטיפול')")
+            d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1, 'S91', 'א-נושא', 'ב', 'בטיפול')")
+            d.commit()
+
+    def test_sort_by_topic_orders_open_tasks(self):
+        html = self.login("sup@test").get("/sites/1?sort=topic").get_data(as_text=True)
+        self.assertLess(html.index(">א-נושא<"), html.index(">ת-נושא<"))
+
+    def test_sort_by_date_added_newest_first(self):
+        with A.app.app_context():
+            d = A.db()
+            d.execute("UPDATE tasks SET created_at='2026-01-01' WHERE public_no='S90'")
+            d.execute("UPDATE tasks SET created_at='2026-02-01' WHERE public_no='S91'")
+            d.commit()
+        html = self.login("sup@test").get("/sites/1?sort=added").get_data(as_text=True)
+        self.assertLess(html.index(">ב<"), html.index(">א<"))
+
+    def test_sort_control_is_shown(self):
+        html = self.login("sup@test").get("/sites/1").get_data(as_text=True)
+        self.assertIn('name="sort"', html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

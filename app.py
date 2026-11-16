@@ -107,7 +107,8 @@ def init_db():
                  "ALTER TABLE contacts ADD COLUMN password_hash TEXT",
                  "ALTER TABLE contacts ADD COLUMN is_admin INTEGER DEFAULT 0",
                  "ALTER TABLE sites ADD COLUMN levels TEXT",
-                 "ALTER TABLE sites ADD COLUMN stages TEXT"):
+                 "ALTER TABLE sites ADD COLUMN stages TEXT",
+                 "ALTER TABLE tasks ADD COLUMN created_at TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -358,10 +359,10 @@ def publish_meeting(meeting_id):
                 n += 1
             cur = db().execute(
                 """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
-                       target_text, target_date, last_meeting_id)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                       target_text, target_date, last_meeting_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (site_id, public, r["number"], r["topic"], r["task"], r["assignee"],
-                 r["target"], target_date, meeting_id))
+                 r["target"], target_date, meeting_id, dt.date.today().isoformat()))
             task_id = cur.lastrowid
         else:
             task_id = match["id"]
@@ -903,9 +904,9 @@ def admin_queue_resolve(qid):
             public, n = f"{base}-{n}", n + 1
         db().execute(
             """INSERT INTO tasks(site_id, public_no, topic_no, topic, text, assignee_text,
-                   target_text, target_date, last_meeting_id) VALUES (?,?,?,?,?,?,?,?,?)""",
+                   target_text, target_date, last_meeting_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (q["site_id"], public, r["number"], r["topic"], r["task"], r["assignee"],
-             r["target"], current_target_date(r["target"]), q["meeting_id"]))
+             r["target"], current_target_date(r["target"]), q["meeting_id"], dt.date.today().isoformat()))
         new_id = db().execute("SELECT id FROM tasks WHERE site_id=? AND public_no=?",
                               (q["site_id"], public)).fetchone()["id"]
         db().execute("INSERT INTO task_targets(task_id, target_text, meeting_id) VALUES (?,?,?)",
@@ -1870,8 +1871,21 @@ def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
     today = dt.date.today().isoformat()
-    open_t = sorted([t for t in tasks if t["status"] not in ("בוצע", "לידיעה")],
-                    key=lambda t: (priority_of(t, today), t["public_no"]))
+    sort = request.args.get("sort", "")
+    sort_keys = {
+        "number": lambda t: t["public_no"] or "",
+        "topic": lambda t: (t["topic"] or "", t["public_no"] or ""),
+        "target": lambda t: (t["target_date"] or "9999-99-99", t["public_no"] or ""),
+        "status": lambda t: (t["status"] or "", t["public_no"] or ""),
+    }
+    open_t = [t for t in tasks if t["status"] not in ("בוצע", "לידיעה")]
+    if sort == "added":  # newest first; tasks without a recorded date go last
+        open_t.sort(key=lambda t: t["public_no"] or "")
+        open_t.sort(key=lambda t: t["created_at"] or "", reverse=True)
+    elif sort in sort_keys:
+        open_t.sort(key=sort_keys[sort])
+    else:
+        open_t.sort(key=lambda t: (priority_of(t, today), t["public_no"]))
     info_t = sorted([t for t in tasks if t["status"] == "לידיעה"], key=lambda t: t["public_no"])
     done_t = [t for t in tasks if t["status"] == "בוצע"]
     month = db().execute("SELECT month_current, month_total, meeting_date FROM meetings WHERE site_id=? AND status='published' AND month_current IS NOT NULL ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
@@ -1883,6 +1897,14 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a></p>
 <h3>משימות פתוחות</h3>
+<form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
+<option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
+<option value="added" {% if sort == 'added' %}selected{% endif %}>תאריך הוספה (החדשות קודם)</option>
+<option value="number" {% if sort == 'number' %}selected{% endif %}>מספר</option>
+<option value="topic" {% if sort == 'topic' %}selected{% endif %}>נושא</option>
+<option value="target" {% if sort == 'target' %}selected{% endif %}>יעד</option>
+<option value="status" {% if sort == 'status' %}selected{% endif %}>סטטוס</option>
+</select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
 <td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}
@@ -1898,7 +1920,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, sort=sort, weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"))
 
 
