@@ -835,6 +835,33 @@ class OpenTasksSortTests(AppTestCase):
         self.assertIn('name="sort"', html)
 
 
+class ProtocolAuditTests(AppTestCase):
+    def _meeting(self, kind, day, task, source):
+        rows = [{"number": "1", "topic": "נושא", "task": task, "assignee": "", "target": "", "meeting_date": day}]
+        with A.app.app_context():
+            d = A.db()
+            d.execute("INSERT INTO meetings(site_id, kind, source_name, staged_rows, status) VALUES (1,?,?,?,'published')",
+                      (kind, source, A.json.dumps(rows, ensure_ascii=False)))
+            d.commit()
+
+    def test_weekly_gap_and_duplicates_are_reported(self):
+        self._meeting("שבועית", "01.11.26", "משימה א", "w1.pdf")
+        self._meeting("שבועית", "08.11.26", "משימה ב", "w2.pdf")
+        self._meeting("שבועית", "10.11.26", "משימה ג", "w3.pdf")
+        self._meeting("שבועית", "08.11.26", "משימה ב", "w2-copy.pdf")
+        html = self.login("sup@test").get("/sites/1/audit").get_data(as_text=True)
+        self.assertIn("פער של 2 ימים", html)
+        self.assertIn("כפילות תאריך", html)
+        self.assertIn("תוכן זהה", html)
+
+    def test_clean_weekly_sequence_is_ok(self):
+        self._meeting("שבועית", "01.11.26", "משימה א", "w1.pdf")
+        self._meeting("שבועית", "08.11.26", "משימה ב", "w2.pdf")
+        html = self.login("sup@test").get("/sites/1/audit").get_data(as_text=True)
+        self.assertNotIn("פער של", html)
+        self.assertIn("תקין", html)
+
+
 class InitialIdentifiesPersonTests(AppTestCase):
     def setUp(self):
         super().setUp()

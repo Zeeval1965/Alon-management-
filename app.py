@@ -1,11 +1,13 @@
 """MVP skeleton: sites, contacts, protocol import with approval, tasks, outbox."""
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import tempfile
 import uuid
+from collections import Counter
 
 import openpyxl
 from flask import Flask, abort, flash, g, redirect, render_template_string, request, send_from_directory, session, url_for
@@ -709,7 +711,7 @@ ROLE_WRITE = {
 SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
-    "site_warnings": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "site_warnings": "tasks", "site_audit": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -1339,6 +1341,65 @@ def site_search(site_id):
         shown=shown, hl=highlight, s=s, url_for=url_for)
 
 
+@app.route("/sites/<int:site_id>/audit")
+def site_audit(site_id):
+    """Audit of published protocols: the same protocol recorded twice, and continuity per kind.
+    A weekly protocol is expected every 7 days; other kinds only show the gap."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    meetings = db().execute(
+        "SELECT * FROM meetings WHERE site_id=? AND status='published' ORDER BY id", (site_id,)).fetchall()
+    items = []
+    for m in meetings:
+        rows = [r for r in json.loads(m["staged_rows"] or "[]") if not r.get("skip")]
+        dates = Counter(parse_date(r.get("meeting_date")) for r in rows if r.get("meeting_date"))
+        day = dates.most_common(1)[0][0] if dates else None
+        content = sorted([str(r.get("number") or ""), r.get("topic") or "", r.get("task") or "", r.get("target") or ""]
+                         for r in rows)
+        items.append({"m": m, "day": day, "rows": len(rows), "gap": None, "flags": [],
+                      "fp": hashlib.sha1(json.dumps(content, ensure_ascii=False).encode()).hexdigest()})
+
+    # Duplicates: same kind and date, or the same content under another meeting.
+    for i, a in enumerate(items):
+        if a["day"] is None:
+            a["flags"].append("תאריך לא זוהה")
+        for b in items[:i]:
+            if a["day"] and b["day"] == a["day"] and b["m"]["kind"] == a["m"]["kind"]:
+                a["flags"].append(f"כפילות תאריך עם פגישה #{b['m']['id']}")
+                break
+        for b in items[:i]:
+            if a["rows"] and b["fp"] == a["fp"]:
+                a["flags"].append(f"תוכן זהה לפגישה #{b['m']['id']}")
+                break
+
+    # Continuity per kind, in date order.
+    by_kind = {}
+    for it in items:
+        by_kind.setdefault(it["m"]["kind"], []).append(it)
+    for kind, its in by_kind.items():
+        its.sort(key=lambda it: (it["day"] or "9999-99-99", it["m"]["id"]))
+        prev = None
+        for it in its:
+            if prev and prev["day"] and it["day"]:
+                gap = (dt.date.fromisoformat(it["day"]) - dt.date.fromisoformat(prev["day"])).days
+                it["gap"] = gap
+                if kind == "שבועית" and gap != 7:
+                    it["flags"].append(f"פער של {gap} ימים (צפוי 7)")
+            prev = it
+
+    items.sort(key=lambda it: (it["day"] or "9999-99-99", it["m"]["id"]))
+    problems = sum(1 for it in items if it["flags"])
+    return page("ביקורת פרוטוקולים - " + s["name"], """
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+<p class="note">נבדקו {{ items|length }} פרוטוקולים שפורסמו. עם בעיה: {{ problems }}.
+המחזור השבועי צפוי כל 7 ימים. בסוגים אחרים מוצג רק הפער בין הפגישות.</p>
+<table><tr><th>סוג</th><th>תאריך</th><th>מזהה</th><th>שם קובץ</th><th>שורות</th><th>ימים מהקודם</th><th>בדיקה</th></tr>
+{% for it in items %}<tr{% if it['flags'] %} class="overdue"{% endif %}><td>{{ it['m']['kind'] }}</td><td>{{ it['day'] or '' }}</td>
+<td>#{{ it['m']['id'] }}</td><td>{{ it['m']['source_name'] or '' }}</td><td>{{ it['rows'] }}</td>
+<td>{{ it['gap'] if it['gap'] is not none else '' }}</td><td>{{ it['flags']|join(' · ') if it['flags'] else 'תקין' }}</td></tr>
+{% else %}<tr><td colspan="7">אין פרוטוקולים שפורסמו</td></tr>{% endfor %}</table>
+""", s=s, items=items, problems=problems)
+
+
 @app.route("/sites/<int:site_id>/warnings")
 def site_warnings(site_id):
     """Things to fix: the same person recorded more than once, tasks with no one assigned, and
@@ -1895,7 +1956,7 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
 <option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
