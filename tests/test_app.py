@@ -893,7 +893,7 @@ class ClosureApprovalTests(AppTestCase):
 
     def test_pending_closure_shown_on_warnings_page(self):
         html = self.login("sup@test").get("/sites/1/warnings").get_data(as_text=True)
-        self.assertIn("סגירה ממתינה לאישור המפקח", html)
+        self.assertIn("לבדיקה: לא הופיעה בפרוטוקול המלא האחרון", html)
         self.assertIn("סגור כבוצע", html)
 
 
@@ -937,7 +937,7 @@ class BacklogDataTests(AppTestCase):
     def test_global_lists_are_seeded(self):
         self.assertEqual(self.db_val("SELECT COUNT(*) FROM severity_levels"), 4)
         self.assertEqual(self.db_val("SELECT COUNT(*) FROM item_types"), 7)
-        self.assertEqual(self.db_val("SELECT kind FROM task_status_options WHERE name='לא רלוונטי'"), "closed")
+        self.assertEqual(self.db_val("SELECT kind FROM task_status_options WHERE name='בוטלה'"), "closed")
 
     def test_suggestions_from_text(self):
         self.assertEqual(A.suggest_severity("תיקון דחוף בחזית"), "גבוה")
@@ -992,6 +992,124 @@ class BacklogDataTests(AppTestCase):
         self.assertEqual(self.db_val("SELECT text FROM task_comments WHERE task_id=?", (tid,)), "הערה לבדיקה")
         self.assertEqual(self.db_val("SELECT name FROM task_docs WHERE task_id=?", (tid,)), "תכנית ב-3")
         self.assertEqual(self.login("owner@test").post(f"/tasks/{tid}/comments", data={"text": "x"}).status_code, 403)
+
+
+class TaskLinkTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        with A.app.app_context():
+            d = A.db()
+            owner = d.execute("SELECT id FROM contacts WHERE email='owner@test'").fetchone()[0]
+            for no, text in (("K1", "תיקון חזית צפון"), ("K2", "החלפת דלת")):
+                d.execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,?,'חזית',?,'פתוחה')", (no, text))
+            d.commit()
+            self.t1 = d.execute("SELECT id FROM tasks WHERE public_no='K1'").fetchone()[0]
+            self.t2 = d.execute("SELECT id FROM tasks WHERE public_no='K2'").fetchone()[0]
+            self.owner = owner
+            d.execute("INSERT INTO task_assignments(task_id, contact_id, confirmed, is_responsible) VALUES (?,?,1,1)",
+                      (self.t1, owner))
+            d.commit()
+            self.token = A.make_task_link(self.t1, owner)
+            A.db().commit()
+
+    def test_link_shows_and_changes_only_its_task(self):
+        c = A.app.test_client()
+        self.assertIn("תיקון חזית צפון", c.get(f"/u/{self.token}").get_data(as_text=True))
+        self.assertNotIn("החלפת דלת", c.get(f"/u/{self.token}").get_data(as_text=True))
+        c.post(f"/u/{self.token}", data={"status": "בטיפול", "comment": "הזמנתי חומרים"})
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.t1,)), "בטיפול")
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.t2,)), "פתוחה")
+        self.assertEqual(self.db_val("SELECT changed_by FROM task_status_log WHERE task_id=?", (self.t1,)), "owner@test")
+        self.assertEqual(self.db_val("SELECT text FROM task_comments WHERE task_id=?", (self.t1,)), "הזמנתי חומרים")
+
+    def test_unknown_or_expired_link_is_not_found(self):
+        c = A.app.test_client()
+        self.assertEqual(c.get("/u/not-a-real-token").status_code, 404)
+        with A.app.app_context():
+            A.db().execute("UPDATE task_links SET expires_at='2000-01-01T00:00' WHERE contact_id=?", (self.owner,))
+            A.db().commit()
+        self.assertEqual(A.app.test_client().get(f"/u/{self.token}").status_code, 404)
+
+    def test_closing_from_link_is_a_request_only(self):
+        A.app.test_client().post(f"/u/{self.token}", data={"status": "בוצע"})
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.t1,)), "פתוחה")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_closure_pending WHERE task_id=?", (self.t1,)), 1)
+
+    def test_send_screen_is_for_managers_only(self):
+        self.assertEqual(self.login("owner@test").get("/sites/1/send-links").status_code, 403)
+        self.assertEqual(self.login("sup@test").get("/sites/1/send-links").status_code, 200)
+
+    def test_send_queues_links_to_owner_in_development(self):
+        c = self.login("sup@test")
+        r = c.post("/sites/1/send-links", data={f"ch_{self.t1}_{self.owner}": "email"})
+        self.assertEqual(r.status_code, 200)
+        body = self.db_val("SELECT body FROM outbox ORDER BY id DESC LIMIT 1")
+        self.assertIn("/u/", body)
+        self.assertIn("[פיתוח", body)
+        self.assertGreaterEqual(self.db_val("SELECT COUNT(*) FROM task_links WHERE task_id=?", (self.t1,)), 2)
+
+
+class DecisionChangesTests(AppTestCase):
+    def _task(self, no, status="פתוחה"):
+        with A.app.app_context():
+            A.db().execute("INSERT INTO tasks(site_id, public_no, topic, text, status) VALUES (1,?,'חשמל',?,?)",
+                           (no, "משימה " + no, status))
+            A.db().commit()
+            return A.db().execute("SELECT id FROM tasks WHERE public_no=?", (no,)).fetchone()[0]
+
+    def test_new_statuses_exist_and_old_name_is_gone(self):
+        self.assertEqual(self.db_val("SELECT kind FROM task_status_options WHERE name='מעוכבת'"), "open")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_status_options WHERE name='לא רלוונטי'"), 0)
+        tid = self._task("D1")
+        c = self.login("sup@test")
+        self.assertEqual(c.post(f"/tasks/{tid}/status", data={"status": "ממתינה לבדיקה"}).status_code, 302)
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "ממתינה לבדיקה")
+
+    def test_manager_closing_sets_closure_date(self):
+        tid = self._task("D2")
+        self.login("sup@test").post(f"/tasks/{tid}/status", data={"status": "בוצע"})
+        self.assertEqual(self.db_val("SELECT closed_at FROM tasks WHERE id=?", (tid,)), __import__("datetime").date.today().isoformat())
+
+    def test_confirmed_assignee_reports_but_cannot_close(self):
+        tid = self._task("D3")
+        with A.app.app_context():
+            A.db().execute("INSERT INTO contacts(email, first_name, last_name, password_hash, is_admin) VALUES ('kab@test','קבלן','',?,0)",
+                           (A.generate_password_hash("pw"),))
+            cid = A.db().execute("SELECT id FROM contacts WHERE email='kab@test'").fetchone()[0]
+            A.db().execute("INSERT INTO memberships(site_id, contact_id, site_role) VALUES (1,?,'קבלן')", (cid,))
+            A.db().execute("INSERT INTO task_assignments(task_id, contact_id, confirmed) VALUES (?,?,1)", (tid, cid))
+            A.db().commit()
+        c = self.login("kab@test")
+        self.assertEqual(c.post(f"/tasks/{tid}/status", data={"status": "בטיפול"}).status_code, 302)
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בטיפול")
+        c.post(f"/tasks/{tid}/status", data={"status": "בוצע"})
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בטיפול")
+        self.assertEqual(self.db_val("SELECT COUNT(*) FROM task_closure_pending WHERE task_id=?", (tid,)), 1)
+        other = self._task("D4")
+        self.assertEqual(c.post(f"/tasks/{other}/status", data={"status": "בטיפול"}).status_code, 403)
+
+    def test_protocol_search_finds_non_task_rows(self):
+        rows = [{"number": "7", "topic": "כללי", "task": "הערה על תיאום מערכות", "assignee": "",
+                 "target": "", "meeting_date": "03.11.26", "skip": False}]
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status) VALUES (1,'שבועית',?, 'published')",
+                           (json.dumps(rows, ensure_ascii=False),))
+            A.db().commit()
+        html = self.login("sup@test").get("/sites/1/protocol-search?q=תיאום").get_data(as_text=True)
+        self.assertIn("הערה על תיאום מערכות", html)
+        self.assertEqual(self.login("owner@test").get("/sites/1/protocol-search?q=תיאום").status_code, 403)
+
+    def test_opened_date_is_protocol_date_and_occurrences_kept(self):
+        row = {"number": "1", "topic": "חשמל", "task": "בדיקת לוח חשמל", "assignee": "",
+               "target": "", "meeting_date": "01.11.26"}
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status) VALUES (1,'שבועית',?, 'draft')",
+                           (json.dumps([row], ensure_ascii=False),))
+            A.db().commit()
+            A.publish_meeting(A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0])
+        self.assertEqual(self.db_val("SELECT created_at FROM tasks WHERE text='בדיקת לוח חשמל'"), "2026-11-01")
+        self.assertEqual(self.db_val("SELECT text FROM task_occurrences WHERE task_id=(SELECT id FROM tasks WHERE text='בדיקת לוח חשמל')"),
+                         "בדיקת לוח חשמל")
 
 
 class InitialIdentifiesPersonTests(AppTestCase):

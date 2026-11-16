@@ -1,6 +1,7 @@
 """MVP skeleton: sites, contacts, protocol import with approval, tasks, outbox."""
 import datetime as dt
 import hashlib
+import secrets
 import json
 import os
 import re
@@ -85,6 +86,14 @@ CREATE TABLE IF NOT EXISTS task_comments (
 CREATE TABLE IF NOT EXISTS task_docs (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, name TEXT NOT NULL, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_links (
+  token_hash TEXT PRIMARY KEY, task_id INTEGER NOT NULL, contact_id INTEGER NOT NULL,
+  created_at TEXT, expires_at TEXT
+);
+CREATE TABLE IF NOT EXISTS task_occurrences (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, meeting_id INTEGER, number TEXT,
+  topic TEXT, text TEXT, target TEXT, created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
@@ -115,17 +124,19 @@ def _close(_):
 
 
 TASK_STATUS_SEED = [("פתוחה", "open"), ("בטיפול", "open"), ("ממתינה לאישור", "open"),
-                    ("ממתין למפרט", "open"), ("לבדיקה חוזרת", "open"), ("לידיעה", "info"),
-                    ("בוצע", "closed"), ("לא רלוונטי", "closed")]
+                    ("ממתין למפרט", "open"), ("לבדיקה חוזרת", "open"), ("ממתינה לבדיקה", "open"),
+                    ("מעוכבת", "open"), ("לידיעה", "info"), ("בוצע", "closed"), ("בוטלה", "closed")]
 SEVERITY_SEED = ["קריטי", "גבוה", "בינוני", "נמוך"]
 ITEM_TYPE_SEED = ["הערה", "אי-דיוק", "בקשה למפרט", "נושא חזית", "חניית יועץ", "ליקוי ביצוע", "פריט פתוח"]
-CLOSED_STATUSES = ("בוצע", "לא רלוונטי")
+CLOSED_STATUSES = ("בוצע", "בוטלה")
 INFO_STATUSES = ("לידיעה",)
 
 
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript(SCHEMA)
+    c.execute("UPDATE tasks SET status='בוטלה' WHERE status='לא רלוונטי'")
+    c.execute("UPDATE task_status_options SET name='בוטלה' WHERE name='לא רלוונטי'")
     for i, (name, kind) in enumerate(TASK_STATUS_SEED):
         c.execute("INSERT OR IGNORE INTO task_status_options(name, kind, sort) VALUES (?,?,?)", (name, kind, i))
     for i, name in enumerate(SEVERITY_SEED):
@@ -145,7 +156,10 @@ def init_db():
                  "ALTER TABLE sites ADD COLUMN stages TEXT",
                  "ALTER TABLE tasks ADD COLUMN created_at TEXT",
                  "ALTER TABLE tasks ADD COLUMN severity TEXT",
-                 "ALTER TABLE tasks ADD COLUMN item_type TEXT"):
+                 "ALTER TABLE tasks ADD COLUMN item_type TEXT",
+                 "ALTER TABLE tasks ADD COLUMN sub_topic TEXT",
+                 "ALTER TABLE tasks ADD COLUMN approver TEXT",
+                 "ALTER TABLE tasks ADD COLUMN closed_at TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -399,7 +413,8 @@ def publish_meeting(meeting_id):
                        target_text, target_date, last_meeting_id, created_at, severity, item_type)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (site_id, public, r["number"], r["topic"], r["task"], r["assignee"],
-                 r["target"], target_date, meeting_id, dt.date.today().isoformat(),
+                 r["target"], target_date, meeting_id,
+                 parse_date(r.get("meeting_date")) or dt.date.today().isoformat(),
                  suggest_severity(r["task"]), suggest_item_type(r["task"])))
             task_id = cur.lastrowid
         else:
@@ -414,8 +429,12 @@ def publish_meeting(meeting_id):
             log_task_status(task_id, "לבדיקה חוזרת", "הופיעה שוב בפרוטוקול לאחר סגירה")
         db().execute("INSERT INTO task_targets(task_id, target_text, meeting_id) VALUES (?,?,?)",
                      (task_id, r["target"], meeting_id))
+        db().execute(
+            "INSERT INTO task_occurrences(task_id, meeting_id, number, topic, text, target, created_at) VALUES (?,?,?,?,?,?,?)",
+            (task_id, meeting_id, number, r.get("topic"), r.get("task"), r.get("target"),
+             dt.datetime.now().isoformat(timespec="minutes")))
         if done_here:
-            db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (task_id,))
+            db().execute("UPDATE tasks SET status='בוצע', closed_at=? WHERE id=?", (dt.date.today().isoformat(), task_id))
         published.append(task_id)
         used.add((task_id, day))
 
@@ -438,7 +457,7 @@ def publish_meeting(meeting_id):
         # only tasks from the same kind of protocol: a weekly report does not close execution items
         gone = db().execute(
             """SELECT t.id FROM tasks t JOIN meetings lm ON lm.id = t.last_meeting_id
-               WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לא רלוונטי') AND lm.kind=? AND t.last_meeting_id != ?""",
+               WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'בוטלה') AND lm.kind=? AND t.last_meeting_id != ?""",
             (site_id, m["kind"], meeting_id)).fetchall()
         for t in gone:
             if t["id"] not in listed_ids:
@@ -501,14 +520,14 @@ def dev_contact():
     return db().execute("SELECT * FROM contacts WHERE email=?", (DEV_EMAIL,)).fetchone()
 
 
-def enqueue(site_id, contact, body, mode):
+def enqueue(site_id, contact, body, mode, channel=None):
     if DEV_MODE:
         intended = f"{contact['first_name']} {contact['last_name']}".strip() or contact["email"]
         body = f"[פיתוח - במקור אל: {intended}] {body}"
         contact = dev_contact()
     if DEV_MODE:
         channel = "email"  # until WhatsApp is connected, development messages go to the owner's email
-    else:
+    elif channel is None:
         channel = "email" if contact["is_consultant"] else (contact["pref_channel"] or "whatsapp")
     db().execute(
         "INSERT INTO outbox(site_id, contact_id, channel, body, mode, created) VALUES (?,?,?,?,?,?)",
@@ -532,7 +551,7 @@ def send_task_reminders(site_id, today=None):
     today = today or dt.date.today()
     limit = (today + dt.timedelta(days=1)).isoformat()
     tasks = db().execute(
-        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה', 'לא רלוונטי')
+        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה', 'בוטלה')
            AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
@@ -754,7 +773,7 @@ SECTION_OF = {
     "site_view": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -763,7 +782,8 @@ SECTION_OF = {
     "meeting_upload": "protocols", "meeting_review": "protocols",
     "progress_view": "progress", "progress_save": "progress",
 }
-PUBLIC_ENDPOINTS = {"login", "logout", "static"}
+# task_link_view is open to anyone holding a valid link; it shows and changes only that one task
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view"}
 # contact import and editing: administrator and supervisors (deleting field values: administrator only)
 MANAGER_ENDPOINTS = {"contacts_import", "contacts_import_preview", "contacts_import_confirm", "contact_edit",
                      "contact_role_add", "contact_role_remove", "contact_delete"}
@@ -806,6 +826,31 @@ def can_see_emails(site_id):
     if me is None:
         return False
     return bool(me["is_admin"]) or bool(roles_on_site(me, site_id) & EMAIL_ROLES)
+
+
+LINK_DAYS = 14
+LINK_STATUSES_EXCLUDED = ("בוצע", "לידיעה", "בוטלה")  # 'בוצע' is a closure request, see below
+
+
+def make_task_link(task_id, contact_id):
+    """A personal link to one task for one contact. Only the hash is stored."""
+    token = secrets.token_urlsafe(24)
+    now = dt.datetime.now()
+    db().execute("INSERT INTO task_links(token_hash, task_id, contact_id, created_at, expires_at) VALUES (?,?,?,?,?)",
+                 (hashlib.sha256(token.encode()).hexdigest(), task_id, contact_id,
+                  now.isoformat(timespec="minutes"), (now + dt.timedelta(days=LINK_DAYS)).isoformat(timespec="minutes")))
+    return token
+
+
+def is_confirmed_assignee(contact, task_id):
+    if task_id is None:
+        return False
+    return db().execute("SELECT 1 FROM task_assignments WHERE task_id=? AND contact_id=? AND confirmed=1",
+                        (task_id, contact["id"])).fetchone() is not None
+
+
+def is_task_manager(contact, site_id):
+    return bool(contact["is_admin"]) or "מפקח" in roles_on_site(contact, site_id)
 
 
 def task_status_names(kind=None):
@@ -929,6 +974,8 @@ def require_access():
         return None
     if endpoint in MANAGER_ENDPOINTS:
         return None if is_manager(me) else abort(403)
+    if endpoint == "task_status" and request.method == "POST" and is_confirmed_assignee(me, (request.view_args or {}).get("task_id")):
+        return None
     section = SECTION_OF.get(endpoint)
     if section is None:
         abort(403)  # administrator-only screen
@@ -1169,8 +1216,25 @@ def task_status(task_id):
     new_status = request.form["status"]
     if new_status not in task_status_names():
         abort(400)
+    me = current_contact()
+    if not is_task_manager(me, t["site_id"]):
+        # a confirmed assignee reports handling; closing is only a request for the supervisor
+        if not is_confirmed_assignee(me, task_id):
+            abort(403)
+        if new_status == "בוצע":
+            db().execute("INSERT OR IGNORE INTO task_closure_pending(task_id, meeting_id, created_at) VALUES (?,?,?)",
+                         (task_id, t["last_meeting_id"], dt.datetime.now().isoformat(timespec="minutes")))
+            log_task_status(task_id, "בוצע", "בקשת סגירה ממתינה לאישור המפקח")
+            db().commit()
+            return redirect(url_for("site_view", site_id=t["site_id"]))
+        if new_status in LINK_STATUSES_EXCLUDED:
+            abort(400)
     by_name = request.form.get("by", "לא צוין")
-    db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, task_id))
+    if new_status in CLOSED_STATUSES:
+        db().execute("UPDATE tasks SET status=?, closed_at=? WHERE id=?",
+                     (new_status, dt.date.today().isoformat(), task_id))
+    else:
+        db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, task_id))
     log_task_status(task_id, new_status, request.form.get("by", ""))
     db().commit()
     if new_status != "פתוחה":
@@ -1188,7 +1252,7 @@ def _full_names(site_id):
 
 def rematch_site(site_id):
     """Run name matching again for the site's open tasks (after contacts were imported or changed)."""
-    for t in db().execute("SELECT id FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לא רלוונטי')", (site_id,)).fetchall():
+    for t in db().execute("SELECT id FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'בוטלה')", (site_id,)).fetchall():
         suggest_assignees(t["id"])
     db().commit()
 
@@ -1414,7 +1478,7 @@ def site_search(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     q = (request.args.get("q") or "").strip()
     kind = request.args.get("kind") if request.args.get("kind") in ("משימות", "החלטות") else "משימות"
-    view = request.args.get("view") if request.args.get("view") in ("open", "done", "info") else ""
+    view = request.args.get("view") if request.args.get("view") in ("open", "done", "info", "repeat3") else ""
     status = request.args.get("status") or ""
     topic = request.args.get("topic") or ""
     contact_id = request.args.get("contact", type=int)
@@ -1440,6 +1504,8 @@ def site_search(site_id):
             if view == "done" and t["status"] != "בוצע":
                 continue
             if view == "info" and t["status"] != "לידיעה":
+                continue
+            if view == "repeat3" and task_repeat_count(t["id"]) < 3:
                 continue
             if status and t["status"] != status:
                 continue
@@ -1467,6 +1533,8 @@ def site_search(site_id):
 <a href="{{ url_for('site_search', site_id=s['id'], view='done') }}">משימות שבוצעו</a> ·
 <a href="{{ url_for('site_search', site_id=s['id'], view='info') }}">לידיעה</a> ·
 <a href="{{ url_for('site_search', site_id=s['id'], kind='החלטות') }}">כל ההחלטות</a> ·
+<a href="{{ url_for('site_search', site_id=s['id'], view='repeat3') }}">חזרו 3 פעמים ומעלה</a> ·
+<a href="{{ url_for('site_protocol_search', site_id=s['id']) }}">חיפוש בכל הפרוטוקולים</a> ·
 <a href="{{ url_for('site_warnings', site_id=s['id']) }}">ללא שיוך</a>
 </p>
 <form method="get">
@@ -1577,7 +1645,7 @@ def task_closure(task_id, action):
     if db().execute("SELECT 1 FROM task_closure_pending WHERE task_id=?", (task_id,)).fetchone():
         db().execute("DELETE FROM task_closure_pending WHERE task_id=?", (task_id,))
         if action == "approve":
-            db().execute("UPDATE tasks SET status='בוצע' WHERE id=?", (task_id,))
+            db().execute("UPDATE tasks SET status='בוצע', closed_at=? WHERE id=?", (dt.date.today().isoformat(), task_id))
             log_task_status(task_id, "בוצע", "נסגרה לאחר היעלמה מפרוטוקול מלא")
         db().commit()
     return redirect(url_for("site_warnings", site_id=t["site_id"]))
@@ -1606,6 +1674,133 @@ def task_doc_add(task_id):
     return redirect(url_for("site_view", site_id=t["site_id"]))
 
 
+@app.route("/u/<token>", methods=["GET", "POST"])
+def task_link_view(token):
+    """Status update for one task, reached from a link. No login: the link itself is the access."""
+    row = db().execute("SELECT * FROM task_links WHERE token_hash=?",
+                       (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+    if row is None or row["expires_at"] < dt.datetime.now().isoformat(timespec="minutes"):
+        abort(404)
+    t = db().execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() or abort(404)
+    c = db().execute("SELECT * FROM contacts WHERE id=?", (row["contact_id"],)).fetchone() or abort(404)
+    name = f"{c['first_name'] or ''} {c['last_name'] or ''}".strip() or c["email"]
+    allowed = [s for s in task_status_names() if s not in LINK_STATUSES_EXCLUDED]
+    message = ""
+    if request.method == "POST":
+        new_status = request.form.get("status", "")
+        comment = (request.form.get("comment") or "").strip()
+        if new_status == "בוצע":
+            db().execute("INSERT OR IGNORE INTO task_closure_pending(task_id, meeting_id, created_at) VALUES (?,?,?)",
+                         (t["id"], t["last_meeting_id"], dt.datetime.now().isoformat(timespec="minutes")))
+            message = "בקשת הסגירה נשלחה למפקח לאישור."
+        elif new_status in allowed:
+            db().execute("UPDATE tasks SET status=? WHERE id=?", (new_status, t["id"]))
+            db().execute(
+                "INSERT INTO task_status_log(task_id, status, handled_by, changed_by, changed_at) VALUES (?,?,?,?,?)",
+                (t["id"], new_status, name, name, dt.datetime.now().isoformat(timespec="minutes")))
+            message = "הסטטוס עודכן."
+            t = db().execute("SELECT * FROM tasks WHERE id=?", (t["id"],)).fetchone()
+            notify_supervisors_task_handled(t, name, new_status)
+        elif new_status != "בוצע":
+            abort(400)
+        doc = (request.form.get("doc") or "").strip()
+        if doc:
+            db().execute("INSERT INTO task_docs(task_id, name, created_at) VALUES (?,?,?)",
+                         (t["id"], doc, dt.datetime.now().isoformat(timespec="minutes")))
+        if comment:
+            db().execute("INSERT INTO task_comments(task_id, contact_id, text, created_at) VALUES (?,?,?,?)",
+                         (t["id"], c["id"], comment, dt.datetime.now().isoformat(timespec="minutes")))
+        db().commit()
+        t = db().execute("SELECT * FROM tasks WHERE id=?", (t["id"],)).fetchone()
+    return page("עדכון משימה", """
+<h2>עדכון משימה {{ t['public_no'] }}</h2>
+<p><b>{{ t['topic'] or '' }}</b></p><p>{{ t['text'] }}</p>
+<p class="note">סטטוס נוכחי: {{ t['status'] }}</p>
+{% if message %}<p class="flash">{{ message }}</p>{% endif %}
+<form method="post">
+<label>סטטוס חדש <select name="status">{% for o in allowed %}<option>{{ o }}</option>{% endfor %}<option>בוצע</option></select></label>
+<p class="note">בחירה ב"בוצע" שולחת בקשת סגירה למפקח; המשימה תיסגר רק לאחר אישורו.</p>
+<label>אסמכתא (לא חובה: שם מסמך או קישור)<br><input name="doc" style="width:100%"></label>
+<label>הערה (לא חובה)<br><textarea name="comment" rows="3" style="width:100%"></textarea></label>
+<p><button>שמירה</button></p>
+</form>
+""", t=t, allowed=allowed, message=message)
+
+
+@app.route("/sites/<int:site_id>/send-links", methods=["GET", "POST"])
+def site_send_links(site_id):
+    """Send each responsible person a personal link per task, by the channel chosen in the table."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    me = current_contact()
+    if not (me["is_admin"] or "מפקח" in roles_on_site(me, site_id)):
+        abort(403)
+    rows = db().execute(
+        """SELECT a.contact_id, c.first_name, c.last_name, c.email, t.id AS task_id, t.public_no, t.topic, t.text
+           FROM task_assignments a JOIN contacts c ON c.id = a.contact_id JOIN tasks t ON t.id = a.task_id
+           WHERE t.site_id=? AND a.is_responsible=1 AND a.confirmed=1
+             AND t.status NOT IN ('בוצע', 'לידיעה', 'בוטלה')
+           ORDER BY c.first_name, c.last_name, t.public_no""", (site_id,)).fetchall()
+    sent = None
+    if request.method == "POST":
+        groups = {}
+        for r in rows:
+            ch = request.form.get(f"ch_{r['task_id']}_{r['contact_id']}", "email")
+            if ch == "none":
+                continue
+            groups.setdefault((r["contact_id"], ch), []).append(r)
+        base = request.host_url.rstrip("/")
+        messages = links = 0
+        for (contact_id, ch), items in groups.items():
+            c = db().execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+            lines = [f"שלום {c['first_name'] or ''}, נא לעדכן סטטוס למשימות הבאות:"]
+            for it in items:
+                token = make_task_link(it["task_id"], contact_id)
+                links += 1
+                lines.append(f"{it['public_no']} – {it['topic'] or ''}: {(it['text'] or '')[:120]}")
+                lines.append(f"לעדכון: {base}/u/{token}")
+            enqueue(site_id, c, "\n".join(lines), "מיידי", channel=ch)
+            messages += 1
+        db().commit()
+        sent = (messages, links)
+    return page("שליחת קישורי עדכון - " + s["name"], """
+<h2>שליחת קישורי עדכון לאחראים</h2>
+<p class="note">כל אחראי מקבל קישור אישי לכל משימה. הקישור פתוח לשבועיים ומאפשר לעדכן רק את המשימה שלו.</p>
+{% if sent %}<p class="flash">נוצרו {{ sent[0] }} הודעות ו-{{ sent[1] }} קישורים.</p>{% endif %}
+<form method="post">
+<table><tr><th>אחראי</th><th>משימה</th><th>נושא</th><th>שליחה</th></tr>
+{% for r in rows %}<tr><td>{{ r['first_name'] }} {{ r['last_name'] or '' }}</td><td>{{ r['public_no'] }}</td><td>{{ r['topic'] or '' }}: {{ r['text'][:80] }}</td>
+<td><select name="ch_{{ r['task_id'] }}_{{ r['contact_id'] }}"><option value="email">דוא"ל</option><option value="mobile">נייד</option><option value="none">לא לשלוח</option></select></td></tr>
+{% else %}<tr><td colspan="4">אין משימות פתוחות עם אחראי מאושר</td></tr>{% endfor %}</table>
+<p><button>שליחה</button></p>
+</form>
+<p class="note">במצב פיתוח כל ההודעות נשלחות לבעלים בלבד, עם שם הנמען המקורי בגוף ההודעה.</p>
+""", rows=rows, sent=sent, s=s)
+
+
+@app.route("/sites/<int:site_id>/protocol-search")
+def site_protocol_search(site_id):
+    """Search every row of every protocol, including rows that are not tasks."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    q = request.args.get("q", "")
+    terms = [x.lower() for x in search_terms(q)]
+    hits = []
+    if terms:
+        for m in db().execute("SELECT * FROM meetings WHERE site_id=? ORDER BY id", (site_id,)).fetchall():
+            for r in json.loads(m["staged_rows"] or "[]"):
+                text = " ".join(str(r.get(k) or "") for k in ("number", "topic", "task", "target", "meeting_date", "subject"))
+                if all(term in text.lower() for term in terms):
+                    hits.append({"kind": m["kind"], "meeting": m["id"], "row": r, "skip": bool(r.get("skip"))})
+    return page("חיפוש בפרוטוקולים - " + s["name"], """
+<p><a href="{{ url_for('site_search', site_id=s['id']) }}">חזרה לחיפוש</a></p>
+<form method="get"><input name="q" value="{{ q }}" placeholder="מילה או ביטוי"> <button>חיפוש</button></form>
+{% if terms %}<p class="note">{{ hits|length }} תוצאות (עד 300 מוצגות)</p>
+<table><tr><th>סוג</th><th>ישיבה</th><th>תאריך</th><th>סעיף</th><th>נושא</th><th>טקסט</th><th>יעד</th></tr>
+{% for h in hits[:300] %}<tr><td>{{ h['kind'] }}</td><td>#{{ h['meeting'] }}</td><td>{{ h['row'].get('meeting_date') or '' }}</td>
+<td>{{ h['row'].get('number') or '' }}</td><td>{{ h['row'].get('topic') or '' }}</td><td>{{ h['row'].get('task') or '' }}</td><td>{{ h['row'].get('target') or '' }}</td></tr>{% endfor %}</table>
+{% endif %}
+""", s=s, q=q, terms=terms, hits=hits)
+
+
 @app.route("/sites/<int:site_id>/warnings")
 def site_warnings(site_id):
     """Things to fix: the same person recorded more than once, tasks with no one assigned, and
@@ -1627,13 +1822,13 @@ def site_warnings(site_id):
                   for k, v in groups.items() if len(v) > 1]
     unassigned = db().execute(
         """SELECT t.id, t.public_no, t.topic, t.text, t.assignee_text FROM tasks t
-           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה', 'לא רלוונטי')
+           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לידיעה', 'בוטלה')
              AND NOT EXISTS (SELECT 1 FROM task_assignments a WHERE a.task_id=t.id)
            ORDER BY t.public_no""", (site_id,)).fetchall()
     pending = db().execute(
         """SELECT t.id AS task_id, t.public_no, t.topic, t.text, a.raw_name, a.contact_id, c.first_name, c.last_name, c.org
            FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN contacts c ON c.id = a.contact_id
-           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'לא רלוונטי') AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
+           WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'בוטלה') AND a.confirmed=0 ORDER BY t.public_no""", (site_id,)).fetchall()
     choices = db().execute(
         """SELECT DISTINCT c.id, c.first_name, c.last_name FROM memberships m JOIN contacts c ON c.id = m.contact_id
            WHERE m.site_id=? ORDER BY c.first_name, c.last_name""", (site_id,)).fetchall()
@@ -1645,7 +1840,7 @@ def site_warnings(site_id):
 <table><tr><th>שם</th><th>רשומות</th></tr>
 {% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] if show_email else '' }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
-<h3>סגירה ממתינה לאישור המפקח (המשימה לא הופיעה בפרוטוקול מלא)</h3>
+<h3>לבדיקה: לא הופיעה בפרוטוקול המלא האחרון (לא נסגרה אוטומטית)</h3>
 <table><tr><th>משימה</th><th>תיאור</th><th>פעולה</th></tr>
 {% for c in closures %}<tr><td>{{ c['public_no'] }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
 <td><form method="post" action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
@@ -2180,7 +2375,7 @@ def site_view(site_id):
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('assignments', site_id=s['id']) }}">שיוך משימות לאנשי קשר</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
 <option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
@@ -2192,7 +2387,7 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no'] }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}{% if t['id'] in closure_ids %}<br><span class="note">סגירה ממתינה לאישור המפקח</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס">{{ t['status'] }}{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}">
 <select name="status">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" size="10"><button>עדכון</button></form></td>
