@@ -2703,6 +2703,37 @@ def site_live(site_id):
     })
 
 
+def _dmy(iso):
+    try:
+        return dt.date.fromisoformat(iso).strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return iso or ""
+
+
+def construction_schedule(land_iso, total):
+    """Last construction month (from the land date and the contract's month count) and the
+    construction month we are in today, counting the land month as month 1."""
+    try:
+        land = dt.date.fromisoformat(land_iso)
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return None, "לא נקבע"
+    if total <= 0:
+        return None, "לא נקבע"
+    start = land.year * 12 + (land.month - 1)
+    end_idx = start + total - 1
+    end_txt = f"{end_idx % 12 + 1:02d}.{end_idx // 12}"
+    today = dt.date.today()
+    idx = today.year * 12 + (today.month - 1) - start
+    if idx < 0:
+        current = f"טרם החל (עלייה לקרקע ב-{_dmy(land_iso)})"
+    elif idx >= total:
+        current = f"הסתיימו {total} חודשי הביצוע לפי החוזה"
+    else:
+        current = f"{idx + 1} מתוך {total}"
+    return end_txt, current
+
+
 @app.route("/sites/<int:site_id>")
 def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -2830,7 +2861,7 @@ def site_view(site_id):
 שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
-<p>עלייה לקרקע {{ s['land_date'] }} · מסירה לפי חוזה {{ s['delivery_date'] }} · חודש ביצוע {{ month_txt }}</p>
+<p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש סיום לפי חישוב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
@@ -2857,7 +2888,9 @@ def site_view(site_id):
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
-        month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"),
+        land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']),
+        month_txt=construction_schedule(s["land_date"], s["months_total"])[1],
+        end_txt=construction_schedule(s["land_date"], s["months_total"])[0] or "לא נקבע",
         latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
 
 
