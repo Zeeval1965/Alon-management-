@@ -1663,3 +1663,35 @@ class ProtocolViewStatusTests(AppTestCase):
         c.post(f"/tasks/{tid}/status", data={"status": "בטיפול", "by": "בדיקה"})
         with A.app.app_context():
             self.assertEqual(A.db().execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0], "בטיפול")
+
+
+class AuditActionsTests(AppTestCase):
+    def _published(self, day, text):
+        row = {"number": "1", "topic": "חשמל", "task": text, "assignee": "חשמלאי", "target": "", "meeting_date": day, "flags": []}
+        with A.app.app_context():
+            A.db().execute("INSERT INTO meetings(site_id, kind, staged_rows, status, meeting_date, published_at) VALUES (1,'ביצוע',?,'draft',?,'2026-11-17T08:00')",
+                           (json.dumps([row], ensure_ascii=False), A.parse_date(day)))
+            mid = A.db().execute("SELECT MAX(id) FROM meetings").fetchone()[0]
+            A.db().commit()
+        with A.app.app_context():
+            A.publish_meeting(mid)
+        return mid
+
+    def test_delete_removes_protocol_and_only_its_tasks(self):
+        first = self._published("02.11.26", "בדיקת חשמל לקומה ראשונה בבניין")
+        second = self._published("09.11.26", "בדיקת חשמל לקומה שנייה בבניין")
+        c = self.login("admin@test")
+        self.assertEqual(c.post(f"/meetings/{second}/delete", data={"confirm": "לא"}).status_code, 400)
+        self.assertEqual(c.post(f"/meetings/{second}/delete", data={"confirm": "מחק"}).status_code, 302)
+        with A.app.app_context():
+            d = A.db()
+            self.assertIsNone(d.execute("SELECT 1 FROM meetings WHERE id=?", (second,)).fetchone())
+            self.assertIsNotNone(d.execute("SELECT 1 FROM meetings WHERE id=?", (first,)).fetchone())
+            self.assertEqual(d.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+    def test_update_changes_date_and_kind(self):
+        mid = self._published("02.11.26", "בדיקת חשמל לקומה ראשונה בבניין")
+        self.login("admin@test").post(f"/meetings/{mid}/update", data={"meeting_date": "2026-11-05", "kind": "שבועית"})
+        with A.app.app_context():
+            row = A.db().execute("SELECT meeting_date, kind FROM meetings WHERE id=?", (mid,)).fetchone()
+        self.assertEqual((row["meeting_date"], row["kind"]), ("2026-11-05", "שבועית"))

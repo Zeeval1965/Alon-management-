@@ -844,7 +844,7 @@ SECTION_OF = {
     "site_view": "tasks", "site_live": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "meeting_update": "protocols", "meeting_delete": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -1776,12 +1776,54 @@ def site_audit(site_id):
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 <p class="note">נבדקו {{ items|length }} פרוטוקולים שפורסמו. עם בעיה: {{ problems }}.
 המחזור השבועי צפוי כל 7 ימים. בסוגים אחרים מוצג רק הפער בין הפגישות.</p>
-<table><tr><th>סוג</th><th>תאריך</th><th>מזהה</th><th>שם קובץ</th><th>שורות</th><th>ימים מהקודם</th><th>בדיקה</th></tr>
+<table><tr><th>סוג</th><th>תאריך</th><th>מזהה</th><th>שם קובץ</th><th>שורות</th><th>ימים מהקודם</th><th>בדיקה</th><th>פעולות</th></tr>
 {% for it in items %}<tr{% if it['flags'] %} class="overdue"{% endif %}><td>{{ it['m']['kind'] }}</td><td>{{ it['day'] or '' }}</td>
 <td>#{{ it['m']['id'] }}</td><td>{{ it['m']['source_name'] or '' }}</td><td>{{ it['rows'] }}</td>
-<td>{{ it['gap'] if it['gap'] is not none else '' }}</td><td>{{ it['flags']|join(' · ') if it['flags'] else 'תקין' }}</td></tr>
-{% else %}<tr><td colspan="7">אין פרוטוקולים שפורסמו</td></tr>{% endfor %}</table>
+<td>{{ it['gap'] if it['gap'] is not none else '' }}</td><td>{{ it['flags']|join(' · ') if it['flags'] else 'תקין' }}</td>
+<td><a href="{{ url_for('meeting_view', meeting_id=it['m']['id']) }}">פתיחה</a>
+<form method="post" action="{{ url_for('meeting_update', meeting_id=it['m']['id']) }}" style="display:inline">
+<input type="date" name="meeting_date" value="{{ it['m']['meeting_date'] or '' }}"> <select name="kind"><option{% if it['m']['kind']=='ביצוע' %} selected{% endif %}>ביצוע</option><option{% if it['m']['kind']=='שבועית' %} selected{% endif %}>שבועית</option><option{% if it['m']['kind']=='סופרפוזיציה' %} selected{% endif %}>סופרפוזיציה</option></select> <button>שמירה</button></form>
+<form method="post" action="{{ url_for('meeting_delete', meeting_id=it['m']['id']) }}" style="display:inline" onsubmit="return confirm('למחוק את הפרוטוקול ואת המשימות שנוצרו רק ממנו? הפעולה אינה הפיכה.')">
+<input type="hidden" name="confirm" value="מחק"><button>מחיקה</button></form></td></tr>
+{% else %}<tr><td colspan="8">אין פרוטוקולים שפורסמו</td></tr>{% endfor %}</table>
 """, s=s, items=items, problems=problems)
+
+
+@app.route("/meetings/<int:meeting_id>/update", methods=["POST"])
+def meeting_update(meeting_id):
+    """Correct the protocol date and kind. Tasks keep their own dates; only the protocol record changes."""
+    m = db().execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone() or abort(404)
+    try:
+        day = dt.date.fromisoformat(request.form.get("meeting_date", "")).isoformat()
+    except ValueError:
+        day = m["meeting_date"]
+    kind = request.form.get("kind") or m["kind"]
+    db().execute("UPDATE meetings SET meeting_date=?, kind=? WHERE id=?", (day, kind, meeting_id))
+    db().commit()
+    return redirect(url_for("site_audit", site_id=m["site_id"]))
+
+
+@app.route("/meetings/<int:meeting_id>/delete", methods=["POST"])
+def meeting_delete(meeting_id):
+    """Delete a protocol and the tasks that came only from it (with what was recorded against them)."""
+    m = db().execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone() or abort(404)
+    if request.form.get("confirm") != "מחק":
+        abort(400)
+    d = db()
+    task_ids = [r[0] for r in d.execute(
+        "SELECT DISTINCT task_id FROM task_occurrences WHERE meeting_id=?", (meeting_id,)).fetchall()]
+    d.execute("DELETE FROM task_occurrences WHERE meeting_id=?", (meeting_id,))
+    d.execute("DELETE FROM task_targets WHERE meeting_id=?", (meeting_id,))
+    d.execute("DELETE FROM task_closure_pending WHERE meeting_id=?", (meeting_id,))
+    d.execute("DELETE FROM admin_queue WHERE meeting_id=?", (meeting_id,))
+    for tid in task_ids:
+        if d.execute("SELECT 1 FROM task_occurrences WHERE task_id=?", (tid,)).fetchone() is None:
+            for table in ("task_status_log", "task_comments", "task_docs", "task_links", "task_assignments"):
+                d.execute(f"DELETE FROM {table} WHERE task_id=?", (tid,))
+            d.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    d.execute("DELETE FROM meetings WHERE id=?", (meeting_id,))
+    d.commit()
+    return redirect(url_for("site_audit", site_id=m["site_id"]))
 
 
 @app.route("/tasks/<int:task_id>/closure/<action>", methods=["POST"])
