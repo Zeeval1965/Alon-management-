@@ -2209,7 +2209,7 @@ dialog{border:1px solid var(--gray-line);border-radius:8px;padding:16px;box-shad
 main{flex:1;min-width:0}
 @media (max-width:640px){header{padding:8px 10px;display:flex;align-items:center;flex-wrap:nowrap;gap:10px}header b{font-size:15px;white-space:nowrap}header a{margin-left:0;font-size:13px;white-space:nowrap}header{overflow-x:auto}html,body{max-width:100vw;overflow-x:hidden}.shell{flex-direction:column;width:100%;min-width:0}.shell>main{min-width:0;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.side{flex:none;min-height:0;display:flex;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;padding:6px 8px;gap:4px;-webkit-overflow-scrolling:touch}.side a{padding:7px 12px;font-size:14px;flex:0 0 auto;border-radius:16px;background:#fff;border:1px solid #E0E0E0}.side a.on,.side a[aria-current]{background:var(--red);color:#fff;border-color:var(--red)}.side-title,.side-sep{display:none}}
 </style></head><body>
-<header><b>הלל הזקן 14</b>
+<header><b>{{ brand }}</b>
 {% if home_url %}<a href="{{ home_url }}">לוח בקרה</a>{% endif %}<a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
 <div class="shell">{% if side or side_admin %}<aside class="side">{% if side_title %}<div class="side-title">{{ side_title }}</div>{% endif %}
 {% for it in side %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}
@@ -2314,8 +2314,10 @@ def _side_menu():
 
 
 def page(title, body, **ctx):
+    site = ctx.get("s")
+    brand = site["name"] if site is not None and "name" in site.keys() else "קבוצת הכרם"
     return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
-                                  url_for=url_for, get_flashed_messages=lambda: [], **_side_menu())
+                                  url_for=url_for, get_flashed_messages=lambda: [], brand=brand, **_side_menu())
 
 
 @app.route("/")
