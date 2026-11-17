@@ -2719,6 +2719,23 @@ def _dmy(iso):
         return iso or ""
 
 
+def construction_months_strip(land_iso, total):
+    """One cell per construction month: 'done', 'cur' (this month) or 'future'. Empty if not computable."""
+    try:
+        land = dt.date.fromisoformat(land_iso)
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return []
+    if total <= 0:
+        return []
+    today = dt.date.today()
+    idx = (today.year * 12 + today.month - 1) - (land.year * 12 + land.month - 1)
+    out = []
+    for i in range(total):
+        out.append("done" if i < idx else "cur" if i == idx else "future")
+    return out
+
+
 def construction_schedule(land_iso, total):
     """Last construction month (from the land date and the contract's month count) and the
     construction month we are in today, counting the land month as month 1."""
@@ -2806,6 +2823,13 @@ def site_view(site_id):
     topic_rows = [{"name": n, "n": c, "w": round(100 * c / topic_top)} for n, c in topic_counts]
     return page(s["name"], """
 {% if is_admin %}<form method="post" action="{{ url_for('site_guest_link', site_id=s['id']) }}" style="margin:6px 0"><button>קישור צפייה ללא סיסמה לשעה</button></form>{% endif %}
+<form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
+שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
+יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
+<button>שמירה</button></form>
+<p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
+{% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a></p>
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0">
 <a class="kpi warn" href="{{ url_for('site_view', site_id=s['id'], sort='target') }}" style="border:1px solid #c62828"><b data-live="late" style="color:#c62828">{{ kp.late }}</b><span>משימות באיחור</span></a>
@@ -2863,15 +2887,9 @@ def site_view(site_id):
   setInterval(tick, 60000);
 })();
 </script>
-<style>.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
+<style>.mstrip{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 10px}.mcell{width:16px;height:16px;border-radius:4px;background:#E0E0E0;display:inline-block}.mcell.done{background:#2a9d4b}.mcell.cur{background:#c62828;box-shadow:0 0 0 3px rgba(198,40,40,.25);animation:livepulse 1.2s infinite}.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
 <h3>התפלגות סטטוסים</h3>
 <div>{% for r in status_rows %}<div class="brow"><span class="lbl"><span class="pill {{ sclass.get(r.name, '') }}">{{ r.name }}</span></span><span class="track"><span class="fill" style="width:{{ r.w }}%"></span></span><span class="n">{{ r.n }}</span></div>{% endfor %}</div>
-<form method="post" action="{{ url_for('site_schedule', site_id=s['id']) }}">
-שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
-יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
-<button>שמירה</button></form>
-<p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
 <option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
@@ -2897,7 +2915,7 @@ def site_view(site_id):
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
-        land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']),
+        land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']), months_strip=construction_months_strip(s['land_date'], s['months_total']),
         month_txt=construction_schedule(s["land_date"], s["months_total"])[1],
         end_txt=construction_schedule(s["land_date"], s["months_total"])[0] or "לא נקבע",
         latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
