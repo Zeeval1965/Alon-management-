@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS item_types (name TEXT PRIMARY KEY, sort INTEGER DEFAU
 CREATE TABLE IF NOT EXISTS task_comments (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, contact_id INTEGER, text TEXT NOT NULL, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_images (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, meeting_id INTEGER, site_id INTEGER,
+  file TEXT NOT NULL, topic TEXT, created_at TEXT, UNIQUE(task_id, file)
+);
 CREATE TABLE IF NOT EXISTS task_docs (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, name TEXT NOT NULL, created_at TEXT
 );
@@ -503,6 +507,11 @@ def publish_meeting(meeting_id):
             "INSERT INTO task_occurrences(task_id, meeting_id, number, topic, text, target, created_at) VALUES (?,?,?,?,?,?,?)",
             (task_id, meeting_id, number, r.get("topic"), r.get("task"), r.get("target"),
              dt.datetime.now().isoformat(timespec="minutes")))
+        for name in r.get("images") or []:
+            db().execute(
+                "INSERT OR IGNORE INTO task_images(task_id, meeting_id, site_id, file, topic, created_at) VALUES (?,?,?,?,?,?)",
+                (task_id, meeting_id, site_id, name, (r.get("topic") or "").strip() or "ללא נושא",
+                 dt.datetime.now().isoformat(timespec="minutes")))
         if done_here:
             db().execute("UPDATE tasks SET status='בוצע', closed_at=? WHERE id=?", (dt.date.today().isoformat(), task_id))
         published.append(task_id)
@@ -844,7 +853,7 @@ SECTION_OF = {
     "site_view": "tasks", "site_live": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "meeting_update": "protocols", "meeting_delete": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "meeting_update": "protocols", "meeting_delete": "protocols", "protocol_image": "protocols", "site_images": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -1813,12 +1822,13 @@ def meeting_delete(meeting_id):
     task_ids = [r[0] for r in d.execute(
         "SELECT DISTINCT task_id FROM task_occurrences WHERE meeting_id=?", (meeting_id,)).fetchall()]
     d.execute("DELETE FROM task_occurrences WHERE meeting_id=?", (meeting_id,))
+    d.execute("DELETE FROM task_images WHERE meeting_id=?", (meeting_id,))
     d.execute("DELETE FROM task_targets WHERE meeting_id=?", (meeting_id,))
     d.execute("DELETE FROM task_closure_pending WHERE meeting_id=?", (meeting_id,))
     d.execute("DELETE FROM admin_queue WHERE meeting_id=?", (meeting_id,))
     for tid in task_ids:
         if d.execute("SELECT 1 FROM task_occurrences WHERE task_id=?", (tid,)).fetchone() is None:
-            for table in ("task_status_log", "task_comments", "task_docs", "task_links", "task_assignments"):
+            for table in ("task_status_log", "task_comments", "task_docs", "task_links", "task_assignments", "task_images"):
                 d.execute(f"DELETE FROM {table} WHERE task_id=?", (tid,))
             d.execute("DELETE FROM tasks WHERE id=?", (tid,))
     d.execute("DELETE FROM meetings WHERE id=?", (meeting_id,))
@@ -2903,7 +2913,7 @@ def reset_site_protocols(site_id):
     d = db()
     task_ids = [r[0] for r in d.execute("SELECT id FROM tasks WHERE site_id=?", (site_id,)).fetchall()]
     for table in ("task_status_log", "task_comments", "task_docs", "task_links", "task_assignments",
-                  "task_closure_pending", "task_targets", "task_occurrences"):
+                  "task_closure_pending", "task_targets", "task_occurrences", "task_images"):
         for tid in task_ids:
             d.execute(f"DELETE FROM {table} WHERE task_id=?", (tid,))
     d.execute("DELETE FROM admin_queue WHERE site_id=?", (site_id,))
@@ -2975,7 +2985,7 @@ def site_protocols(site_id):
     return page("מאגר פרוטוקולים - " + s["name"], """
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 <p>
-<a href="{{ url_for('site_protocols', site_id=s['id'], sort=sort) }}" {% if not this_month %}style="font-weight:bold"{% endif %}>כל הפרוטוקולים</a> ·
+<a href="{{ url_for('site_protocols', site_id=s['id'], sort=sort) }}" {% if not this_month %}style="font-weight:bold"{% endif %}>כל הפרוטוקולים</a> · <a href="{{ url_for('site_images', site_id=s['id']) }}">תמונות לפי נושא</a> ·
 <a href="{{ url_for('site_protocols', site_id=s['id'], sort=sort, month='current') }}" {% if this_month %}style="font-weight:bold"{% endif %}>החודש</a>
 </p>
 <form method="get" style="margin-bottom:8px">{% if this_month %}<input type="hidden" name="month" value="current">{% endif %}
@@ -3029,7 +3039,7 @@ def meeting_upload(site_id):
                 continue
             tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
             f.save(tmp.name)
-            rows = extract_rows(tmp.name)
+            rows = extract_rows(tmp.name, image_dir=os.path.join(UPLOAD_DIR, "protocol_images", str(site_id)))
             # a page with no date of its own takes the date written in the file name
             named = date_from_filename(f.filename)
             for r in rows:
@@ -3054,6 +3064,36 @@ def meeting_upload(site_id):
 <input type="file" name="file" accept=".pdf" multiple required> <button>העלאה לבדיקה</button></form>""", url_for=url_for, active=1, step_names=PROTOCOL_STEPS)
 
 
+@app.route("/protocol-images/<int:site_id>/<name>")
+def protocol_image(site_id, name):
+    if not re.fullmatch(r"[0-9a-f]{16}\.png", name):
+        abort(404)
+    return send_from_directory(os.path.join(UPLOAD_DIR, "protocol_images", str(site_id)), name)
+
+
+@app.route("/sites/<int:site_id>/images")
+def site_images(site_id):
+    """Pictures from the protocols, filed by topic. ?topic= shows one topic."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    topic = request.args.get("topic", "")
+    rows = db().execute(
+        """SELECT i.file, i.topic, i.task_id, i.meeting_id, t.public_no, t.text
+           FROM task_images i JOIN tasks t ON t.id = i.task_id
+           WHERE i.site_id=? ORDER BY i.topic, i.id""", (site_id,)).fetchall()
+    topics = sorted({r["topic"] for r in rows})
+    shown = [r for r in rows if not topic or r["topic"] == topic]
+    return page("תמונות מהפרוטוקולים - " + s["name"], """
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
+<p>נושאים: <a href="{{ url_for('site_images', site_id=s['id']) }}">הכול</a>
+{% for t in topics %} · <a href="{{ url_for('site_images', site_id=s['id'], topic=t) }}">{{ t }}</a>{% endfor %}</p>
+<div style="display:flex;flex-wrap:wrap;gap:10px">
+{% for r in shown %}<figure style="margin:0;width:200px">
+<a href="{{ url_for('protocol_image', site_id=s['id'], name=r['file']) }}" target="_blank"><img src="{{ url_for('protocol_image', site_id=s['id'], name=r['file']) }}" style="width:200px;border:1px solid #ddd"></a>
+<figcaption style="font-size:12px">{{ r['topic'] }} · {{ r['public_no']|pubno }}<br><a href="{{ url_for('meeting_view', meeting_id=r['meeting_id']) }}">הפרוטוקול</a></figcaption></figure>
+{% else %}<p>אין תמונות{% if topic %} בנושא זה{% endif %}.</p>{% endfor %}
+</div>""", s=s, topics=topics, shown=shown)
+
+
 @app.route("/meetings/<int:meeting_id>/view")
 def meeting_view(meeting_id):
     """A published protocol as it was written: its own rows, with the status each task has today."""
@@ -3066,18 +3106,21 @@ def meeting_view(meeting_id):
         date_txt = dt.date.fromisoformat(m["meeting_date"]).strftime("%d.%m.%Y")
     except (TypeError, ValueError):
         date_txt = "לא זוהה"
+    pics = {}
+    for pr in db().execute("SELECT task_id, file FROM task_images WHERE meeting_id=? ORDER BY id", (meeting_id,)).fetchall():
+        pics.setdefault(pr["task_id"], []).append(pr["file"])
     return page(f"פרוטוקול {date_txt}", """
 <p><a href="{{ url_for('site_protocols', site_id=m['site_id']) }}">חזרה למאגר הפרוטוקולים</a></p>
 <p>סוג: {{ m['kind'] }} · תאריך: {{ date_txt }} · קובץ: {{ m['source_name'] or '' }}</p>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס היום</th></tr>
 {% for r in rows %}<tr><td data-label="#">{{ r['number'] }}</td><td data-label="נושא">{{ r['topic'] or '' }}</td>
-<td data-label="משימה" style="width:100%">{{ r['text'] }}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
+<td data-label="משימה" style="width:100%">{{ r['text'] }}{% for f in pics.get(r['task_id'], []) %} <a href="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" target="_blank"><img src="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" style="max-width:160px;max-height:110px;display:block;margin-top:4px;border:1px solid #ddd"></a>{% endfor %}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
 <td data-label="סטטוס היום"><span class="pill {{ sclass.get(r['status'], '') }}">{{ r['status'] }}</span>
 <form method="post" action="{{ url_for('task_status', task_id=r['task_id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in options %}<option {% if o == r['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>
 {% else %}<tr><td colspan="5">אין שורות בפרוטוקול זה</td></tr>{% endfor %}</table>""",
-        m=m, rows=rows, date_txt=date_txt, sclass=STATUS_CLASS, options=task_status_names())
+        m=m, rows=rows, date_txt=date_txt, sclass=STATUS_CLASS, options=task_status_names(), pics=pics)
 
 
 @app.route("/meetings/<int:meeting_id>/review", methods=["GET", "POST"])

@@ -1695,3 +1695,25 @@ class AuditActionsTests(AppTestCase):
         with A.app.app_context():
             row = A.db().execute("SELECT meeting_date, kind FROM meetings WHERE id=?", (mid,)).fetchone()
         self.assertEqual((row["meeting_date"], row["kind"]), ("2026-11-05", "שבועית"))
+
+
+class ProtocolPicturesTests(AppTestCase):
+    def test_pictures_are_stored_with_their_row_and_filed_by_topic(self):
+        c = self.login("admin@test")
+        c.post("/sites/1/meetings/new", data={"kind": "ביצוע", "file": (open("/home/claude/in/f1.pdf", "rb"), "f1.pdf")},
+               content_type="multipart/form-data")
+        with A.app.app_context():
+            ids = [r[0] for r in A.db().execute("SELECT id FROM meetings WHERE status='draft' ORDER BY meeting_date, id").fetchall()]
+        for mid in ids:
+            with A.app.app_context():
+                A.publish_meeting(mid)
+        with A.app.app_context():
+            n = A.db().execute("SELECT COUNT(*) FROM task_images").fetchone()[0]
+            f = A.db().execute("SELECT file, meeting_id FROM task_images LIMIT 1").fetchone()
+        self.assertGreaterEqual(n, 1)
+        view = c.get(f"/meetings/{f['meeting_id']}/view").get_data(as_text=True)
+        self.assertIn("/protocol-images/1/" + f["file"], view)
+        self.assertEqual(c.get("/sites/1/images").status_code, 200)
+        self.assertEqual(c.get("/sites/1/images?topic=ללא נושא").status_code, 200)
+        self.assertEqual(c.get("/protocol-images/1/" + f["file"]).status_code, 200)
+        self.assertEqual(c.get("/protocol-images/1/..%2Fx.png").status_code, 404)

@@ -4,7 +4,11 @@ The PDFs store Hebrew in visual order, so each cell is reversed back to
 logical order while ASCII/digit runs (dates, numbers, Latin words) keep
 their own direction.
 """
+import hashlib
+import io
+import os
 import re
+
 import pdfplumber
 
 _ASCII_RUN = re.compile(r"[0-9A-Za-z][0-9A-Za-z./:%'\"\-]*")
@@ -72,15 +76,51 @@ def meeting_date_of_page(page):
     return None
 
 
-def extract_rows(pdf_path):
-    """Return list of dicts: number, topic, task, assignee, update, target, meeting_date."""
+def _row_for_box(placed, box):
+    """Index of the protocol row an image belongs to: the row that contains it, else the nearest one."""
+    cx, cy = (box["x0"] + box["x1"]) / 2, (box["top"] + box["bottom"]) / 2
+    best = None
+    for idx, bbox in placed:
+        if bbox is None:
+            continue
+        x0, top, x1, bottom = bbox
+        if x0 <= cx <= x1 and top <= cy <= bottom:
+            return idx
+        dist = min(abs(cy - top), abs(cy - bottom))
+        if best is None or dist < best[0]:
+            best = (dist, idx)
+    return best[1] if best else None
+
+
+def _save_crop(page, box, image_dir):
+    """Render one image area of the page to a PNG file named by its content; returns the file name."""
+    bbox = (max(0, box["x0"]), max(0, box["top"]), min(page.width, box["x1"]), min(page.height, box["bottom"]))
+    pil = page.crop(bbox).to_image(resolution=120).original
+    buf = io.BytesIO()
+    pil.save(buf, "PNG")
+    data = buf.getvalue()
+    name = hashlib.sha1(data).hexdigest()[:16] + ".png"
+    os.makedirs(image_dir, exist_ok=True)
+    path = os.path.join(image_dir, name)
+    if not os.path.exists(path):
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return name
+
+
+def extract_rows(pdf_path, image_dir=None):
+    """Return list of dicts: number, topic, task, assignee, update, target, meeting_date.
+    With image_dir, each row also gets 'images': file names of the pictures placed in its area."""
     rows = []
+    pictures = []  # (row index, file name, page number)
     with pdfplumber.open(pdf_path) as pdf:
         current_date = None
         for page in pdf.pages:
             current_date = meeting_date_of_page(page) or current_date
-            for table in page.extract_tables():
-                for cells in table:
+            placed = []  # (row index, bbox of the row on this page)
+            for table in page.find_tables():
+                data = table.extract() or []
+                for i, cells in enumerate(data):
                     if not cells or _is_header(cells):
                         continue
                     if len(cells) < 6:
@@ -101,6 +141,29 @@ def extract_rows(pdf_path):
                     row["subject"] = subject_of(task)
                     row["flags"] = flags_of(row)
                     rows.append(row)
+                    bbox = table.rows[i].bbox if i < len(table.rows) else None
+                    placed.append((len(rows) - 1, bbox))
+            if image_dir and placed:
+                for box in page.images:
+                    if box["x1"] - box["x0"] < 60 or box["bottom"] - box["top"] < 60:
+                        continue  # logos, stamps and icons are not protocol pictures
+                    if box["top"] < 80:
+                        continue  # page header
+                    idx = _row_for_box(placed, box)
+                    if idx is None:
+                        continue
+                    pictures.append((idx, _save_crop(page, box, image_dir), page.page_number))
+    # a picture repeated on several pages is a logo or a template picture, not content
+    pages_of = {}
+    for _, name, pno in pictures:
+        pages_of.setdefault(name, set()).add(pno)
+    for idx, name, _ in pictures:
+        if len(pages_of[name]) <= 2:
+            rows[idx].setdefault("images", [])
+            if name not in rows[idx]["images"]:
+                rows[idx]["images"].append(name)
+    for r in rows:
+        r.setdefault("images", [])
     return rows
 
 
