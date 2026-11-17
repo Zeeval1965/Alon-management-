@@ -2210,9 +2210,10 @@ main{flex:1;min-width:0}
 @media (max-width:640px){header{padding:8px 10px;display:flex;align-items:center;flex-wrap:nowrap;gap:10px}header b{font-size:15px;white-space:nowrap}header a{margin-left:0;font-size:13px;white-space:nowrap}header{overflow-x:auto}html,body{max-width:100vw;overflow-x:hidden}.shell{flex-direction:column;width:100%;min-width:0}.shell>main{min-width:0;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}.side{flex:none;min-height:0;display:flex;flex-wrap:nowrap;overflow-x:auto;white-space:nowrap;padding:6px 8px;gap:4px;-webkit-overflow-scrolling:touch}.side a{padding:7px 12px;font-size:14px;flex:0 0 auto;border-radius:16px;background:#fff;border:1px solid #E0E0E0}.side a.on,.side a[aria-current]{background:var(--red);color:#fff;border-color:var(--red)}.side-title,.side-sep{display:none}}
 </style></head><body>
 <header><b>{{ brand }}</b>
-{% if home_url %}<a href="{{ home_url }}">לוח בקרה</a>{% endif %}<a href="{{ url_for('sites') }}">אתרים</a><a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a></header>
+{% if home_url %}<a href="{{ home_url }}">לוח בקרה</a>{% endif %}<a href="{{ url_for('sites') }}">אתרים</a>{% if can_import %}<a href="{{ url_for('contacts_import') }}">ייבוא אנשי קשר</a>{% endif %}</header>
+{% if crumbs %}<nav class="crumbs">{% for c in crumbs %}{% if not loop.last and c[1] %}<a href="{{ c[1] }}">{{ c[0] }}</a> › {% else %}<b>{{ c[0] }}</b>{% endif %}{% endfor %}</nav>{% endif %}
 <div class="shell">{% if side or side_admin %}<aside class="side">{% if side_title %}<div class="side-title">{{ side_title }}</div>{% endif %}
-{% for it in side %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}
+{% for g in side_groups %}<div class="side-title">{{ g['name'] }}</div>{% for it in g['items'] %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}{% endfor %}
 {% if side_admin %}<div class="side-sep"></div>{% for it in side_admin %}<a href="{{ it['url'] }}" class="{{ 'on' if it['on'] else '' }}">{{ it['label'] }}</a>{% endfor %}{% endif %}
 </aside>{% endif %}
 <main><h2>{{ title }}</h2>
@@ -2264,16 +2265,18 @@ main{flex:1;min-width:0}
 
 
 SIDE_SITE_ITEMS = [
-    ("לוח בקרה", "site_view", "tasks"),
-    ("משימות וחיפוש", "site_search", "tasks"),
-    ("ללא שיוך", "site_warnings", "tasks"),
-    ("שיוך משימות", "assignments", "tasks"),
-    ("אנשי קשר של הפרויקט", "site_contacts", "tasks"),
-    ("שליחת קישורי עדכון", "site_send_links", "tasks"),
-    ("להדפסה", "site_print", "tasks"),
-    ("מאגר פרוטוקולים", "site_protocols", "protocols"),
-    ("העלאת פרוטוקול", "meeting_upload", "protocols"),
-    ("ביקורת פרוטוקולים", "site_audit", "protocols"),
+    ("משימות", "לוח בקרה", "site_view", "tasks"),
+    ("משימות", "משימות וחיפוש", "site_search", "tasks"),
+    ("משימות", "ללא שיוך", "site_warnings", "tasks"),
+    ("משימות", "שיוך משימות", "assignments", "tasks"),
+    ("פרוטוקולים", "מאגר פרוטוקולים", "site_protocols", "protocols"),
+    ("פרוטוקולים", "העלאת פרוטוקול", "meeting_upload", "protocols"),
+    ("פרוטוקולים", "תמונות לפי נושא", "site_images", "protocols"),
+    ("פרוטוקולים", "ביקורת פרוטוקולים", "site_audit", "protocols"),
+    ("אנשים ודוחות", "אנשי קשר של הפרויקט", "site_contacts", "tasks"),
+    ("אנשים ודוחות", "שליחת קישורי עדכון", "site_send_links", "tasks"),
+    ("אנשים ודוחות", "התרעות לתיקון", "site_warnings", "tasks"),
+    ("אנשים ודוחות", "להדפסה", "site_print", "tasks"),
 ]
 
 
@@ -2294,9 +2297,11 @@ def _side_menu():
             if not me["is_admin"]:
                 for role in roles_on_site(me, site_id):
                     sections |= role_sections(role)
-            for label, endpoint, section in SIDE_SITE_ITEMS:
-                if me["is_admin"] or section in sections:
-                    side.append({"label": label, "url": url_for(endpoint, site_id=site_id),
+            seen_labels = set()
+            for group, label, endpoint, section in SIDE_SITE_ITEMS:
+                if (me["is_admin"] or section in sections) and label not in seen_labels:
+                    seen_labels.add(label)
+                    side.append({"group": group, "label": label, "url": url_for(endpoint, site_id=site_id),
                                  "on": request.endpoint == endpoint})
     admin = []
     if me["is_admin"]:
@@ -2310,14 +2315,30 @@ def _side_menu():
         first = db().execute("SELECT id FROM sites ORDER BY id LIMIT 1").fetchone()
         if first is not None:
             home_url = url_for("site_view", site_id=first["id"])
-    return {"side": side, "side_admin": admin, "side_title": title, "home_url": home_url}
+    groups = []
+    for it in side:
+        if not groups or groups[-1]["name"] != it["group"]:
+            groups.append({"name": it["group"], "items": []})
+        groups[-1]["items"].append(it)
+    can_import = bool(me and (me["is_admin"] or is_manager(me)))
+    return {"side": side, "side_groups": groups, "side_admin": admin, "side_title": title, "home_url": home_url,
+            "can_import": can_import}
 
 
 def page(title, body, **ctx):
     site = ctx.get("s")
     brand = site["name"] if site is not None and "name" in site.keys() else "קבוצת הכרם"
+    crumbs = [("אתרים", url_for("sites"))]
+    sid = (request.view_args or {}).get("site_id") if has_request_context() else None
+    if sid is not None:
+        row = db().execute("SELECT id, name FROM sites WHERE id=?", (sid,)).fetchone()
+        if row is not None:
+            crumbs.append((row["name"], url_for("site_view", site_id=row["id"])))
+    if title and title != crumbs[-1][0]:
+        crumbs.append((title, None))
     return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
-                                  url_for=url_for, get_flashed_messages=get_flashed_messages, brand=brand, **_side_menu())
+                                  url_for=url_for, get_flashed_messages=get_flashed_messages, brand=brand,
+                                  crumbs=crumbs, **_side_menu())
 
 
 @app.route("/")
@@ -2829,7 +2850,7 @@ def site_view(site_id):
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 {% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a> · <a href="{{ url_for('site_images', site_id=s['id']) }}">תמונות לפי נושא</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a></p>
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0">
 <a class="kpi warn" href="{{ url_for('site_view', site_id=s['id'], sort='target') }}" style="border:1px solid #c62828"><b data-live="late" style="color:#c62828">{{ kp.late }}</b><span>משימות באיחור</span></a>
@@ -2887,7 +2908,7 @@ def site_view(site_id):
   setInterval(tick, 60000);
 })();
 </script>
-<style>.mstrip{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 10px}.mcell{width:16px;height:16px;border-radius:4px;background:#E0E0E0;display:inline-block}.mcell.done{background:#2a9d4b}.mcell.cur{background:#c62828;box-shadow:0 0 0 3px rgba(198,40,40,.25);animation:livepulse 1.2s infinite}.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
+<style>.crumbs{font-size:13px;color:#6B6B6B;padding:6px 12px;background:#fff}.crumbs a{color:#1565c0}.mstrip{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 10px}.mcell{width:16px;height:16px;border-radius:4px;background:#E0E0E0;display:inline-block}.mcell.done{background:#2a9d4b}.mcell.cur{background:#c62828;box-shadow:0 0 0 3px rgba(198,40,40,.25);animation:livepulse 1.2s infinite}.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
 <h3>התפלגות סטטוסים</h3>
 <div>{% for r in status_rows %}<div class="brow"><span class="lbl"><span class="pill {{ sclass.get(r.name, '') }}">{{ r.name }}</span></span><span class="track"><span class="fill" style="width:{{ r.w }}%"></span></span><span class="n">{{ r.n }}</span></div>{% endfor %}</div>
 <h3>משימות פתוחות</h3>
