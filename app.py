@@ -2750,10 +2750,42 @@ def site_view(site_id):
     top = max(counts.values(), default=1)
     status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
     site_image = next((url_for("static", filename=f) for k, f in SITE_IMAGES.items() if k in s["name"]), None)
+    open_names = task_status_names("open")
+    open_now = [t for t in tasks if t["status"] in open_names]
+
+    def age_days(t):
+        try:
+            return (dt.date.today() - dt.date.fromisoformat((t["created_at"] or "")[:10])).days
+        except ValueError:
+            return 0
+    aged_list = sorted([t for t in open_now if age_days(t) > 90], key=lambda t: -age_days(t))[:4]
+    aged_rows = [{"t": t, "days": age_days(t)} for t in aged_list]
+    topic_counts = Counter((t["topic"] or "ללא נושא") for t in open_now).most_common(5)
+    top_topics = [name for name, _ in topic_counts[:3]]
+    topic_top = max((c for _, c in topic_counts), default=1)
+    topic_rows = [{"name": n, "n": c, "w": round(100 * c / topic_top)} for n, c in topic_counts]
     return page(s["name"], """
 {% if is_admin %}<form method="post" action="{{ url_for('site_guest_link', site_id=s['id']) }}" style="margin:6px 0"><button>קישור צפייה ללא סיסמה לשעה</button></form>{% endif %}
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
-<div class="kpis">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0">
+<a class="kpi warn" href="{{ url_for('site_view', site_id=s['id'], sort='target') }}" style="border:1px solid #c62828"><b data-live="late" style="color:#c62828">{{ kp.late }}</b><span>משימות באיחור</span></a>
+<a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='aged') }}"><b data-live="aged_over_30">{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b data-live="open">{{ kp.open }}</b><span>סה"כ משימות פתוחות</span></a>
+<a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='done') }}"><b data-live="closed">{{ kp.closed }}</b><span>נסגרו</span></a>
+</div>
+<p class="note">ממתינות לאישור: <a href="{{ url_for('site_search', site_id=s['id'], view='awaiting') }}">{{ kp.awaiting_approval }}</a> · חזרו בפרוטוקולים: <a href="{{ url_for('site_search', site_id=s['id'], view='repeat2') }}">{{ kp.repeats_open }}</a> · אחוז סגירה: {{ pct }}%</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin:8px 0">
+<div class="kpi" style="text-align:right"><b style="font-size:16px">משימות ישנות ופתוחות (מעל 90 יום)</b>
+{% for a in aged_rows %}<div style="padding:6px 0;border-top:1px solid #eee"><span style="color:#c62828;font-weight:700">{{ a.days }} יום</span> · {{ a.t['text'][:90] }}</div>{% else %}<div>אין משימות ישנות.</div>{% endfor %}
+<p class="note"><a href="{{ url_for('site_search', site_id=s['id'], view='aged') }}">לרשימה המלאה</a></p></div>
+<div class="kpi" style="text-align:right"><b style="font-size:16px">נושאים מעכבים (הכי הרבה פתוחים)</b>
+{% for t in topic_rows %}<div style="display:flex;gap:8px;align-items:center;padding:4px 0"><b style="width:36px;color:#c62828">{{ t.n }}</b><span style="flex:1;background:#eee;height:10px;border-radius:5px"><span style="display:block;height:10px;border-radius:5px;background:#e57373;width:{{ t.w }}%"></span></span><span style="min-width:90px">{{ t.name }}</span></div>{% else %}<div>אין משימות פתוחות.</div>{% endfor %}</div>
+<div class="kpi" style="text-align:right"><b style="font-size:16px">סיכום והמלצות לפעולה</b>
+<div style="padding:6px 0"><span style="color:#c62828;font-weight:700">{{ kp.late }}</span> משימות באיחור – נדרש טיפול מיידי מול האחראים</div>
+<div style="padding:6px 0"><span style="color:#c62828;font-weight:700">{{ kp.aged_over_30 }}</span> משימות פתוחות מעל 30 יום – מומלץ ישיבת סטטוס ממוקדת</div>
+<div style="padding:6px 0">נושאים מרכזיים מעכבים: {{ top_topics|join(', ') or 'אין' }}</div></div>
+</div>
+<div class="kpis" style="display:none">
 <a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b data-live="open">{{ kp.open }}</b><span>משימות פתוחות</span></a>
 <a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='awaiting') }}"><b data-live="awaiting_approval">{{ kp.awaiting_approval }}</b><span>ממתינות לאישור</span></a>
 <a class="kpi warn" href="{{ url_for('site_search', site_id=s['id'], view='aged') }}"><b data-live="aged_over_30">{{ kp.aged_over_30 }}</b><span>פתוחות מעל 30 יום</span></a>
@@ -2824,7 +2856,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"),
         latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
 

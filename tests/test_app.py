@@ -820,7 +820,7 @@ class OpenTasksSortTests(AppTestCase):
 
     def test_sort_by_topic_orders_open_tasks(self):
         html = self.login("sup@test").get("/sites/1?sort=topic").get_data(as_text=True)
-        self.assertLess(html.index(">א-נושא<"), html.index(">ת-נושא<"))
+        self.assertLess(html.index(">א-נושא</td>"), html.index(">ת-נושא</td>"))
 
     def test_sort_by_date_added_newest_first(self):
         with A.app.app_context():
