@@ -202,6 +202,9 @@ def init_db():
                  "ALTER TABLE outbox ADD COLUMN mode TEXT DEFAULT 'מיידי'",
                  "ALTER TABLE contacts ADD COLUMN password_hash TEXT",
                  "ALTER TABLE contacts ADD COLUMN is_admin INTEGER DEFAULT 0",
+                 "ALTER TABLE contacts ADD COLUMN is_guest INTEGER DEFAULT 0",
+                 "ALTER TABLE contacts ADD COLUMN guest_token_hash TEXT",
+                 "ALTER TABLE contacts ADD COLUMN expires_at TEXT",
                  "ALTER TABLE sites ADD COLUMN levels TEXT",
                  "ALTER TABLE sites ADD COLUMN stages TEXT",
                  "ALTER TABLE tasks ADD COLUMN created_at TEXT",
@@ -863,7 +866,7 @@ SECTION_OF = {
     "progress_view": "progress", "progress_save": "progress",
 }
 # task_link_view is open to anyone holding a valid link; it shows and changes only that one task
-PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view", "admin_site_delete_approve"}
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view", "admin_site_delete_approve", "guest_enter"}
 # contact import and editing: administrator and supervisors (deleting field values: administrator only)
 MANAGER_ENDPOINTS = {"contacts_import", "contacts_import_preview", "contacts_import_confirm", "contact_edit",
                      "contact_role_add", "contact_role_remove", "contact_delete"}
@@ -887,6 +890,10 @@ def current_contact():
         return None
     if "_me" not in g:
         g._me = db().execute("SELECT * FROM contacts WHERE id=?", (session["cid"],)).fetchone()
+        if g._me is not None and g._me["is_guest"]:
+            if not g._me["expires_at"] or g._me["expires_at"] < dt.datetime.now().isoformat(timespec="minutes"):
+                session.pop("cid", None)  # the guest window has closed
+                g._me = None
     return g._me
 
 
@@ -2744,6 +2751,7 @@ def site_view(site_id):
     status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
     site_image = next((url_for("static", filename=f) for k, f in SITE_IMAGES.items() if k in s["name"]), None)
     return page(s["name"], """
+{% if is_admin %}<form method="post" action="{{ url_for('site_guest_link', site_id=s['id']) }}" style="margin:6px 0"><button>קישור צפייה ללא סיסמה לשעה</button></form>{% endif %}
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div class="kpis">
 <a class="kpi" href="{{ url_for('site_search', site_id=s['id'], view='open') }}"><b data-live="open">{{ kp.open }}</b><span>משימות פתוחות</span></a>
@@ -2816,7 +2824,7 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         month_txt=(f"{month['month_current']} מתוך {s['months_total'] or month['month_total']}" if month else "לא נקבע"),
         latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
 
@@ -2920,6 +2928,38 @@ def reset_site_protocols(site_id):
     d.execute("DELETE FROM tasks WHERE site_id=?", (site_id,))
     d.execute("DELETE FROM meetings WHERE site_id=?", (site_id,))
     d.commit()
+
+
+@app.route("/sites/<int:site_id>/guest-link", methods=["POST"])
+def site_guest_link(site_id):
+    """Administrator only: a link that opens the site read-only, without a password, for one hour."""
+    if not current_contact() or not current_contact()["is_admin"]:
+        abort(403)
+    db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    token = secrets.token_urlsafe(24)
+    expires = (dt.datetime.now() + dt.timedelta(hours=1)).isoformat(timespec="minutes")
+    email = f"guest-{secrets.token_hex(6)}@guest.invalid"
+    cur = db().execute(
+        "INSERT INTO contacts(email, first_name, last_name, is_guest, guest_token_hash, expires_at) VALUES (?,?,?,?,?,?)",
+        (email, "אורח", "לשעה", 1, hashlib.sha256(token.encode()).hexdigest(), expires))
+    db().execute("INSERT INTO memberships(site_id, contact_id, site_role, permission) VALUES (?,?,?,?)",
+                 (site_id, cur.lastrowid, "בעלי דירות", "צפייה"))
+    db().commit()
+    link = url_for("guest_enter", token=token, _external=True)
+    return page("קישור גישה לשעה", """<p>הקישור פעיל עד {{ expires }} בלבד, לצפייה בלבד ללא סיסמה.</p>
+<p><input value="{{ link }}" readonly style="width:100%" onclick="this.select()"></p>
+<p><a href="{{ url_for('site_view', site_id=site_id) }}">חזרה לאתר</a></p>""", expires=expires.replace("T", " "), link=link, site_id=site_id)
+
+
+@app.route("/guest/<token>")
+def guest_enter(token):
+    h = hashlib.sha256(token.encode()).hexdigest()
+    row = db().execute("SELECT * FROM contacts WHERE is_guest=1 AND guest_token_hash=?", (h,)).fetchone()
+    if row is None or not row["expires_at"] or row["expires_at"] < dt.datetime.now().isoformat(timespec="minutes"):
+        return page("הקישור פג תוקף", "<p>הקישור אינו פעיל יותר. בקשו מהמנהל קישור חדש.</p>"), 410
+    session["cid"] = row["id"]
+    m = db().execute("SELECT site_id FROM memberships WHERE contact_id=? LIMIT 1", (row["id"],)).fetchone()
+    return redirect(url_for("site_view", site_id=m["site_id"]) if m else url_for("sites"))
 
 
 @app.route("/sites/<int:site_id>/protocols/reset", methods=["POST"])

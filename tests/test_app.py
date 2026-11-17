@@ -1717,3 +1717,20 @@ class ProtocolPicturesTests(AppTestCase):
         self.assertEqual(c.get("/sites/1/images?topic=ללא נושא").status_code, 200)
         self.assertEqual(c.get("/protocol-images/1/" + f["file"]).status_code, 200)
         self.assertEqual(c.get("/protocol-images/1/..%2Fx.png").status_code, 404)
+
+
+class GuestLinkTests(AppTestCase):
+    def test_guest_link_opens_site_read_only_and_expires(self):
+        c = self.login("admin@test")
+        html = c.post("/sites/1/guest-link").get_data(as_text=True)
+        token = html.split("/guest/", 1)[1].split('"', 1)[0]
+        g = A.app.test_client()
+        self.assertEqual(g.get("/sites/1").status_code, 302)
+        self.assertEqual(g.get(f"/guest/{token}").status_code, 302)
+        self.assertEqual(g.get("/sites/1").status_code, 200)
+        self.assertEqual(g.get("/sites/1/protocols").status_code, 403)
+        with A.app.app_context():
+            A.db().execute("UPDATE contacts SET expires_at='2000-01-01T00:00' WHERE is_guest=1")
+            A.db().commit()
+        g2 = A.app.test_client()
+        self.assertEqual(g2.get(f"/guest/{token}").status_code, 410)
