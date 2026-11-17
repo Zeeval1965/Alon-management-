@@ -2306,8 +2306,7 @@ def _side_menu():
     admin = []
     if me["is_admin"]:
         admin = [{"label": "ניהול כללי", "url": url_for("admin_overview"), "on": request.endpoint == "admin_overview"},
-                 {"label": "אתר חדש", "url": url_for("site_new"), "on": request.endpoint == "site_new"},
-                 {"label": "כל האתרים", "url": url_for("sites"), "on": request.endpoint == "sites"}]
+                 {"label": "אתר חדש", "url": url_for("site_new"), "on": request.endpoint == "site_new"}]
     home_url = ""
     if side:
         home_url = url_for("site_view", site_id=site_id)
@@ -2977,6 +2976,7 @@ def admin_overview():
         rows.append({"s": s_row, "kp": kp, "pct": round(100 * kp["closed"] / total) if total else 0, "meetings": meetings})
     users = db().execute("SELECT first_name, last_name, email FROM contacts WHERE password_hash IS NOT NULL ORDER BY email").fetchall()
     return page("ניהול כללי", """
+<p><a href="{{ url_for('sites') }}">כל האתרים</a></p>
 <p><a href="{{ url_for('site_new') }}">+ אתר חדש</a> · <a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
 <h3>אתרים</h3>
 <table class="cards"><tr><th>אתר</th><th>פתוחות</th><th>נסגרו</th><th>אחוז סגירה</th><th>פרוטוקולים שפורסמו</th><th>מחיקה</th></tr>
