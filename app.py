@@ -2320,11 +2320,18 @@ def page(title, body, **ctx):
 
 @app.route("/")
 def sites():
-    rows = db().execute("SELECT * FROM sites ORDER BY id").fetchall()
+    rows = []
+    for r in db().execute("SELECT * FROM sites ORDER BY id").fetchall():
+        d = dict(r)
+        end_txt = construction_schedule(d["land_date"], d["months_total"])[0]
+        d["land_shown"] = _dmy(d["land_date"])
+        d["delivery_shown"] = _dmy(d["delivery_date"]) if d["delivery_date"] else (
+            f"{end_txt} (מחושב)" if end_txt else "")
+        rows.append(d)
     return page("אתרים", """
 <p><a href="{{ url_for('site_new') }}">אתר חדש</a> · <a href="{{ url_for('admin_overview') }}">ניהול כללי</a></p>
 <table><tr><th>אתר</th><th>עלייה לקרקע</th><th>מסירה</th><th>חודשי ביצוע (חוזה)</th><th></th></tr>
-{% for s in rows %}<tr><td>{{ s['name'] }}</td><td>{{ s['land_date'] }}</td><td>{{ s['delivery_date'] }}</td>
+{% for s in rows %}<tr><td>{{ s['name'] }}</td><td>{{ s['land_shown'] }}</td><td>{{ s['delivery_shown'] }}</td>
 <td>{{ s['months_total'] }}</td><td><a href="{{ url_for('site_view', site_id=s['id']) }}">פתיחה</a></td></tr>{% endfor %}</table>
 """, rows=rows, url_for=url_for)
 
@@ -2861,7 +2868,7 @@ def site_view(site_id):
 שעת שליחה לסיכומים (ברירת מחדל לכל האתר) <input name="digest_time" value="{{ s['digest_time'] }}" size="5">
 יום לסיכום שבועי <select name="weekly_day">{% for d in weekdays %}<option {% if d == s['weekly_day'] %}selected{% endif %}>{{ d }}</option>{% endfor %}</select>
 <button>שמירה</button></form>
-<p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש סיום לפי חישוב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
+<p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('site_contacts', site_id=s['id']) }}">אנשי קשר של הפרויקט</a> · <a href="{{ url_for('site_warnings', site_id=s['id']) }}">התרעות לתיקון</a> · <a href="{{ url_for('site_search', site_id=s['id']) }}">חיפוש משימות</a> · <a href="{{ url_for('site_print', site_id=s['id']) }}">להדפסה</a> · <a href="{{ url_for('site_audit', site_id=s['id']) }}">ביקורת פרוטוקולים</a> · <a href="{{ url_for('site_send_links', site_id=s['id']) }}">שליחת קישורי עדכון</a> · <a href="{{ url_for('site_protocols', site_id=s['id']) }}">מאגר פרוטוקולים</a></p>
 <h3>משימות פתוחות</h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
