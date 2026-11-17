@@ -11,7 +11,7 @@ import uuid
 from collections import Counter
 
 import openpyxl
-from flask import has_request_context, Flask, abort, flash, g, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
+from flask import get_flashed_messages, has_request_context, Flask, abort, flash, g, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
 from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -2317,7 +2317,7 @@ def page(title, body, **ctx):
     site = ctx.get("s")
     brand = site["name"] if site is not None and "name" in site.keys() else "קבוצת הכרם"
     return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
-                                  url_for=url_for, get_flashed_messages=lambda: [], brand=brand, **_side_menu())
+                                  url_for=url_for, get_flashed_messages=get_flashed_messages, brand=brand, **_side_menu())
 
 
 @app.route("/")
@@ -2580,7 +2580,7 @@ def contacts_import():
     return page("ייבוא אנשי קשר", """
 <form method="post" action="{{ url_for('contacts_import_preview') }}" enctype="multipart/form-data">
 <p><label>אתר: <select name="site_id" required>
-{% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
+<option value="" disabled selected>בחר אתר</option>{% for s in sites %}<option value="{{ s['id'] }}">{{ s['name'] }}</option>{% endfor %}</select></label></p>
 <p><input type="file" name="file" accept=".xlsx" required></p>
 <button>בדיקה לפני ייבוא</button></form>
 <p class="note">התפקיד במערכת נלקח מעמודת "תפקיד" (או "סוג") בכל שורה: יזם, נציגות, בעלי דירות, יועצים, מפקח, קבלן. בשלב הבדיקה תראה מה ייובא ומה דורש תיקון, ורק אחרי אישור הייבוא יתבצע.</p>""",
