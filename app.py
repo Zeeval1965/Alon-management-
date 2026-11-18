@@ -1545,7 +1545,7 @@ def assignments(site_id):
 <p class="note">הקישור נעשה לפי שם שמופיע בעמודת 'לטיפול'. המפקח מאשר כל שיוך לפני שהוא נכנס לתור ההודעות.
 בכל משימה יש אדם אחד אחראי לביצוע, והאחרים מקבלים גישה לצפייה בלבד.</p>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>טקסט בפרוטוקול</th><th>הציע</th><th>איש קשר</th><th>תפקיד בשיוך</th><th>פעולה</th></tr>
-{% for r in rows %}<tr><td>{{ r['public_no']|pubno }}</td><td style="min-width:260px">{{ r['topic'] or '' }}: {{ r['text'] }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
+{% for r in rows %}<tr><td>{{ r['public_no']|pubno }}</td><td style="min-width:260px">{{ r['topic'] or '' }}: {{ r['text'] }}{{ pic_mark(r['id']) }}</td><td>{{ r['assignee_text'] }}</td><td>{{ r['raw_name'] }}</td>
 <td><a href="{{ url_for('contact_card', site_id=site_id, contact_id=r['contact_id']) }}">{{ r['first_name'] }} {{ r['last_name'] or '' }}</a> ({{ r['role'] or '' }}, {{ r['org'] or '' }})</td>
 <td>{% if not r['confirmed'] %}ממתין לאישור{% elif r['is_responsible'] %}אחראי לביצוע{% elif r['is_cc'] %}מכותב{% else %}לצפייה{% endif %}</td>
 <td>{% if not r['confirmed'] %}
@@ -2335,7 +2335,17 @@ def page(title, body, **ctx):
             crumbs.append((row["name"], url_for("site_view", site_id=row["id"])))
     if title and title != crumbs[-1][0]:
         crumbs.append((title, None))
-    return render_template_string(PAGE, title=title, body=render_template_string(body, **ctx),
+    pic_ids = set()
+    if sid is not None:
+        pic_ids = {r[0] for r in db().execute("SELECT DISTINCT task_id FROM task_images WHERE site_id=?", (sid,)).fetchall()}
+
+    def pic_mark(task_id):
+        if sid is None or task_id not in pic_ids:
+            return ""
+        href = url_for("site_images", site_id=sid, task=task_id)
+        return Markup(f' <a href="{href}" title="יש תמונה שמורה למשימה" style="text-decoration:none">📷</a>')
+
+    return render_template_string(PAGE, title=title, body=render_template_string(body, pic_mark=pic_mark, **ctx),
                                   url_for=url_for, get_flashed_messages=get_flashed_messages, brand=brand,
                                   crumbs=crumbs, **_side_menu())
 
@@ -2881,7 +2891,7 @@ def site_view(site_id):
 <p class="note live-strip"><span class="live-dot"></span> חי · עודכן <span id="live-time">{{ now_txt }}</span> · מתרענן כל דקה</p>
 <h3>משימות מהפרוטוקול האחרון{% if latest_date %} · {{ latest_date }}{% endif %}</h3>
 {% if latest_tasks %}<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
-{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>
+{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option {% if o == t['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>{% endfor %}</table>
@@ -2921,7 +2931,7 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td>
@@ -2930,10 +2940,10 @@ def site_view(site_id):
 <input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>{% endfor %}</table>
 <h3>לידיעה</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in info_t %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
+{% for t in info_t %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% else %}<tr><td colspan="4">אין משימות לידיעה</td></tr>{% endfor %}</table>
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
-{% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
+{% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
 """, s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']), months_strip=construction_months_strip(s['land_date'], s['months_total']),
         month_txt=construction_schedule(s["land_date"], s["months_total"])[1],
@@ -3234,7 +3244,8 @@ def site_images(site_id):
            FROM task_images i JOIN tasks t ON t.id = i.task_id
            WHERE i.site_id=? ORDER BY i.topic, i.id""", (site_id,)).fetchall()
     topics = sorted({r["topic"] for r in rows})
-    shown = [r for r in rows if not topic or r["topic"] == topic]
+    task_f = request.args.get("task", "")
+    shown = [r for r in rows if (not topic or r["topic"] == topic) and (not task_f or str(r["task_id"]) == task_f)]
     return page("תמונות מהפרוטוקולים - " + s["name"], """
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 <p>נושאים: <a href="{{ url_for('site_images', site_id=s['id']) }}">הכול</a>
@@ -3267,7 +3278,7 @@ def meeting_view(meeting_id):
 <p>סוג: {{ m['kind'] }} · תאריך: {{ date_txt }} · קובץ: {{ m['source_name'] or '' }}</p>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס היום</th></tr>
 {% for r in rows %}<tr><td data-label="#">{{ r['number'] }}</td><td data-label="נושא">{{ r['topic'] or '' }}</td>
-<td data-label="משימה" style="width:100%">{{ r['text'] }}{% for f in pics.get(r['task_id'], []) %} <a href="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" target="_blank"><img src="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" style="max-width:160px;max-height:110px;display:block;margin-top:4px;border:1px solid #ddd"></a>{% endfor %}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
+<td data-label="משימה" style="width:100%">{{ r['text'] }}{{ pic_mark(r['task_id']) }}{% for f in pics.get(r['task_id'], []) %} <a href="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" target="_blank"><img src="{{ url_for('protocol_image', site_id=m['site_id'], name=f) }}" style="max-width:160px;max-height:110px;display:block;margin-top:4px;border:1px solid #ddd"></a>{% endfor %}</td><td data-label="יעד">{{ r['target'] or '' }}</td>
 <td data-label="סטטוס היום"><span class="pill {{ sclass.get(r['status'], '') }}">{{ r['status'] }}</span>
 <form method="post" action="{{ url_for('task_status', task_id=r['task_id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in options %}<option {% if o == r['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
