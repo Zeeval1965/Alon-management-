@@ -2051,11 +2051,14 @@ def site_warnings(site_id):
 {% for d in duplicates %}<tr><td>{{ d['name'] }}</td><td>{% for r in d['records'] %}{{ r['email'] if show_email else '' }} ({{ r['org'] }}: {{ r['roles']|join(', ') }})<br>{% endfor %}</td></tr>
 {% else %}<tr><td colspan="2">אין כפילויות</td></tr>{% endfor %}</table>
 <h3>לבדיקה: לא הופיעה בפרוטוקול המלא האחרון (לא נסגרה אוטומטית)</h3>
-<table><tr><th>משימה</th><th>תיאור</th><th>פעולה</th></tr>
-{% for c in closures %}<tr><td>{{ c['public_no']|pubno }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}</td>
-<td><form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="display:inline"><button>סגור כבוצע</button></form>
-<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="display:inline"><button>השאר פתוחה</button></form></td></tr>
-{% else %}<tr><td colspan="3">אין סגירות ממתינות</td></tr>{% endfor %}</table>
+<table><tr><th>משימה</th><th>תיאור</th></tr>
+{% for c in closures %}<tr><td>{{ c['public_no']|pubno }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}{{ pic_mark(c['id']) }}</td></tr>
+<tr><td colspan="2" style="background:#fafafa"><div style="display:flex;gap:8px;flex-wrap:wrap">
+<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="flex:1"><button style="width:100%">סגור כבוצע</button></form>
+<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="flex:1"><button style="width:100%">השאר פתוחה</button></form>
+<form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="flex:1"><button name="action" value="info" style="width:100%">מחיקה - לידיעה</button></form>
+</div></td></tr>
+{% else %}<tr><td colspan="2">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
 <table><tr><th>משימה</th><th>תיאור המשימה</th><th>הטקסט בפרוטוקול</th><th>איש קשר מוצע</th><th>ארגון</th></tr>
 {% for p in pending %}<tr><td>{{ p['public_no']|pubno }}</td><td style="min-width:260px">{{ p['topic'] or '' }}: {{ p['text'] }}</td>
