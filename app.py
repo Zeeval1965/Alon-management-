@@ -2053,10 +2053,11 @@ def site_warnings(site_id):
 <h3>לבדיקה: לא הופיעה בפרוטוקול המלא האחרון (לא נסגרה אוטומטית)</h3>
 <table><tr><th>משימה</th><th>תיאור</th></tr>
 {% for c in closures %}<tr><td>{{ c['public_no']|pubno }}</td><td>{{ c['topic'] or '' }}: {{ c['text'] }}{{ pic_mark(c['id']) }}</td></tr>
-<tr><td colspan="2" style="background:#fafafa"><div style="display:flex;gap:8px;flex-wrap:wrap">
-<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="flex:1"><button style="width:100%">סגור כבוצע</button></form>
-<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="flex:1"><button style="width:100%">השאר פתוחה</button></form>
-<form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="flex:1"><button name="action" value="info" style="width:100%">מחיקה - לידיעה</button></form>
+<tr><td colspan="2" style="background:#fafafa;padding:4px"><div style="display:flex;gap:6px;flex-wrap:wrap">
+<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="margin:0"><button>סגור כבוצע</button></form>
+<form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="margin:0"><button>השאר פתוחה</button></form>
+<form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="margin:0"><button name="action" value="info">לידיעה</button></form>
+<form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="margin:0"><button name="action" value="delete" onclick="if(this.dataset.armed){return true}this.dataset.armed=1;this.textContent='לחץ שוב לאישור מחיקה';return false">מחיקה</button></form>
 </div></td></tr>
 {% else %}<tr><td colspan="2">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
