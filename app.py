@@ -1305,21 +1305,21 @@ def _task_reply(task_id, redirect_to, message="", hide=False):
 
 @app.route("/tasks/<int:task_id>/triage", methods=["POST"])
 def task_triage(task_id):
-    """For a task with no one to assign: 'info' marks it for information only, 'delete' removes it."""
+    """For a task with no one to assign: 'info' marks it for information only, 'delete' cancels it (status בוטלה)."""
     t = db().execute("SELECT site_id FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
     action = request.form.get("action")
     if action == "info":
         db().execute("UPDATE tasks SET status='לידיעה' WHERE id=?", (task_id,))
         log_task_status(task_id, "לידיעה")
     elif action == "delete":
-        db().execute("DELETE FROM task_assignments WHERE task_id=?", (task_id,))
-        db().execute("DELETE FROM task_targets WHERE task_id=?", (task_id,))
-        db().execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        # Nothing is removed: the task is cancelled and hidden from open lists; search by status shows it.
+        db().execute("UPDATE tasks SET status='בוטלה' WHERE id=?", (task_id,))
+        log_task_status(task_id, "בוטלה")
     else:
         abort(400)
     db().commit()
     return _task_reply(task_id, url_for("site_warnings", site_id=t["site_id"]), hide=True,
-                       message="המשימה נמחקה." if action == "delete" else "המשימה סומנה לידיעה.")
+                       message="המשימה בוטלה." if action == "delete" else "המשימה סומנה לידיעה.")
 
 
 @app.route("/tasks/<int:task_id>/status", methods=["POST"])
@@ -2057,7 +2057,6 @@ def site_warnings(site_id):
 <form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='approve') }}" style="margin:0"><button>סגור כבוצע</button></form>
 <form method="post" data-ajax action="{{ url_for('task_closure', task_id=c['id'], action='keep') }}" style="margin:0"><button>השאר פתוחה</button></form>
 <form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="margin:0"><button name="action" value="info">לידיעה</button></form>
-<form method="post" data-ajax action="{{ url_for('task_triage', task_id=c['id']) }}" style="margin:0"><button name="action" value="delete" onclick="if(this.dataset.armed){return true}this.dataset.armed=1;this.textContent='לחץ שוב לאישור מחיקה';return false">מחיקה</button></form>
 </div></td></tr>
 {% else %}<tr><td colspan="2">אין סגירות ממתינות</td></tr>{% endfor %}</table>
 <h3>שיוכים הממתינים לאישור המפקח (שם חלקי או שם משותף לכמה אנשים)</h3>
@@ -2077,7 +2076,7 @@ def site_warnings(site_id):
 <button>שייך</button></form>
 <form method="post" data-ajax action="{{ url_for('task_triage', task_id=t['id']) }}" style="margin-top:4px">
 <button name="action" value="info">1 - לידיעה</button>
-<button name="action" value="delete" onclick="return confirm('למחוק את המשימה? הפעולה אינה הפיכה.')">2 - מחק</button></form></td></tr>
+<button name="action" value="delete">2 - בטל</button></form></td></tr>
 {% else %}<tr><td colspan="4">כל המשימות הפתוחות משויכות</td></tr>{% endfor %}</table>
 <p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה לאתר</a></p>
 """, duplicates=duplicates, unassigned=unassigned, pending=pending, choices=choices, closures=closures,

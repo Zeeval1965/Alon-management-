@@ -1263,13 +1263,13 @@ class InPlaceUpdateTests(AppTestCase):
         self.assertEqual(r.status_code, 302)
         self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בטיפול")
 
-    def test_delete_from_script_returns_delete_message_and_removes_task(self):
+    def test_delete_from_script_cancels_task_and_keeps_row(self):
         tid = self._task("P4")
         d = self.login("sup@test").post(f"/tasks/{tid}/triage", data={"action": "delete"},
                                         headers={"X-Requested-With": "fetch"}).get_json()
         self.assertTrue(d["hide"])
-        self.assertEqual(d["message"], "המשימה נמחקה.")
-        self.assertEqual(self.db_val("SELECT COUNT(*) FROM tasks WHERE id=?", (tid,)), 0)
+        self.assertEqual(d["message"], "המשימה בוטלה.")
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (tid,)), "בוטלה")
 
     def test_site_page_marks_task_forms_for_in_place_update(self):
         self._task("P3")
@@ -1359,7 +1359,7 @@ class TriageTests(AppTestCase):
 
     def test_delete_task(self):
         self.login("sup@test").post(f"/tasks/{self.tid}/triage", data={"action": "delete"})
-        self.assertIsNone(self.db_val("SELECT id FROM tasks WHERE id=?", (self.tid,)))
+        self.assertEqual(self.db_val("SELECT status FROM tasks WHERE id=?", (self.tid,)), "בוטלה")
 
     def test_owner_cannot_triage(self):
         r = self.login("owner@test").post(f"/tasks/{self.tid}/triage", data={"action": "delete"})
