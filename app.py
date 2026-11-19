@@ -813,6 +813,32 @@ def plan_file_name(site_name, discipline, title, version, original):
     return (base or "plan") + ext
 
 
+def plan_history(rows):
+    """Plans grouped by discipline and title. Each group lists its uploads oldest first, the days
+    since the previous upload, the current (latest) upload and the average gap between uploads."""
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["discipline"] or "", r["title"]), []).append(r)
+    out = []
+    for (discipline, title), items in groups.items():
+        ordered = sorted(items, key=lambda r: (r["uploaded_at"] or "", r["id"]))
+        versions, prev_at, gaps = [], None, []
+        for r in ordered:
+            gap = None
+            try:
+                at = dt.datetime.fromisoformat(r["uploaded_at"]) if r["uploaded_at"] else None
+                if at and prev_at:
+                    gap = (at - prev_at).days
+                    gaps.append(gap)
+                prev_at = at or prev_at
+            except ValueError:
+                pass
+            versions.append({"row": r, "gap": gap})
+        out.append({"discipline": discipline, "title": title, "versions": versions,
+                    "current": ordered[-1], "avg_gap": round(sum(gaps) / len(gaps)) if gaps else None})
+    return sorted(out, key=lambda g: (g["discipline"], g["title"]))
+
+
 @app.route("/sites/<int:site_id>/plans", methods=["GET", "POST"])
 def plans_view(site_id):
     site = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -855,12 +881,14 @@ def plans_view(site_id):
     rows = db().execute("SELECT * FROM plans WHERE site_id=? ORDER BY uploaded_at DESC, id DESC", (site_id,)).fetchall()
     return page("תוכניות וגרסאות - " + site["name"], """
 <p>{{ site_nav|safe }}</p>
-<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>קובץ</th><th>הועלה</th><th>מי</th><th></th></tr>
-{% for r in rows %}<tr><td data-label="תחום">{{ r['discipline'] or '' }}</td><td data-label="תוכנית">{{ r['title'] }}</td>
-<td data-label="מהדורה">{{ r['version'] or '' }}</td><td data-label="קובץ">{{ r['original_name'] or '' }}</td>
-<td data-label="הועלה">{{ r['uploaded_at'] or '' }}</td><td data-label="מי">{{ r['uploaded_by'] or '' }}</td>
-<td data-label="פתיחה">{% if r['drive_url'] %}<a href="{{ r['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=r['id']) }}">הורדה</a>{% endif %}</td></tr>
-{% else %}<tr><td colspan="7">אין תוכניות עדיין</td></tr>{% endfor %}</table>
+<p class="note">סה"כ {{ groups|length }} תוכניות · {{ rows|length }} העלאות</p>
+{% for g in groups %}
+<h3>{{ g['discipline'] or 'ללא תחום' }} · {{ g['title'] }}</h3>
+<p class="note">{{ g['versions']|length }} העלאות · נוכחית: {{ g['current']['version'] or '—' }} ({{ g['current']['uploaded_at'] or '' }}){% if g['avg_gap'] is not none %} · ממוצע {{ g['avg_gap'] }} ימים בין העלאות{% endif %}</p>
+<table class="cards"><tr><th>מהדורה</th><th>הועלה</th><th>מי</th><th>ימים מהקודמת</th><th>קובץ</th></tr>
+{% for v in g['versions'] %}<tr><td data-label="מהדורה">{{ v['row']['version'] or '' }}</td><td data-label="הועלה">{{ v['row']['uploaded_at'] or '' }}</td><td data-label="מי">{{ v['row']['uploaded_by'] or '' }}</td><td data-label="ימים מהקודמת">{{ v['gap'] if v['gap'] is not none else '' }}</td><td data-label="קובץ">{% if v['row']['drive_url'] %}<a href="{{ v['row']['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=v['row']['id']) }}">הורדה</a>{% endif %}</td></tr>
+{% endfor %}</table>
+{% else %}<p class="note">עדיין לא הועלו תוכניות.</p>{% endfor %}
 <h3>תוכנית חדשה</h3>
 <form method="post" enctype="multipart/form-data">
 <p><select name="discipline">{% for d in disciplines %}<option>{{ d }}</option>{% endfor %}</select>
@@ -868,7 +896,7 @@ def plans_view(site_id):
 <input name="version" placeholder="מהדורה" size="8"></p>
 <p><input type="file" name="file" accept=".pdf,.dwg,.dxf,.xlsx,.xls,.docx" required> <button>העלאה</button></p></form>
 <p class="note">{{ storage_note }}</p>""",
-        rows=rows, s=site, url_for=url_for, disciplines=PLAN_DISCIPLINES,
+        rows=rows, groups=plan_history(rows), s=site, url_for=url_for, disciplines=PLAN_DISCIPLINES,
         site_nav=Markup(f'<a href="{url_for("site_view", site_id=site_id)}">חזרה ללוח הבקרה</a>'),
         storage_note=("הקבצים נשמרים בתיקיית Drive של האתר והתחום." if drive_storage.is_configured()
                       else "Drive לא מוגדר עדיין: הקבצים נשמרים באתר בלבד."))
@@ -2917,7 +2945,7 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 {% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a></p>
-<h3>תוכניות האתר ({{ plan_rows|length }})</h3>
+<h3>תוכניות האתר ({{ plan_rows|length }}) · <a href="{{ url_for('plans_view', site_id=s['id']) }}">רשימה והיסטוריית גרסאות</a></h3>
 {% if plan_rows %}<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>הועלה</th><th>מי</th><th>קובץ</th></tr>
 {% for p in plan_rows %}<tr><td data-label="תחום">{{ p['discipline'] or '' }}</td><td data-label="תוכנית">{{ p['title'] }}</td><td data-label="מהדורה">{{ p['version'] or '' }}</td><td data-label="הועלה">{{ p['uploaded_at'] or '' }}</td><td data-label="מי">{{ p['uploaded_by'] or '' }}</td><td data-label="קובץ">{% if p['drive_url'] %}<a href="{{ p['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=p['id']) }}">הורדה</a>{% endif %}</td></tr>
 {% endfor %}</table>{% else %}<p class="note">עדיין לא הועלו תוכניות.</p>{% endif %}
