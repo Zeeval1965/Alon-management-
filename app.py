@@ -15,6 +15,7 @@ from flask import get_flashed_messages, has_request_context, Flask, abort, flash
 from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import drive_storage
 from protocol_parser import extract_rows, extract_supervision_items
 
 DB_PATH = os.environ.get("APP_DB", os.path.join(os.path.dirname(__file__), "app.db"))
@@ -220,7 +221,11 @@ def init_db():
                  "ALTER TABLE tasks ADD COLUMN published_at TEXT",
                  "ALTER TABLE meetings ADD COLUMN published_at TEXT",
                  "ALTER TABLE tasks ADD COLUMN approver TEXT",
-                 "ALTER TABLE tasks ADD COLUMN closed_at TEXT"):
+                 "ALTER TABLE tasks ADD COLUMN closed_at TEXT",
+                 "ALTER TABLE plans ADD COLUMN discipline TEXT",
+                 "ALTER TABLE plans ADD COLUMN drive_file_id TEXT",
+                 "ALTER TABLE plans ADD COLUMN drive_url TEXT",
+                 "ALTER TABLE plans ADD COLUMN uploaded_by TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -797,36 +802,76 @@ def supervision_view(site_id):
         rows=rows, site_id=site_id)
 
 
+PLAN_DISCIPLINES = ["אדריכלות", "קונסטרוקציה", "אינסטלציה וספרינקלרים", "תאורה", "אחר"]
+
+
+def plan_file_name(site_name, discipline, title, version, original):
+    """File name in Drive: site_discipline_plan_version.ext, with characters Drive or Windows dislike removed."""
+    ext = os.path.splitext(original or "")[1].lower()
+    parts = [(p or "").strip() for p in (site_name, discipline, title, version)]
+    base = "_".join(re.sub(r'[\\/:*?"<>|\s]+', "_", p) for p in parts if p)
+    return (base or "plan") + ext
+
+
 @app.route("/sites/<int:site_id>/plans", methods=["GET", "POST"])
 def plans_view(site_id):
+    site = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
     if request.method == "POST":
         f = request.files.get("file")
         title = (request.form.get("title") or "").strip()
+        discipline = (request.form.get("discipline") or "").strip() or "אחר"
+        version = (request.form.get("version") or "").strip()
         if f and title:
-            os.makedirs(os.path.join(UPLOAD_DIR, str(site_id)), exist_ok=True)
-            ext = os.path.splitext(f.filename or "")[1].lower()
-            stored = os.path.join(str(site_id), f"{uuid.uuid4().hex}{ext}")
-            f.save(os.path.join(UPLOAD_DIR, stored))
-            db().execute(
-                """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (site_id, title, (request.form.get("version") or "").strip(), stored, f.filename,
-                 dt.datetime.now().isoformat(timespec="minutes")))
+            uploaded_at = dt.datetime.now().isoformat(timespec="minutes")
+            me = current_contact()
+            who = (f"{me['first_name'] or ''} {me['last_name'] or ''}".strip() or me["email"]) if me else ""
+            name = plan_file_name(site["name"], discipline, title, version, f.filename)
+            if drive_storage.is_configured():
+                try:
+                    stored = drive_storage.upload_plan_file(f.read(), name, f.mimetype, site["name"], discipline)
+                except Exception as exc:  # the file is not stored locally when Drive fails
+                    flash(f"ההעלאה ל-Drive נכשלה: {exc}")
+                    return redirect(url_for("plans_view", site_id=site_id))
+                db().execute(
+                    """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at,
+                           discipline, drive_file_id, drive_url, uploaded_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (site_id, title, version, "", name, uploaded_at, discipline,
+                     stored["file_id"], stored["url"], who))
+                flash("התוכנית הועלתה ל-Drive.")
+            else:
+                os.makedirs(os.path.join(UPLOAD_DIR, str(site_id)), exist_ok=True)
+                ext = os.path.splitext(f.filename or "")[1].lower()
+                stored_path = os.path.join(str(site_id), f"{uuid.uuid4().hex}{ext}")
+                f.save(os.path.join(UPLOAD_DIR, stored_path))
+                db().execute(
+                    """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at,
+                           discipline, uploaded_by)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (site_id, title, version, stored_path, f.filename, uploaded_at, discipline, who))
+                flash("התוכנית נשמרה (Drive לא מוגדר עדיין).")
             db().commit()
         return redirect(url_for("plans_view", site_id=site_id))
-    rows = db().execute("SELECT * FROM plans WHERE site_id=? ORDER BY title, id", (site_id,)).fetchall()
-    return render_template_string(
-        PAGE_CSS + "<h1>תוכניות וגרסאות</h1>" + SECTION_NAV + """
-<table><tr><th>שם</th><th>גרסה</th><th>קובץ מקורי</th><th>הועלה</th><th></th></tr>
-{% for r in rows %}<tr><td>{{ r['title'] }}</td><td>{{ r['version'] }}</td><td>{{ r['original_name'] }}</td>
-<td>{{ r['uploaded_at'] }}</td><td><a href="{{ url_for('plan_file', plan_id=r['id']) }}">הורדה</a></td></tr>
-{% else %}<tr><td colspan="5">אין תוכניות עדיין</td></tr>{% endfor %}</table>
-<h2>תוכנית חדשה</h2>
+    rows = db().execute("SELECT * FROM plans WHERE site_id=? ORDER BY uploaded_at DESC, id DESC", (site_id,)).fetchall()
+    return page("תוכניות וגרסאות - " + site["name"], """
+<p>{{ site_nav|safe }}</p>
+<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>קובץ</th><th>הועלה</th><th>מי</th><th></th></tr>
+{% for r in rows %}<tr><td data-label="תחום">{{ r['discipline'] or '' }}</td><td data-label="תוכנית">{{ r['title'] }}</td>
+<td data-label="מהדורה">{{ r['version'] or '' }}</td><td data-label="קובץ">{{ r['original_name'] or '' }}</td>
+<td data-label="הועלה">{{ r['uploaded_at'] or '' }}</td><td data-label="מי">{{ r['uploaded_by'] or '' }}</td>
+<td data-label="פתיחה">{% if r['drive_url'] %}<a href="{{ r['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=r['id']) }}">הורדה</a>{% endif %}</td></tr>
+{% else %}<tr><td colspan="7">אין תוכניות עדיין</td></tr>{% endfor %}</table>
+<h3>תוכנית חדשה</h3>
 <form method="post" enctype="multipart/form-data">
-<input name="title" placeholder="שם התוכנית (למשל חתך א-א)" required>
-<input name="version" placeholder="גרסה">
-<input type="file" name="file" required><button>העלה</button></form>""",
-        rows=rows, site_id=site_id)
+<p><select name="discipline">{% for d in disciplines %}<option>{{ d }}</option>{% endfor %}</select>
+<input name="title" placeholder="שם התוכנית (למשל חתך א-א)" required size="30">
+<input name="version" placeholder="מהדורה" size="8"></p>
+<p><input type="file" name="file" accept=".pdf,.dwg,.dxf,.xlsx,.xls,.docx" required> <button>העלאה</button></p></form>
+<p class="note">{{ storage_note }}</p>""",
+        rows=rows, s=site, url_for=url_for, disciplines=PLAN_DISCIPLINES,
+        site_nav=Markup(f'<a href="{url_for("site_view", site_id=site_id)}">חזרה ללוח הבקרה</a>'),
+        storage_note=("הקבצים נשמרים בתיקיית Drive של האתר והתחום." if drive_storage.is_configured()
+                      else "Drive לא מוגדר עדיין: הקבצים נשמרים באתר בלבד."))
 
 
 @app.route("/plans/<int:plan_id>/file")
@@ -834,6 +879,8 @@ def plan_file(plan_id):
     r = db().execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
     if r is None:
         abort(404)
+    if r["drive_url"]:
+        return redirect(r["drive_url"])
     return send_from_directory(UPLOAD_DIR, r["file_path"], as_attachment=True,
                                download_name=r["original_name"] or "plan")
 
@@ -2286,6 +2333,7 @@ SIDE_SITE_ITEMS = [
     ("אנשים ודוחות", "שליחת קישורי עדכון", "site_send_links", "tasks"),
     ("אנשים ודוחות", "התרעות לתיקון", "site_warnings", "tasks"),
     ("אנשים ודוחות", "להדפסה", "site_print", "tasks"),
+    ("תוכניות", "תוכניות וגרסאות", "plans_view", "plans"),
 ]
 
 
@@ -2869,6 +2917,11 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 {% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a></p>
+<h3>תוכניות האתר ({{ plan_rows|length }})</h3>
+{% if plan_rows %}<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>הועלה</th><th>מי</th><th>קובץ</th></tr>
+{% for p in plan_rows %}<tr><td data-label="תחום">{{ p['discipline'] or '' }}</td><td data-label="תוכנית">{{ p['title'] }}</td><td data-label="מהדורה">{{ p['version'] or '' }}</td><td data-label="הועלה">{{ p['uploaded_at'] or '' }}</td><td data-label="מי">{{ p['uploaded_by'] or '' }}</td><td data-label="קובץ">{% if p['drive_url'] %}<a href="{{ p['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=p['id']) }}">הורדה</a>{% endif %}</td></tr>
+{% endfor %}</table>{% else %}<p class="note">עדיין לא הועלו תוכניות.</p>{% endif %}
+<p><a href="{{ url_for('plans_view', site_id=s['id']) }}">העלאת תוכנית</a></p>
 {% if site_image %}<div class="hero"><img src="{{ site_image }}" alt="הדמיית הפרויקט"></div>{% endif %}
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0">
 <a class="kpi warn" href="{{ url_for('site_view', site_id=s['id'], sort='target') }}" style="border:1px solid #c62828"><b data-live="late" style="color:#c62828">{{ kp.late }}</b><span>משימות באיחור</span></a>
@@ -2953,7 +3006,8 @@ def site_view(site_id):
 <h3>משימות שבוצעו</h3>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th></tr>
 {% for t in done_t %}<tr class="done"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="לטיפול">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td></tr>{% endfor %}</table>
-""", s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
+""", plan_rows=db().execute("SELECT * FROM plans WHERE site_id=? ORDER BY uploaded_at DESC, id DESC", (site_id,)).fetchall(),
+        s=s, kp=kp, pct=pct, status_rows=status_rows, site_image=site_image, aged_rows=aged_rows, topic_rows=topic_rows, top_topics=top_topics, is_admin=bool(current_contact() and current_contact()["is_admin"]), sclass=STATUS_CLASS, sort=sort, closure_ids=closure_ids, last=last, status_options=task_status_names(), weekdays=WEEKDAYS, open_t=open_t, info_t=info_t, done_t=done_t, linked=_linked_people(site_id), rowclass=lambda t: {0: "overdue", 1: "urgent", 9: "done"}.get(priority_of(t, today), ""),
         land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']), months_strip=construction_months_strip(s['land_date'], s['months_total']),
         month_txt=construction_schedule(s["land_date"], s["months_total"])[1],
         end_txt=construction_schedule(s["land_date"], s["months_total"])[0] or "לא נקבע",
