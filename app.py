@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS task_assignments (
   id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, contact_id INTEGER NOT NULL,
   raw_name TEXT, confirmed INTEGER DEFAULT 0, UNIQUE(task_id, contact_id)
 );
+CREATE TABLE IF NOT EXISTS mail_senders (email TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS mail_inbox (
+  id INTEGER PRIMARY KEY, message_id TEXT UNIQUE, received TEXT, sender TEXT, subject TEXT,
+  site_id INTEGER, status TEXT
+);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY, site_id INTEGER, contact_id INTEGER, channel TEXT,
   body TEXT, mode TEXT DEFAULT 'מיידי', status TEXT DEFAULT 'queued', created TEXT
@@ -200,6 +205,7 @@ def init_db():
                  "ALTER TABLE sites ADD COLUMN digest_time TEXT DEFAULT '08:00'",
                  "ALTER TABLE sites ADD COLUMN weekly_day TEXT DEFAULT 'ראשון'",
                  "ALTER TABLE outbox ADD COLUMN mode TEXT DEFAULT 'מיידי'",
+                 "ALTER TABLE sites ADD COLUMN mail_keyword TEXT",
                  "ALTER TABLE contacts ADD COLUMN password_hash TEXT",
                  "ALTER TABLE contacts ADD COLUMN is_admin INTEGER DEFAULT 0",
                  "ALTER TABLE contacts ADD COLUMN is_guest INTEGER DEFAULT 0",
@@ -866,7 +872,7 @@ SECTION_OF = {
     "progress_view": "progress", "progress_save": "progress",
 }
 # task_link_view is open to anyone holding a valid link; it shows and changes only that one task
-PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view", "admin_site_delete_approve", "guest_enter"}
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "task_link_view", "admin_site_delete_approve", "guest_enter", "mail_poll"}
 # contact import and editing: administrator and supervisors (deleting field values: administrator only)
 MANAGER_ENDPOINTS = {"contacts_import", "contacts_import_preview", "contacts_import_confirm", "contact_edit",
                      "contact_role_add", "contact_role_remove", "contact_delete"}
@@ -2988,6 +2994,9 @@ def admin_overview():
                                 (s_row["id"],)).fetchone()[0]
         rows.append({"s": s_row, "kp": kp, "pct": round(100 * kp["closed"] / total) if total else 0, "meetings": meetings})
     users = db().execute("SELECT first_name, last_name, email FROM contacts WHERE password_hash IS NOT NULL ORDER BY email").fetchall()
+    mail_senders = db().execute("SELECT email FROM mail_senders ORDER BY email").fetchall()
+    mail_inbox = db().execute("SELECT * FROM mail_inbox ORDER BY id DESC LIMIT 30").fetchall()
+    sites_kw = db().execute("SELECT id, name, IFNULL(mail_keyword,'') AS kw FROM sites ORDER BY id").fetchall()
     return page("ניהול כללי", """
 <p><a href="{{ url_for('sites') }}">כל האתרים</a></p>
 <p><a href="{{ url_for('site_new') }}">+ אתר חדש</a> · <a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
@@ -2999,7 +3008,120 @@ def admin_overview():
 <h3>משתמשים עם גישת מנהל</h3>
 <p class="note">{{ users|length }} משתמשים עם חשבון במערכת.</p>
 <table class="cards"><tr><th>שם</th><th>דוא"ל</th></tr>{% for u in users %}<tr><td data-label="שם">{{ u['first_name'] or '' }} {{ u['last_name'] or '' }}</td><td data-label='דוא"ל'>{{ u['email'] }}</td></tr>{% endfor %}</table>
-""", rows=rows, users=users, url_for=url_for)
+<h3>קליטת פרוטוקולים במייל</h3>
+<p class="note">פרוטוקול שמתקבל במייל נכנס כטיוטה, ותאשר אותו מהמסך לפני הפרסום.</p>
+<h4>שולחים מאושרים</h4>
+<table>{% for e in mail_senders %}<tr><td>{{ e['email'] }}</td><td><form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="del_sender"><input type="hidden" name="email" value="{{ e['email'] }}"><button>הסר</button></form></td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="add_sender"><input name="email" placeholder="כתובת דוא&quot;ל" required> <button>הוסף שולח</button></form>
+<h4>שם הפרויקט בכותרת המייל, לכל אתר</h4>
+{% for s in sites_kw %}<form method="post" action="{{ url_for('mail_admin_update') }}" style="margin:4px 0"><input type="hidden" name="action" value="set_keyword"><input type="hidden" name="site_id" value="{{ s['id'] }}">{{ s['name'] }}: <input name="keyword" value="{{ s['kw'] }}"> <button>שמור</button></form>{% endfor %}
+<h4>מיילים אחרונים</h4>
+<table class="cards"><tr><th>התקבל</th><th>שולח</th><th>נושא</th><th>סטטוס</th></tr>{% for m in mail_inbox %}<tr><td data-label="התקבל">{{ m['received'] }}</td><td data-label="שולח">{{ m['sender'] }}</td><td data-label="נושא">{{ m['subject'] }}</td><td data-label="סטטוס">{{ m['status'] }}</td></tr>{% else %}<tr><td colspan="4">אין עדיין</td></tr>{% endfor %}</table>
+""", rows=rows, users=users, mail_senders=mail_senders, mail_inbox=mail_inbox, sites_kw=sites_kw, url_for=url_for)
+
+
+def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע"):
+    """Same steps as the manual upload: split by date, store one draft per date."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.write(pdf_bytes)
+    tmp.close()
+    rows = extract_rows(tmp.name, image_dir=os.path.join(UPLOAD_DIR, "protocol_images", str(site_id)))
+    named = date_from_filename(filename)
+    for r in rows:
+        if not r.get("meeting_date") and named:
+            r["meeting_date"] = dt.date.fromisoformat(named).strftime("%d.%m.%y")
+    ids = []
+    for day, group in split_rows_by_date(rows):
+        cur = db().execute(
+            "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
+            (site_id, kind, filename, json.dumps(group, ensure_ascii=False), day))
+        ids.append(cur.lastrowid)
+    return ids
+
+
+def mail_poll_once():
+    """Reads unread mail from the protocol mailbox. Only trusted senders are taken, and only when the
+    subject contains a site's mail keyword. Their PDFs become drafts. Every message is logged once."""
+    import imaplib
+    from email import message_from_bytes
+    from email.utils import parseaddr
+    from email.header import decode_header, make_header
+    user = os.environ.get("GMAIL_USER")
+    pw = os.environ.get("GMAIL_APP_PASSWORD")
+    if not user or not pw:
+        return {"error": "GMAIL_USER / GMAIL_APP_PASSWORD not set"}
+    senders = {r["email"].lower() for r in db().execute("SELECT email FROM mail_senders").fetchall()}
+    sites = db().execute("SELECT id, mail_keyword FROM sites WHERE IFNULL(mail_keyword,'') != ''").fetchall()
+    M = imaplib.IMAP4_SSL("imap.gmail.com")
+    M.login(user, pw)
+    M.select("INBOX")
+    _, data = M.search(None, "UNSEEN")
+    summary = []
+    for num in data[0].split():
+        _, msg_data = M.fetch(num, "(RFC822)")
+        msg = message_from_bytes(msg_data[0][1])
+        msg_id = (msg.get("Message-ID") or num.decode()).strip()
+        if db().execute("SELECT 1 FROM mail_inbox WHERE message_id=?", (msg_id,)).fetchone():
+            M.store(num, "+FLAGS", "\\Seen")
+            continue
+        sender = parseaddr(msg.get("From", ""))[1].lower()
+        subject = str(make_header(decode_header(msg.get("Subject", ""))))
+        site_id = None
+        ids = []
+        if sender not in senders:
+            status = "שולח לא מאושר"
+        else:
+            site = next((x for x in sites if x["mail_keyword"] in subject), None)
+            if site is None:
+                status = "לא זוהה אתר לפי הנושא"
+            else:
+                site_id = site["id"]
+                for part in msg.walk():
+                    fn = part.get_filename()
+                    if fn and fn.lower().endswith(".pdf"):
+                        fn = str(make_header(decode_header(fn)))
+                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn)
+                status = f"נקלטו {len(ids)} טיוטות" if ids else "אין קובץ PDF מצורף"
+        db().execute(
+            "INSERT INTO mail_inbox(message_id, received, sender, subject, site_id, status) VALUES (?,?,?,?,?,?)",
+            (msg_id, dt.datetime.now().isoformat(timespec="minutes"), sender, subject, site_id, status))
+        db().commit()
+        M.store(num, "+FLAGS", "\\Seen")
+        summary.append({"subject": subject, "status": status})
+    M.logout()
+    return {"processed": len(summary), "items": summary}
+
+
+@app.route("/mail/poll/<token>")
+def mail_poll(token):
+    import hmac
+    expected = os.environ.get("MAIL_POLL_TOKEN", "")
+    if not expected or not hmac.compare_digest(token, expected):
+        abort(404)
+    try:
+        return jsonify(mail_poll_once())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/mail", methods=["POST"])
+def mail_admin_update():
+    if not current_contact()["is_admin"]:
+        abort(403)
+    action = request.form.get("action")
+    if action == "add_sender":
+        email = request.form.get("email", "").strip().lower()
+        if re.fullmatch(EMAIL_PATTERN, email):
+            db().execute("INSERT OR IGNORE INTO mail_senders(email) VALUES (?)", (email,))
+    elif action == "del_sender":
+        db().execute("DELETE FROM mail_senders WHERE email=?", (request.form.get("email", ""),))
+    elif action == "set_keyword":
+        db().execute("UPDATE sites SET mail_keyword=? WHERE id=?",
+                     (request.form.get("keyword", "").strip(), request.form.get("site_id")))
+    else:
+        abort(400)
+    db().commit()
+    return redirect(url_for("admin_overview"))
 
 
 @app.route("/admin/sites/<int:site_id>/delete", methods=["POST"])
