@@ -3091,7 +3091,7 @@ def site_view(site_id):
 <button>שמירה</button></form>
 <p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 {% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
-<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a></p>
+<p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('continuity_view', site_id=s['id']) }}" style="background:#c62828;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-weight:700">הרץ בדיקת המשכיות</a></p>
 <h3>תוכניות האתר ({{ plan_rows|length }}) · <a href="{{ url_for('plans_view', site_id=s['id']) }}">רשימה והיסטוריית גרסאות</a></h3>
 {% if plan_rows %}<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>הועלה</th><th>מי</th><th>קובץ</th></tr>
 {% for p in plan_rows %}<tr><td data-label="תחום">{{ p['discipline'] or '' }}</td><td data-label="תוכנית">{{ p['title'] }}</td><td data-label="מהדורה">{{ p['version'] or '' }}</td><td data-label="הועלה">{{ p['uploaded_at'] or '' }}</td><td data-label="מי">{{ p['uploaded_by'] or '' }}</td><td data-label="קובץ">{% if p['drive_url'] %}<a href="{{ p['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=p['id']) }}">הורדה</a>{% endif %}</td></tr>
