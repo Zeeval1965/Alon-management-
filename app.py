@@ -2930,6 +2930,9 @@ def continuity_analysis(site_id, key_mode="topic_resp", threshold=CONTINUITY_THR
 
     keyed = {}
     for t in open_t:
+        # tasks without a topic are never merged by topic: they stay single and are checked by hand
+        if key_mode != "resp" and not (t["topic"] or "").strip():
+            continue
         keyed.setdefault(group_key(t), []).append(t)
     parent = {t["id"]: t["id"] for t in open_t}
 
