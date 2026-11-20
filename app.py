@@ -225,7 +225,8 @@ def init_db():
                  "ALTER TABLE plans ADD COLUMN discipline TEXT",
                  "ALTER TABLE plans ADD COLUMN drive_file_id TEXT",
                  "ALTER TABLE plans ADD COLUMN drive_url TEXT",
-                 "ALTER TABLE plans ADD COLUMN uploaded_by TEXT"):
+                 "ALTER TABLE plans ADD COLUMN uploaded_by TEXT",
+                 "ALTER TABLE plans ADD COLUMN stage TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -802,7 +803,14 @@ def supervision_view(site_id):
         rows=rows, site_id=site_id)
 
 
-PLAN_DISCIPLINES = ["אדריכלות", "קונסטרוקציה", "אינסטלציה וספרינקלרים", "תאורה", "אחר"]
+PLAN_DISCIPLINES = ["אגרונום", "איטום", "איתור תשתיות", "אינסטלציה", "אל הרס", "אלומיניום", "אסבסט",
+                    "אקוסטיקה", "אקספונט", "אשפה", "אדריכל", "בטיחות", "בים", "בניה ירוקה", "הדמיות",
+                    "הידרולוג", "הסדרי תנועה", "יועץ בריכות", "יועץ קרינה", "תנועה", "יזם", "כתב כמויות",
+                    "מודד", "מכון התעודה", "מכון העתקות", "מיגון", "מיזוג", "מלונאות", "מסד", "מעליות",
+                    "נגישות", "עטלפים", "פיקוח", "פיתוח", "קונסטרוקטור", "קרקע", "ציורי קיר", "תאום מערכות",
+                    "תאורה", "תרמי", "חשמל", "אחר"]
+PLAN_STAGES = ["לא מוגדר", "פנימי", "לעיון", "להתייחסות יועצים", "למכרז", "לביצוע"]
+EXECUTION_STAGE = "לביצוע"
 
 
 def plan_file_name(site_name, discipline, title, version, original):
@@ -834,8 +842,10 @@ def plan_history(rows):
             except ValueError:
                 pass
             versions.append({"row": r, "gap": gap})
+        execution = [r for r in ordered if (r["stage"] or "") == EXECUTION_STAGE]
         out.append({"discipline": discipline, "title": title, "versions": versions,
-                    "current": ordered[-1], "avg_gap": round(sum(gaps) / len(gaps)) if gaps else None})
+                    "current": ordered[-1], "execution": execution[-1] if execution else None,
+                    "avg_gap": round(sum(gaps) / len(gaps)) if gaps else None})
     return sorted(out, key=lambda g: (g["discipline"], g["title"]))
 
 
@@ -846,6 +856,9 @@ def plans_view(site_id):
         f = request.files.get("file")
         title = (request.form.get("title") or "").strip()
         discipline = (request.form.get("discipline") or "").strip() or "אחר"
+        stage = (request.form.get("stage") or "").strip()
+        if stage not in PLAN_STAGES:
+            stage = "לא מוגדר"
         version = (request.form.get("version") or "").strip()
         if f and title:
             uploaded_at = dt.datetime.now().isoformat(timespec="minutes")
@@ -860,10 +873,10 @@ def plans_view(site_id):
                     return redirect(url_for("plans_view", site_id=site_id))
                 db().execute(
                     """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at,
-                           discipline, drive_file_id, drive_url, uploaded_by)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                           discipline, drive_file_id, drive_url, uploaded_by, stage)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (site_id, title, version, "", name, uploaded_at, discipline,
-                     stored["file_id"], stored["url"], who))
+                     stored["file_id"], stored["url"], who, stage))
                 flash("התוכנית הועלתה ל-Drive.")
             else:
                 os.makedirs(os.path.join(UPLOAD_DIR, str(site_id)), exist_ok=True)
@@ -872,9 +885,9 @@ def plans_view(site_id):
                 f.save(os.path.join(UPLOAD_DIR, stored_path))
                 db().execute(
                     """INSERT INTO plans(site_id, title, version, file_path, original_name, uploaded_at,
-                           discipline, uploaded_by)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (site_id, title, version, stored_path, f.filename, uploaded_at, discipline, who))
+                           discipline, uploaded_by, stage)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (site_id, title, version, stored_path, f.filename, uploaded_at, discipline, who, stage))
                 flash("התוכנית נשמרה (Drive לא מוגדר עדיין).")
             db().commit()
         return redirect(url_for("plans_view", site_id=site_id))
@@ -884,19 +897,21 @@ def plans_view(site_id):
 <p class="note">סה"כ {{ groups|length }} תוכניות · {{ rows|length }} העלאות</p>
 {% for g in groups %}
 <h3>{{ g['discipline'] or 'ללא תחום' }} · {{ g['title'] }}</h3>
-<p class="note">{{ g['versions']|length }} העלאות · נוכחית: {{ g['current']['version'] or '—' }} ({{ g['current']['uploaded_at'] or '' }}){% if g['avg_gap'] is not none %} · ממוצע {{ g['avg_gap'] }} ימים בין העלאות{% endif %}</p>
-<table class="cards"><tr><th>מהדורה</th><th>הועלה</th><th>מי</th><th>ימים מהקודמת</th><th>קובץ</th></tr>
-{% for v in g['versions'] %}<tr><td data-label="מהדורה">{{ v['row']['version'] or '' }}</td><td data-label="הועלה">{{ v['row']['uploaded_at'] or '' }}</td><td data-label="מי">{{ v['row']['uploaded_by'] or '' }}</td><td data-label="ימים מהקודמת">{{ v['gap'] if v['gap'] is not none else '' }}</td><td data-label="קובץ">{% if v['row']['drive_url'] %}<a href="{{ v['row']['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=v['row']['id']) }}">הורדה</a>{% endif %}</td></tr>
+<p class="note">{{ g['versions']|length }} העלאות · נוכחית: {{ g['current']['version'] or '—' }} ({{ g['current']['uploaded_at'] or '' }}){% if g['execution'] %} · לביצוע: מהדורה {{ g['execution']['version'] or '—' }} ({{ g['execution']['uploaded_at'] or '' }}){% else %} · אין מהדורה לביצוע{% endif %}{% if g['avg_gap'] is not none %} · ממוצע {{ g['avg_gap'] }} ימים בין העלאות{% endif %}</p>
+<table class="cards"><tr><th>מהדורה</th><th>שלב</th><th>הועלה</th><th>מי</th><th>ימים מהקודמת</th><th>קובץ</th></tr>
+{% for v in g['versions'] %}<tr><td data-label="מהדורה">{{ v['row']['version'] or '' }}</td><td data-label="שלב">{{ v['row']['stage'] or '' }}</td><td data-label="הועלה">{{ v['row']['uploaded_at'] or '' }}</td><td data-label="מי">{{ v['row']['uploaded_by'] or '' }}</td><td data-label="ימים מהקודמת">{{ v['gap'] if v['gap'] is not none else '' }}</td><td data-label="קובץ">{% if v['row']['drive_url'] %}<a href="{{ v['row']['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=v['row']['id']) }}">הורדה</a>{% endif %}</td></tr>
 {% endfor %}</table>
 {% else %}<p class="note">עדיין לא הועלו תוכניות.</p>{% endfor %}
 <h3>תוכנית חדשה</h3>
 <form method="post" enctype="multipart/form-data">
 <p><select name="discipline">{% for d in disciplines %}<option>{{ d }}</option>{% endfor %}</select>
+<select name="stage">{% for s_name in stages %}<option{% if s_name == 'לא מוגדר' %} selected{% endif %}>{{ s_name }}</option>{% endfor %}</select>
 <input name="title" placeholder="שם התוכנית (למשל חתך א-א)" required size="30">
 <input name="version" placeholder="מהדורה" size="8"></p>
 <p><input type="file" name="file" accept=".pdf,.dwg,.dxf,.xlsx,.xls,.docx" required> <button>העלאה</button></p></form>
 <p class="note">{{ storage_note }}</p>""",
         rows=rows, groups=plan_history(rows), s=site, url_for=url_for, disciplines=PLAN_DISCIPLINES,
+        stages=PLAN_STAGES,
         site_nav=Markup(f'<a href="{url_for("site_view", site_id=site_id)}">חזרה ללוח הבקרה</a>'),
         storage_note=("הקבצים נשמרים בתיקיית Drive של האתר והתחום." if drive_storage.is_configured()
                       else "Drive לא מוגדר עדיין: הקבצים נשמרים באתר בלבד."))
@@ -2877,6 +2892,16 @@ def construction_schedule(land_iso, total):
 
 CONTINUITY_STOP = {"של", "את", "על", "עם", "ו", "ה", "ב", "ל", "מ", "כי", "או", "לא", "יש", "אל", "זה", "כל", "גם", "עד"}
 CONTINUITY_THRESHOLD = 0.4  # word overlap (Jaccard) used for ranking only; a person approves every group
+# recurring standing items, each about a different apartment: never merged
+CONTINUITY_EXCLUDED_TOPICS = {"שינוי דיירים", "שינויי דיירים"}
+
+
+def _topic_label(t):
+    """Topic name as shown in the report: spelling variants of the same topic share one name."""
+    topic = (t["topic"] or "").strip()
+    if topic in CONTINUITY_EXCLUDED_TOPICS:
+        return "שינוי דיירים"
+    return topic or "ללא נושא"
 
 
 def _age_days(t):
@@ -2931,7 +2956,10 @@ def continuity_analysis(site_id, key_mode="topic_resp", threshold=CONTINUITY_THR
     keyed = {}
     for t in open_t:
         # tasks without a topic are never merged by topic: they stay single and are checked by hand
-        if key_mode != "resp" and not (t["topic"] or "").strip():
+        topic = (t["topic"] or "").strip()
+        if topic in CONTINUITY_EXCLUDED_TOPICS:
+            continue
+        if key_mode != "resp" and not topic:
             continue
         keyed.setdefault(group_key(t), []).append(t)
     parent = {t["id"]: t["id"] for t in open_t}
@@ -2970,7 +2998,7 @@ def continuity_analysis(site_id, key_mode="topic_resp", threshold=CONTINUITY_THR
 
     crit_strict_after = sum(1 for t in singles if strict(t)) + sum(1 for g in groups if any(strict(t) for t in g))
 
-    topic_before = Counter(t["topic"] or "ללא נושא" for t in open_t)
+    topic_before = Counter(_topic_label(t) for t in open_t)
     topic_removed = Counter()
     for g in groups:
         topic_removed[g[0]["topic"] or "ללא נושא"] += len(g) - 1
