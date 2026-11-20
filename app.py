@@ -2875,6 +2875,153 @@ def construction_schedule(land_iso, total):
     return end_txt, current
 
 
+CONTINUITY_STOP = {"של", "את", "על", "עם", "ו", "ה", "ב", "ל", "מ", "כי", "או", "לא", "יש", "אל", "זה", "כל", "גם", "עד"}
+CONTINUITY_THRESHOLD = 0.4  # word overlap (Jaccard) used for ranking only; a person approves every group
+
+
+def _age_days(t):
+    try:
+        return (dt.date.today() - dt.date.fromisoformat((t["created_at"] or "")[:10])).days
+    except ValueError:
+        return 0
+
+
+def _words(text):
+    return {w for w in re.findall(r"[0-9A-Za-z֐-׿]+", (text or "").lower())
+            if len(w) > 1 and w not in CONTINUITY_STOP}
+
+
+def continuity_analysis(site_id):
+    """Read-only analysis of open tasks that continue one another: same topic and same responsible
+    people, ranked by word overlap. Returns the counts before and after merging each group into one task."""
+    today = dt.date.today().isoformat()
+    open_names = task_status_names("open")
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+    open_t = [t for t in tasks if t["status"] in open_names]
+    links = {}
+    for tid, cid in [(r[0], r[1]) for r in db().execute(
+            "SELECT a.task_id, a.contact_id FROM task_assignments a JOIN tasks t ON t.id = a.task_id WHERE t.site_id=?",
+            (site_id,)).fetchall()]:
+        links.setdefault(tid, set()).add(cid)
+    occ = {tid: n for tid, n in [(r[0], r[1]) for r in db().execute(
+        "SELECT o.task_id, COUNT(*) FROM task_occurrences o JOIN tasks t ON t.id = o.task_id "
+        "WHERE t.site_id=? GROUP BY o.task_id", (site_id,)).fetchall()]}
+
+    def responsible(t):
+        ids = links.get(t["id"])
+        return ("c", frozenset(ids)) if ids else ("t", " ".join(sorted(_words(t["assignee_text"]))))
+
+    def reasons(t):
+        out = []
+        if t["target_date"] and t["target_date"] < today:
+            out.append("באיחור")
+        if _age_days(t) > 90:
+            out.append("מעל 90 יום")
+        if occ.get(t["id"], 0) >= 3:
+            out.append(f"חזרה ב-{occ.get(t['id'], 0)} פרוטוקולים")
+        return out
+
+    keyed = {}
+    for t in open_t:
+        keyed.setdefault((t["topic"] or "", responsible(t)), []).append(t)
+    parent = {t["id"]: t["id"] for t in open_t}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    pair_scores = {}
+    for members in keyed.values():
+        for i, a in enumerate(members):
+            wa = _words(a["text"])
+            for b in members[i + 1:]:
+                wb = _words(b["text"])
+                union = wa | wb
+                sim = len(wa & wb) / len(union) if union else 0.0
+                if sim >= CONTINUITY_THRESHOLD:
+                    pair_scores[frozenset((a["id"], b["id"]))] = sim
+                    parent[find(a["id"])] = find(b["id"])
+    clusters = {}
+    for t in open_t:
+        clusters.setdefault(find(t["id"]), []).append(t)
+    groups = [sorted(c, key=lambda t: ((t["created_at"] or ""), t["id"])) for c in clusters.values() if len(c) > 1]
+    singles = [c[0] for c in clusters.values() if len(c) == 1]
+
+    n_open = len(open_t)
+    removed = sum(len(g) - 1 for g in groups)
+    crit_before = sum(1 for t in open_t if reasons(t))
+    crit_groups = [g for g in groups if any(reasons(t) for t in g)]
+    crit_after = sum(1 for t in singles if reasons(t)) + len(crit_groups)
+
+    topic_before = Counter(t["topic"] or "ללא נושא" for t in open_t)
+    topic_removed = Counter()
+    for g in groups:
+        topic_removed[g[0]["topic"] or "ללא נושא"] += len(g) - 1
+    topic_rows = [{"name": n, "before": c, "after": c - topic_removed.get(n, 0), "removed": topic_removed.get(n, 0)}
+                  for n, c in topic_before.most_common()]
+
+    crit_rows = []
+    for unit in [[t] for t in singles if reasons(t)] + crit_groups:
+        head = unit[0]
+        rs = []
+        for t in unit:
+            for r in reasons(t):
+                if r not in rs:
+                    rs.append(r)
+        crit_rows.append({"no": head["public_no"], "topic": head["topic"] or "", "text": head["text"],
+                          "status": head["status"], "target": head["target_text"] or "",
+                          "members": len(unit), "reasons": " · ".join(rs),
+                          "sort": (0 if "באיחור" in rs else 1, -_age_days(head))})
+    crit_rows.sort(key=lambda r: r["sort"])
+
+    group_rows = []
+    for g in sorted(groups, key=lambda g: -len(g)):
+        members = []
+        for t in g:
+            best = max((pair_scores.get(frozenset((t["id"], o["id"])), 0) for o in g if o["id"] != t["id"]), default=0)
+            members.append({"no": t["public_no"], "text": t["text"], "status": t["status"],
+                            "target": t["target_text"] or "", "created": (t["created_at"] or "")[:10],
+                            "occ": occ.get(t["id"], 0), "sim": round(best * 100)})
+        group_rows.append({"topic": g[0]["topic"] or "", "who": g[0]["assignee_text"] or "", "members": members})
+
+    return {"n_open": n_open, "removed": removed, "units_after": n_open - removed,
+            "pct": round(100 * removed / n_open) if n_open else 0,
+            "crit_before": crit_before, "crit_after": crit_after,
+            "topic_rows": topic_rows, "crit_rows": crit_rows, "group_rows": group_rows}
+
+
+@app.route("/sites/<int:site_id>/continuity")
+def continuity_view(site_id):
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    a = continuity_analysis(site_id)
+    return page("דוח המשכיות משימות - " + s["name"], """
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה ללוח הבקרה</a></p>
+<p class="note">הדוח לקריאה בלבד ולא משנה משימות. כל קבוצה דורשת אישור לפני איחוד. דמיון הטקסט משמש לדירוג בלבד,
+ומשימות נבדקות רק כשהנושא והאחראים זהים.</p>
+<h3>סיכום מספרי</h3>
+<table class="cards"><tr><th>מדד</th><th>לפני</th><th>אחרי איחוד</th><th>שינוי</th></tr>
+<tr><td data-label="מדד">משימות פתוחות</td><td data-label="לפני">{{ a.n_open }}</td><td data-label="אחרי">{{ a.units_after }}</td><td data-label="שינוי">{{ a.removed }} ({{ a.pct }}%)</td></tr>
+<tr><td data-label="מדד">משימות קריטיות</td><td data-label="לפני">{{ a.crit_before }}</td><td data-label="אחרי">{{ a.crit_after }}</td><td data-label="שינוי">{{ a.crit_before - a.crit_after }}</td></tr>
+</table>
+<p class="note">קבוצות המשכיות שנמצאו: {{ a.group_rows|length }}</p>
+<h3>השפעה לפי נושא</h3>
+<table class="cards"><tr><th>נושא</th><th>פתוחות לפני</th><th>אחרי</th><th>הפחתה</th></tr>
+{% for r in a.topic_rows %}<tr><td data-label="נושא">{{ r.name }}</td><td data-label="לפני">{{ r.before }}</td><td data-label="אחרי">{{ r.after }}</td><td data-label="הפחתה">{{ r.removed }}</td></tr>{% endfor %}</table>
+<h3>משימות קריטיות אחרי איחוד</h3>
+<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th><th>למה קריטית</th><th>במקור</th></tr>
+{% for r in a.crit_rows %}<tr><td data-label="#">{{ r.no|pubno }}</td><td data-label="נושא">{{ r.topic }}</td><td data-label="משימה" style="width:100%">{{ r.text }}</td><td data-label="יעד">{{ r.target }}</td><td data-label="סטטוס">{{ r.status }}</td><td data-label="למה">{{ r.reasons }}</td><td data-label="במקור">{{ r.members }}</td></tr>
+{% else %}<tr><td colspan="7">אין משימות קריטיות</td></tr>{% endfor %}</table>
+<h3>קבוצות לבדיקה</h3>
+{% for g in a.group_rows %}<h4>{{ g.topic }} · {{ g.who }} ({{ g.members|length }} משימות)</h4>
+<table class="cards"><tr><th>#</th><th>משימה</th><th>סטטוס</th><th>יעד</th><th>נוצרה</th><th>הופעות</th><th>דמיון</th></tr>
+{% for m in g.members %}<tr><td data-label="#">{{ m.no|pubno }}</td><td data-label="משימה" style="width:100%">{{ m.text }}</td><td data-label="סטטוס">{{ m.status }}</td><td data-label="יעד">{{ m.target }}</td><td data-label="נוצרה">{{ m.created }}</td><td data-label="הופעות">{{ m.occ }}</td><td data-label="דמיון">{{ m.sim }}%</td></tr>
+{% endfor %}</table>
+{% else %}<p class="note">לא נמצאו קבוצות המשכיות.</p>{% endfor %}
+""", s=s, a=a)
+
+
 @app.route("/sites/<int:site_id>")
 def site_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
@@ -3010,7 +3157,7 @@ def site_view(site_id):
 <style>.crumbs{font-size:13px;color:#6B6B6B;padding:6px 12px;background:#fff}.crumbs a{color:#1565c0}.mstrip{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 10px}.mcell{width:16px;height:16px;border-radius:4px;background:#E0E0E0;display:inline-block}.mcell.done{background:#2a9d4b}.mcell.cur{background:#c62828;box-shadow:0 0 0 3px rgba(198,40,40,.25);animation:livepulse 1.2s infinite}.live-strip{display:flex;align-items:center;gap:6px}.live-dot{width:8px;height:8px;border-radius:50%;background:#2a9d4b;display:inline-block;animation:livepulse 1.6s infinite}@keyframes livepulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}</style>
 <h3>התפלגות סטטוסים</h3>
 <div>{% for r in status_rows %}<div class="brow"><span class="lbl"><span class="pill {{ sclass.get(r.name, '') }}">{{ r.name }}</span></span><span class="track"><span class="fill" style="width:{{ r.w }}%"></span></span><span class="n">{{ r.n }}</span></div>{% endfor %}</div>
-<h3>משימות פתוחות</h3>
+<h3>משימות פתוחות · <a href="{{ url_for('continuity_view', site_id=s['id']) }}">דוח המשכיות</a></h3>
 <form method="get" style="margin-bottom:8px">מיון לפי <select name="sort">
 <option value="" {% if sort == '' %}selected{% endif %}>דחיפות (ברירת מחדל)</option>
 <option value="added" {% if sort == 'added' %}selected{% endif %}>זמן פרסום (החדשים קודם)</option>
