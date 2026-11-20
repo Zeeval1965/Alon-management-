@@ -2891,7 +2891,7 @@ def _words(text):
             if len(w) > 1 and w not in CONTINUITY_STOP}
 
 
-def continuity_analysis(site_id):
+def continuity_analysis(site_id, key_mode="topic_resp", threshold=CONTINUITY_THRESHOLD):
     """Read-only analysis of open tasks that continue one another: same topic and same responsible
     people, ranked by word overlap. Returns the counts before and after merging each group into one task."""
     today = dt.date.today().isoformat()
@@ -2921,9 +2921,16 @@ def continuity_analysis(site_id):
             out.append(f"חזרה ב-{occ.get(t['id'], 0)} פרוטוקולים")
         return out
 
+    def group_key(t):
+        if key_mode == "resp":
+            return responsible(t)
+        if key_mode == "topic":
+            return t["topic"] or ""
+        return (t["topic"] or "", responsible(t))
+
     keyed = {}
     for t in open_t:
-        keyed.setdefault((t["topic"] or "", responsible(t)), []).append(t)
+        keyed.setdefault(group_key(t), []).append(t)
     parent = {t["id"]: t["id"] for t in open_t}
 
     def find(x):
@@ -2940,7 +2947,7 @@ def continuity_analysis(site_id):
                 wb = _words(b["text"])
                 union = wa | wb
                 sim = len(wa & wb) / len(union) if union else 0.0
-                if sim >= CONTINUITY_THRESHOLD:
+                if sim >= threshold:
                     pair_scores[frozenset((a["id"], b["id"]))] = sim
                     parent[find(a["id"])] = find(b["id"])
     clusters = {}
@@ -2954,6 +2961,11 @@ def continuity_analysis(site_id):
     crit_before = sum(1 for t in open_t if reasons(t))
     crit_groups = [g for g in groups if any(reasons(t) for t in g)]
     crit_after = sum(1 for t in singles if reasons(t)) + len(crit_groups)
+
+    def strict(t):
+        return bool(t["target_date"] and t["target_date"] < today and (occ.get(t["id"], 0) >= 3 or _age_days(t) > 90))
+
+    crit_strict_after = sum(1 for t in singles if strict(t)) + sum(1 for g in groups if any(strict(t) for t in g))
 
     topic_before = Counter(t["topic"] or "ללא נושא" for t in open_t)
     topic_removed = Counter()
@@ -2988,22 +3000,30 @@ def continuity_analysis(site_id):
 
     return {"n_open": n_open, "removed": removed, "units_after": n_open - removed,
             "pct": round(100 * removed / n_open) if n_open else 0,
-            "crit_before": crit_before, "crit_after": crit_after,
+            "crit_before": crit_before, "crit_after": crit_after, "crit_strict_after": crit_strict_after,
             "topic_rows": topic_rows, "crit_rows": crit_rows, "group_rows": group_rows}
 
 
 @app.route("/sites/<int:site_id>/continuity")
 def continuity_view(site_id):
     s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
-    a = continuity_analysis(site_id)
+    mode = request.args.get("mode", "topic_resp")
+    if mode not in ("topic_resp", "resp", "topic"):
+        mode = "topic_resp"
+    try:
+        thr = min(0.9, max(0.05, float(request.args.get("thr", CONTINUITY_THRESHOLD))))
+    except ValueError:
+        thr = CONTINUITY_THRESHOLD
+    a = continuity_analysis(site_id, mode, thr)
     return page("דוח המשכיות משימות - " + s["name"], """
-<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה ללוח הבקרה</a></p>
+<p><a href="{{ url_for('site_view', site_id=s['id']) }}">חזרה ללוח הבקרה</a> · <a href="{{ url_for('continuity_tune', site_id=s['id']) }}">השוואת הגדרות</a></p>
 <p class="note">הדוח לקריאה בלבד ולא משנה משימות. כל קבוצה דורשת אישור לפני איחוד. דמיון הטקסט משמש לדירוג בלבד,
 ומשימות נבדקות רק כשהנושא והאחראים זהים.</p>
 <h3>סיכום מספרי</h3>
 <table class="cards"><tr><th>מדד</th><th>לפני</th><th>אחרי איחוד</th><th>שינוי</th></tr>
 <tr><td data-label="מדד">משימות פתוחות</td><td data-label="לפני">{{ a.n_open }}</td><td data-label="אחרי">{{ a.units_after }}</td><td data-label="שינוי">{{ a.removed }} ({{ a.pct }}%)</td></tr>
 <tr><td data-label="מדד">משימות קריטיות</td><td data-label="לפני">{{ a.crit_before }}</td><td data-label="אחרי">{{ a.crit_after }}</td><td data-label="שינוי">{{ a.crit_before - a.crit_after }}</td></tr>
+<tr><td data-label="מדד">קריטיות מחמירות (באיחור וגם חוזרת או מעל 90 יום), אחרי איחוד</td><td data-label="לפני">-</td><td data-label="אחרי">{{ a.crit_strict_after }}</td><td data-label="שינוי">-</td></tr>
 </table>
 <p class="note">קבוצות המשכיות שנמצאו: {{ a.group_rows|length }}</p>
 <h3>השפעה לפי נושא</h3>
@@ -3020,6 +3040,37 @@ def continuity_view(site_id):
 {% endfor %}</table>
 {% else %}<p class="note">לא נמצאו קבוצות המשכיות.</p>{% endfor %}
 """, s=s, a=a)
+
+
+CONTINUITY_VARIANTS = [
+    ("נושא + אחראי, סף 40%", "topic_resp", 0.40),
+    ("נושא + אחראי, סף 25%", "topic_resp", 0.25),
+    ("נושא + אחראי, סף 15%", "topic_resp", 0.15),
+    ("אחראי בלבד (בלי נושא), סף 40%", "resp", 0.40),
+    ("אחראי בלבד (בלי נושא), סף 25%", "resp", 0.25),
+    ("נושא בלבד, סף 25%", "topic", 0.25),
+]
+
+
+@app.route("/sites/<int:site_id>/continuity/tune")
+def continuity_tune(site_id):
+    """Runs several matching rules side by side. It does not judge which groups are correct:
+    each row links to the report so the groups can be checked by hand."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rows = []
+    for name, mode, thr in CONTINUITY_VARIANTS:
+        a = continuity_analysis(site_id, mode, thr)
+        rows.append({"name": name, "groups": len(a["group_rows"]), "largest": max((len(g["members"]) for g in a["group_rows"]), default=0),
+                     "removed": a["removed"], "after": a["units_after"], "pct": a["pct"],
+                     "crit_loose": a["crit_after"], "crit_strict": a["crit_strict_after"],
+                     "link": url_for("continuity_view", site_id=site_id, mode=mode, thr=thr)})
+    return page("השוואת הגדרות המשכיות - " + s["name"], """
+<p><a href="{{ url_for('continuity_view', site_id=s['id']) }}">חזרה לדוח</a></p>
+<p class="note">הכלי מחשב כמה משימות ייחסכו בכל הגדרה ומציג את הקבוצה הגדולה ביותר. הוא לא שופט נכונות:
+פתח קבוצות בכל שורה ובדוק בעיניים. קבוצה גדולה מאוד בהגדרה רופפת היא סימן לאיחוד יתר.</p>
+<table class="cards"><tr><th>הגדרה</th><th>קבוצות</th><th>הגדולה</th><th>יאוחדו</th><th>אחרי</th><th>הפחתה</th><th>קריטיות (רופפת)</th><th>קריטיות (מחמירה)</th><th>בדיקה</th></tr>
+{% for r in rows %}<tr><td data-label="הגדרה">{{ r.name }}</td><td data-label="קבוצות">{{ r.groups }}</td><td data-label="הגדולה">{{ r.largest }}</td><td data-label="יאוחדו">{{ r.removed }}</td><td data-label="אחרי">{{ r.after }}</td><td data-label="הפחתה">{{ r.pct }}%</td><td data-label="רופפת">{{ r.crit_loose }}</td><td data-label="מחמירה">{{ r.crit_strict }}</td><td data-label="בדיקה"><a href="{{ r.link }}">פתח קבוצות</a></td></tr>{% endfor %}</table>
+""", s=s, rows=rows)
 
 
 @app.route("/sites/<int:site_id>")
