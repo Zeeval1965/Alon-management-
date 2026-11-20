@@ -3052,6 +3052,52 @@ CONTINUITY_VARIANTS = [
 ]
 
 
+def _csv_download(filename, header, rows):
+    """CSV for download; UTF-8 with BOM so Hebrew opens correctly in Excel."""
+    import csv
+    import io
+    from flask import Response
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    for r in rows:
+        writer.writerow(["" if v is None else v for v in r])
+    data = buf.getvalue().encode("utf-8-sig")
+    return Response(data, mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.route("/admin/export/tasks.csv")
+def export_tasks_csv():
+    """All tasks of all sites, one row each. Contact names and phone numbers are not included;
+    task text is, because it is needed to compare tasks."""
+    rows = db().execute("""
+        SELECT s.name, t.id, t.public_no, t.topic, t.text, t.status, t.target_date, t.target_text,
+               t.created_at, t.published_at,
+               (SELECT COUNT(*) FROM task_assignments a WHERE a.task_id = t.id),
+               COUNT(o.meeting_id), MIN(m.meeting_date), MAX(m.meeting_date)
+        FROM tasks t
+        JOIN sites s ON s.id = t.site_id
+        LEFT JOIN task_occurrences o ON o.task_id = t.id
+        LEFT JOIN meetings m ON m.id = o.meeting_id
+        GROUP BY t.id
+        ORDER BY s.name, t.public_no""").fetchall()
+    header = ["site", "task_id", "public_no", "topic", "text", "status", "target_date", "target_text",
+              "created_at", "published_at", "responsible_count", "occurrences", "first_meeting", "last_meeting"]
+    return _csv_download("tasks.csv", header, rows)
+
+
+@app.route("/admin/export/meetings.csv")
+def export_meetings_csv():
+    rows = db().execute("""
+        SELECT s.name, m.id, m.meeting_date, m.status, m.month_current, m.month_total,
+               (SELECT COUNT(*) FROM task_occurrences o WHERE o.meeting_id = m.id)
+        FROM meetings m
+        JOIN sites s ON s.id = m.site_id
+        ORDER BY s.name, m.meeting_date""").fetchall()
+    header = ["site", "meeting_id", "meeting_date", "status", "month_current", "month_total", "tasks_in_meeting"]
+    return _csv_download("meetings.csv", header, rows)
+
+
 @app.route("/sites/<int:site_id>/continuity/tune")
 def continuity_tune(site_id):
     """Runs several matching rules side by side. It does not judge which groups are correct:
@@ -3066,6 +3112,7 @@ def continuity_tune(site_id):
                      "link": url_for("continuity_view", site_id=site_id, mode=mode, thr=thr)})
     return page("השוואת הגדרות המשכיות - " + s["name"], """
 <p><a href="{{ url_for('continuity_view', site_id=s['id']) }}">חזרה לדוח</a></p>
+<p><a href="{{ url_for('export_tasks_csv') }}">ייצוא כל המשימות (CSV)</a> · <a href="{{ url_for('export_meetings_csv') }}">ייצוא כל הפרוטוקולים (CSV)</a></p>
 <p class="note">הכלי מחשב כמה משימות ייחסכו בכל הגדרה ומציג את הקבוצה הגדולה ביותר. הוא לא שופט נכונות:
 פתח קבוצות בכל שורה ובדוק בעיניים. קבוצה גדולה מאוד בהגדרה רופפת היא סימן לאיחוד יתר.</p>
 <table class="cards"><tr><th>הגדרה</th><th>קבוצות</th><th>הגדולה</th><th>יאוחדו</th><th>אחרי</th><th>הפחתה</th><th>קריטיות (רופפת)</th><th>קריטיות (מחמירה)</th><th>בדיקה</th></tr>
