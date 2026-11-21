@@ -109,6 +109,9 @@ CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_group_rejects (
+  group_key TEXT PRIMARY KEY, created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS task_subitems (
   task_id INTEGER NOT NULL, position INTEGER NOT NULL, text TEXT NOT NULL,
   PRIMARY KEY(task_id, position)
@@ -768,8 +771,11 @@ def task_hygiene_view(site_id):
     saved_all = {}
     for tid, kw in db().execute("SELECT k.task_id, k.keyword FROM task_keywords k JOIN tasks t ON t.id = k.task_id WHERE t.site_id=?", (site_id,)).fetchall():
         saved_all.setdefault(tid, set()).add(kw)
+    rejected = {r[0] for r in db().execute("SELECT group_key FROM task_group_rejects").fetchall()}
     groups = []
     for g in task_hygiene.find_merge_groups(records, saved_keywords=saved_all):
+        if ",".join(str(i) for i in sorted(g)) in rejected:
+            continue  # marked "לא לאחד": not proposed again
         saved = {r[0] for r in db().execute("SELECT keyword FROM task_keywords WHERE task_id=?", (g[0],)).fetchall()}
         groups.append({"members": [by_id[i] for i in g],
                        "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g])
@@ -793,6 +799,10 @@ def task_hygiene_view(site_id):
 <input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
 {% for r in g.members[1:] %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
 <button style="background:#2E7D32">איחוד הקבוצה</button></form>
+<form method="post" action="{{ url_for('task_hygiene_reject', site_id=site_id) }}" style="margin:-12px 0 18px" onsubmit="return confirm('לסמן שהקבוצה לא תאוחד? היא לא תוצע שוב.')">
+<input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
+{% for r in g.members %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
+<button style="background:#757575">לא לאחד</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
         total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
 
@@ -826,6 +836,21 @@ def task_split_view(site_id, task_id):
 </form>
 <p><a href="{{ url_for('task_hygiene_view', site_id=site_id) }}">חזרה לבדיקת הכללים</a></p>
 """, parsed=parsed, items=items, s=s)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/reject", methods=["POST"])
+def task_hygiene_reject(site_id):
+    """Mark a proposed group as not to be merged. It will not be proposed again. Nothing else changes."""
+    ids = sorted({m for m in request.form.getlist("member", type=int) if m})
+    if len(ids) < 2:
+        abort(400)
+    marks = ",".join("?" * len(ids))
+    if len(db().execute(f"SELECT id FROM tasks WHERE site_id=? AND id IN ({marks})", (site_id, *ids)).fetchall()) != len(ids):
+        abort(400)
+    db().execute("INSERT OR IGNORE INTO task_group_rejects(group_key, created_at) VALUES (?,?)",
+                 (",".join(str(i) for i in ids), dt.datetime.now().isoformat(timespec="minutes")))
+    db().commit()
+    return redirect(url_for("task_hygiene_view", site_id=site_id))
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/merge", methods=["POST"])
