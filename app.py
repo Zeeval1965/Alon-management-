@@ -762,11 +762,6 @@ def task_hygiene_view(site_id):
                for t in tasks if (t["status"] or "") != "בוטלה"]
     by_id = {r["id"]: r for r in records}
     counts = Counter(r["status"] for r in records)
-    splits = []
-    for r in records:
-        s = task_hygiene.split_numbered(r["text"])
-        if s:
-            splits.append({"id": r["id"], "topic": r["topic"], "head": s["head"], "items": s["items"]})
     no_target = [r for r in records
                  if r["status"] not in task_hygiene.CLOSING_STATUSES and not r["target"].strip()]
     groups = []
@@ -782,11 +777,6 @@ def task_hygiene_view(site_id):
 <h2>ספירה לפי סטטוס</h2>
 <table><tr><th>סטטוס</th><th>כמות</th></tr>
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
-<h2>פיצול מוצע לתתי-סעיפים (לא נשמר)</h2>
-<p class="note">משימות ארוכות עם ספרור 1. 2. 3. שמוצעות לפיצול. הטקסט המקורי נשאר כמות שהוא.</p>
-<table><tr><th>מזהה</th><th>נושא</th><th>כותרת</th><th>תת-סעיף</th><th>טקסט</th><th>עריכה</th></tr>
-{% for s in splits %}{% for n, txt in s['items'] %}<tr><td>{{ s['id'] }}</td><td>{{ s['topic'] }}</td><td>{{ s['head'] if loop.first else '' }}</td><td>{{ n }}</td><td>{{ txt }}</td><td>{% if loop.first %}<a href="{{ url_for('task_split_view', site_id=site_id, task_id=s['id']) }}" target="_blank" rel="noopener">פתיחה בחלון</a>{% endif %}</td></tr>{% endfor %}
-{% else %}<tr><td colspan="6">אין משימות לפיצול</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -796,7 +786,7 @@ def task_hygiene_view(site_id):
 מילות מפתח: {% for k in g.keywords %}<label style="margin-left:8px"><input type="checkbox" name="kw" value="{{ k }}" {% if (not g.saved) or (k in g.saved) %}checked{% endif %}> {{ k }}</label>{% endfor %}
 <input name="extra" placeholder="מילה נוספת" style="margin-right:8px"> <button>שמירה</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
-        total=len(records), counts=counts, no_target=no_target, groups=groups, splits=splits, site_id=site_id)
+        total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/split/<int:task_id>", methods=["GET", "POST"])
@@ -814,12 +804,7 @@ def task_split_view(site_id, task_id):
         return redirect(url_for("task_split_view", site_id=site_id, task_id=task_id))
     saved = db().execute("SELECT text FROM task_subitems WHERE task_id=? ORDER BY position", (task_id,)).fetchall()
     parsed = task_hygiene.split_numbered(t["text"])
-    if saved:
-        items = [r[0] for r in saved]
-    elif parsed:
-        items = [txt for _, txt in parsed["items"]]
-    else:
-        items = []
+    items = [r[0] for r in saved]  # starts empty: the split is made by hand
     return page("פיצול משימה " + short_no(t["public_no"]), """
 <p class="note">הסעיפים מסודרים לפי הסדר. ערוך כל תיבה לפי הצורך ולחץ שמירה. השמירה לא משנה את המשימה המקורית.</p>
 {% if parsed and parsed.head %}<p><b>כותרת:</b> {{ parsed.head }}</p>{% endif %}
@@ -3409,7 +3394,7 @@ def site_view(site_id):
 </select> <button>מיין</button></form>
 <table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th style="min-width:220px">לטיפול</th><th>יעד</th><th>סטטוס</th><th>הדפסה</th></tr>
 {% for t in open_t %}<tr class="{{ rowclass(t) }}"><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td>
-<td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
+<td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }} <a href="{{ url_for('task_split_view', site_id=s['id'], task_id=t['id']) }}" target="_blank" rel="noopener" style="font-size:12px">[פיצול]</a></td><td data-label="לטיפול" style="min-width:220px;white-space:normal">{% for a in linked.get(t['id'], []) %}<a href="{{ url_for('contact_card', site_id=s['id'], contact_id=a['id']) }}">{{ a['name'] }}</a><br>{% else %}{{ t['assignee_text'] or '' }}{% endfor %}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>{% if t['id'] in closure_ids %}<br><span class="note">לבדיקה: לא הופיעה בפרוטוקול האחרון</span>{% endif %}{% if t['id'] in last %}<br><span class="note">עודכן ע"י {{ last[t['id']]['changed_by'] }}, {{ last[t['id']]['changed_at'] }}</span>{% endif %}
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td>
