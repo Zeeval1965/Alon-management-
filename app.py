@@ -771,6 +771,20 @@ def task_hygiene_view(site_id):
     saved_all = {}
     for tid, kw in db().execute("SELECT k.task_id, k.keyword FROM task_keywords k JOIN tasks t ON t.id = k.task_id WHERE t.site_id=?", (site_id,)).fetchall():
         saved_all.setdefault(tid, set()).add(kw)
+    # review list: what the rules cannot classify (read only, nothing is changed)
+    review = []
+    for r in records:
+        topic = task_hygiene.normalize_topic(r["topic"])
+        if topic == task_hygiene.TENANT_CATEGORY:
+            why = "שינויי דיירים (נשאר נפרד)"
+        elif not topic:
+            why = "ללא נושא"
+        elif not r["responsible"].strip():
+            why = "ללא אחראי"
+        else:
+            continue
+        review.append({"id": r["id"], "topic": r["topic"], "responsible": r["responsible"],
+                       "text": r["text"], "status": r["status"], "why": why})
     rejected = {r[0] for r in db().execute("SELECT group_key FROM task_group_rejects").fetchall()}
     groups = []
     for g in task_hygiene.find_merge_groups(records, saved_keywords=saved_all):
@@ -787,6 +801,11 @@ def task_hygiene_view(site_id):
 <h2>ספירה לפי סטטוס</h2>
 <table><tr><th>סטטוס</th><th>כמות</th></tr>
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
+<h2>רשימת בדיקה: מה שהכללים לא סיווגו (לקריאה בלבד)</h2>
+<p class="note">אלה משימות שלא נכנסות למערכת החוקים: בלי נושא, בלי אחראי, או "שינויי דיירים". הן לא מאוחדות אוטומטית.</p>
+<table><tr><th>מזהה</th><th>סיבה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
+{% for r in review %}<tr><td>{{ r['id'] }}</td><td>{{ r['why'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>
+{% else %}<tr><td colspan="6">כל המשימות סווגו</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -804,7 +823,7 @@ def task_hygiene_view(site_id):
 {% for r in g.members %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
 <button style="background:#757575">לא לאחד</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
-        total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
+        total=len(records), counts=counts, no_target=no_target, groups=groups, review=review, site_id=site_id)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/split/<int:task_id>", methods=["GET", "POST"])
