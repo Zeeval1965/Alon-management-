@@ -109,6 +109,10 @@ CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_subitems (
+  task_id INTEGER NOT NULL, position INTEGER NOT NULL, text TEXT NOT NULL,
+  PRIMARY KEY(task_id, position)
+);
 CREATE TABLE IF NOT EXISTS task_keywords (
   task_id INTEGER NOT NULL, keyword TEXT NOT NULL, PRIMARY KEY(task_id, keyword)
 );
@@ -780,9 +784,9 @@ def task_hygiene_view(site_id):
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
 <h2>פיצול מוצע לתתי-סעיפים (לא נשמר)</h2>
 <p class="note">משימות ארוכות עם ספרור 1. 2. 3. שמוצעות לפיצול. הטקסט המקורי נשאר כמות שהוא.</p>
-<table><tr><th>מזהה</th><th>נושא</th><th>כותרת</th><th>תת-סעיף</th><th>טקסט</th></tr>
-{% for s in splits %}{% for n, txt in s['items'] %}<tr><td>{{ s['id'] }}</td><td>{{ s['topic'] }}</td><td>{{ s['head'] if loop.first else '' }}</td><td>{{ n }}</td><td>{{ txt }}</td></tr>{% endfor %}
-{% else %}<tr><td colspan="5">אין משימות לפיצול</td></tr>{% endfor %}</table>
+<table><tr><th>מזהה</th><th>נושא</th><th>כותרת</th><th>תת-סעיף</th><th>טקסט</th><th>עריכה</th></tr>
+{% for s in splits %}{% for n, txt in s['items'] %}<tr><td>{{ s['id'] }}</td><td>{{ s['topic'] }}</td><td>{{ s['head'] if loop.first else '' }}</td><td>{{ n }}</td><td>{{ txt }}</td><td>{% if loop.first %}<a href="{{ url_for('task_split_view', site_id=site_id, task_id=s['id']) }}" target="_blank" rel="noopener">פתיחה בחלון</a>{% endif %}</td></tr>{% endfor %}
+{% else %}<tr><td colspan="6">אין משימות לפיצול</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -793,6 +797,42 @@ def task_hygiene_view(site_id):
 <input name="extra" placeholder="מילה נוספת" style="margin-right:8px"> <button>שמירה</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
         total=len(records), counts=counts, no_target=no_target, groups=groups, splits=splits, site_id=site_id)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/split/<int:task_id>", methods=["GET", "POST"])
+def task_split_view(site_id, task_id):
+    """One long task split into numbered sub-items, editable. Saved sub-items are kept in
+    task_subitems; the task itself is never changed."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    t = db().execute("SELECT * FROM tasks WHERE id=? AND site_id=?", (task_id, site_id)).fetchone() or abort(404)
+    if request.method == "POST":
+        texts = [x.strip() for x in request.form.getlist("item") if x.strip()]
+        db().execute("DELETE FROM task_subitems WHERE task_id=?", (task_id,))
+        for pos, txt in enumerate(texts, start=1):
+            db().execute("INSERT INTO task_subitems(task_id, position, text) VALUES (?,?,?)", (task_id, pos, txt))
+        db().commit()
+        return redirect(url_for("task_split_view", site_id=site_id, task_id=task_id))
+    saved = db().execute("SELECT text FROM task_subitems WHERE task_id=? ORDER BY position", (task_id,)).fetchall()
+    parsed = task_hygiene.split_numbered(t["text"])
+    if saved:
+        items = [r[0] for r in saved]
+    elif parsed:
+        items = [txt for _, txt in parsed["items"]]
+    else:
+        items = []
+    return page("פיצול משימה " + short_no(t["public_no"]), """
+<p class="note">הסעיפים מסודרים לפי הסדר. ערוך כל תיבה לפי הצורך ולחץ שמירה. השמירה לא משנה את המשימה המקורית.</p>
+{% if parsed and parsed.head %}<p><b>כותרת:</b> {{ parsed.head }}</p>{% endif %}
+<form method="post">
+{% for txt in items %}
+<h4>סעיף {{ loop.index }}</h4>
+<textarea name="item" rows="4" style="width:100%">{{ txt }}</textarea>
+{% else %}<p>לא נמצא ספרור לפיצול. אפשר להוסיף סעיף ידנית בתיבה הבאה.</p>
+<textarea name="item" rows="4" style="width:100%"></textarea>{% endfor %}
+<p><button>שמירה</button></p>
+</form>
+<p><a href="{{ url_for('task_hygiene_view', site_id=site_id) }}">חזרה לבדיקת הכללים</a></p>
+""", parsed=parsed, items=items, s=s)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/keywords", methods=["POST"])
