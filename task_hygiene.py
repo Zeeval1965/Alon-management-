@@ -106,8 +106,8 @@ def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
         saved_kw |= set(words)
     buckets = defaultdict(list)
     for t in tasks:
-        if t.get("status") in CLOSING_STATUSES:
-            continue
+        if t.get("status") in CLOSING_STATUSES or t.get("status") in {ONE_PROTOCOL_STATUS, "בוטלה"}:
+            continue  # לידיעה closes after one protocol; בוטלה is cancelled: neither is merged
         topic = normalize_topic(t.get("topic"))
         if not topic or topic == TENANT_CATEGORY:
             continue  # no topic: never merged by topic; tenant-change items stay separate

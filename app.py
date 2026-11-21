@@ -235,7 +235,8 @@ def init_db():
                  "ALTER TABLE plans ADD COLUMN drive_file_id TEXT",
                  "ALTER TABLE plans ADD COLUMN drive_url TEXT",
                  "ALTER TABLE plans ADD COLUMN uploaded_by TEXT",
-                 "ALTER TABLE plans ADD COLUMN stage TEXT"):
+                 "ALTER TABLE plans ADD COLUMN stage TEXT",
+                 "ALTER TABLE tasks ADD COLUMN merged_into INTEGER"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -788,6 +789,10 @@ def task_hygiene_view(site_id):
 <input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
 מילות מפתח: {% for k in g.keywords %}<label style="margin-left:8px"><input type="checkbox" name="kw" value="{{ k }}" {% if (not g.saved) or (k in g.saved) %}checked{% endif %}> {{ k }}</label>{% endfor %}
 <input name="extra" placeholder="מילה נוספת" style="margin-right:8px"> <button>שמירה</button></form>
+<form method="post" action="{{ url_for('task_hygiene_merge', site_id=site_id) }}" style="margin:0 0 18px" onsubmit="return confirm('לאחד את הקבוצה לתוך המשימה הראשונה? הפעולה נרשמת ביומן.')">
+<input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
+{% for r in g.members[1:] %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
+<button style="background:#2E7D32">איחוד הקבוצה</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
         total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
 
@@ -821,6 +826,29 @@ def task_split_view(site_id, task_id):
 </form>
 <p><a href="{{ url_for('task_hygiene_view', site_id=site_id) }}">חזרה לבדיקת הכללים</a></p>
 """, parsed=parsed, items=items, s=s)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/merge", methods=["POST"])
+def task_hygiene_merge(site_id):
+    """Merge one approved group into its first task. The other tasks keep their record: their
+    protocol history moves to the first task, they are set to בוטלה with merged_into, and every
+    step is logged."""
+    head = request.form.get("task_id", type=int)
+    members = [m for m in request.form.getlist("member", type=int) if m and m != head]
+    if not head or not members:
+        abort(400)
+    ids = [head] + members
+    marks = ",".join("?" * len(ids))
+    found = db().execute(f"SELECT id FROM tasks WHERE site_id=? AND id IN ({marks})", (site_id, *ids)).fetchall()
+    if len(found) != len(ids):
+        abort(400)
+    for m in members:
+        db().execute("UPDATE task_occurrences SET task_id=? WHERE task_id=?", (head, m))
+        db().execute("UPDATE tasks SET status='בוטלה', merged_into=? WHERE id=?", (head, m))
+        log_task_status(m, "בוטלה", f"אוחדה לתוך משימה {head}")
+    log_task_status(head, "נשארה לאחר איחוד", f"אוחדו אליה משימות: {', '.join(str(m) for m in members)}")
+    db().commit()
+    return redirect(url_for("task_hygiene_view", site_id=site_id))
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/keywords", methods=["POST"])
