@@ -758,6 +758,11 @@ def task_hygiene_view(site_id):
                for t in tasks if (t["status"] or "") != "בוטלה"]
     by_id = {r["id"]: r for r in records}
     counts = Counter(r["status"] for r in records)
+    splits = []
+    for r in records:
+        s = task_hygiene.split_numbered(r["text"])
+        if s:
+            splits.append({"id": r["id"], "topic": r["topic"], "head": s["head"], "items": s["items"]})
     no_target = [r for r in records
                  if r["status"] not in task_hygiene.CLOSING_STATUSES and not r["target"].strip()]
     groups = []
@@ -773,6 +778,11 @@ def task_hygiene_view(site_id):
 <h2>ספירה לפי סטטוס</h2>
 <table><tr><th>סטטוס</th><th>כמות</th></tr>
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
+<h2>פיצול מוצע לתתי-סעיפים (לא נשמר)</h2>
+<p class="note">משימות ארוכות עם ספרור 1. 2. 3. שמוצעות לפיצול. הטקסט המקורי נשאר כמות שהוא.</p>
+<table><tr><th>מזהה</th><th>נושא</th><th>כותרת</th><th>תת-סעיף</th><th>טקסט</th></tr>
+{% for s in splits %}{% for n, txt in s['items'] %}<tr><td>{{ s['id'] }}</td><td>{{ s['topic'] }}</td><td>{{ s['head'] if loop.first else '' }}</td><td>{{ n }}</td><td>{{ txt }}</td></tr>{% endfor %}
+{% else %}<tr><td colspan="5">אין משימות לפיצול</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -782,7 +792,7 @@ def task_hygiene_view(site_id):
 מילות מפתח: {% for k in g.keywords %}<label style="margin-left:8px"><input type="checkbox" name="kw" value="{{ k }}" {% if (not g.saved) or (k in g.saved) %}checked{% endif %}> {{ k }}</label>{% endfor %}
 <input name="extra" placeholder="מילה נוספת" style="margin-right:8px"> <button>שמירה</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
-        total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
+        total=len(records), counts=counts, no_target=no_target, groups=groups, splits=splits, site_id=site_id)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/keywords", methods=["POST"])

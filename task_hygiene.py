@@ -130,6 +130,29 @@ def find_merge_groups(tasks, threshold=0.40):
     return groups
 
 
+_NUMBERED = re.compile(r"(?<!\S)(\d{1,2})\.\s+")
+
+
+def split_numbered(text):
+    """Split a long task text into its numbered sub-items (1. 2. 3. ...), in order.
+    Only numbers that continue the sequence count, so dates and drawing numbers are skipped.
+    Returns None when there are fewer than two sub-items. Dry run: nothing is written."""
+    text = text or ""
+    found, expect = [], 1
+    for m in _NUMBERED.finditer(text):
+        if int(m.group(1)) == expect:
+            found.append(m)
+            expect += 1
+    if len(found) < 2:
+        return None
+    head = text[:found[0].start()].strip()
+    items = []
+    for i, m in enumerate(found):
+        end = found[i + 1].start() if i + 1 < len(found) else len(text)
+        items.append((int(m.group(1)), text[m.end():end].strip()))
+    return {"head": head, "items": items}
+
+
 def merge_record(group_tasks):
     """Build one merged record from a group. Keeps the first date and sets the last update date."""
     ordered = sorted(group_tasks, key=lambda t: t.get("first_date") or "")
