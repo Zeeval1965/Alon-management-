@@ -147,10 +147,11 @@ def _close(_):
 
 TASK_STATUS_SEED = [("פתוחה", "open"), ("בטיפול", "open"), ("ממתינה לאישור", "open"),
                     ("ממתין למפרט", "open"), ("לבדיקה חוזרת", "open"), ("ממתינה לבדיקה", "open"),
-                    ("מעוכבת", "open"), ("לידיעה", "info"), ("בוצע", "closed"), ("בוטלה", "closed")]
+                    ("מעוכבת", "open"), ("לידיעה", "info"), ("בוצע", "closed"), ("בוטלה", "closed"),
+                    ("החלטה", "closed"), ("שוטף", "open"), ("מעקב", "open")]
 SEVERITY_SEED = ["קריטי", "גבוה", "בינוני", "נמוך"]
 ITEM_TYPE_SEED = ["הערה", "אי-דיוק", "בקשה למפרט", "נושא חזית", "חניית יועץ", "ליקוי ביצוע", "פריט פתוח"]
-CLOSED_STATUSES = ("בוצע", "בוטלה")
+CLOSED_STATUSES = ("בוצע", "בוטלה", "החלטה")
 INFO_STATUSES = ("לידיעה",)
 
 
@@ -551,7 +552,7 @@ def publish_meeting(meeting_id):
         # only tasks from the same kind of protocol: a weekly report does not close execution items
         gone = db().execute(
             """SELECT t.id FROM tasks t JOIN meetings lm ON lm.id = t.last_meeting_id
-               WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'בוטלה') AND lm.kind=? AND t.last_meeting_id != ?""",
+               WHERE t.site_id=? AND t.status NOT IN ('בוצע', 'בוטלה', 'החלטה') AND lm.kind=? AND t.last_meeting_id != ?""",
             (site_id, m["kind"], meeting_id)).fetchall()
         for t in gone:
             if t["id"] not in listed_ids:
@@ -646,7 +647,7 @@ def send_task_reminders(site_id, today=None):
     today = today or dt.date.today()
     limit = (today + dt.timedelta(days=1)).isoformat()
     tasks = db().execute(
-        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה', 'בוטלה')
+        """SELECT * FROM tasks WHERE site_id=? AND status NOT IN ('בוצע', 'לידיעה', 'בוטלה', 'החלטה')
            AND (target_date IS NOT NULL AND target_date <= ?)""", (site_id, limit)).fetchall()
     for t in tasks:
         when = "באיחור" if t["target_date"] < today.isoformat() else "תאריך היעד הוא מחר או היום"
