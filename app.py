@@ -109,6 +109,9 @@ CREATE TABLE IF NOT EXISTS plans (
   id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, title TEXT NOT NULL, version TEXT,
   file_path TEXT NOT NULL, original_name TEXT, uploaded_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_keywords (
+  task_id INTEGER NOT NULL, keyword TEXT NOT NULL, PRIMARY KEY(task_id, keyword)
+);
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS site_delete_requests (
   token_hash TEXT PRIMARY KEY, site_id INTEGER NOT NULL, requested_by TEXT, created_at TEXT, expires_at TEXT
@@ -757,7 +760,12 @@ def task_hygiene_view(site_id):
     counts = Counter(r["status"] for r in records)
     no_target = [r for r in records
                  if r["status"] not in task_hygiene.CLOSING_STATUSES and not r["target"].strip()]
-    groups = [[by_id[i] for i in g] for g in task_hygiene.find_merge_groups(records)]
+    groups = []
+    for g in task_hygiene.find_merge_groups(records):
+        saved = {r[0] for r in db().execute("SELECT keyword FROM task_keywords WHERE task_id=?", (g[0],)).fetchall()}
+        groups.append({"members": [by_id[i] for i in g],
+                       "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g]),
+                       "saved": saved})
     return render_template_string(
         PAGE_CSS + "<h1>בדיקת משימות (ללא שינוי)</h1>" + SECTION_NAV + """
 <p>סה"כ משימות: {{ total }} | פתוחות בלי יעד (יעברו למעקב): {{ no_target|length }} | קבוצות לאיחוד: {{ groups|length }}</p>
@@ -765,10 +773,33 @@ def task_hygiene_view(site_id):
 <table><tr><th>סטטוס</th><th>כמות</th></tr>
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
+{% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
-{% for g in groups %}{% for r in g %}<tr><td>{{ r['id'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>{% endfor %}
-{% else %}<tr><td colspan="5">אין קבוצות</td></tr>{% endfor %}</table>""",
+{% for r in g.members %}<tr><td>{{ r['id'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('task_hygiene_keywords', site_id=site_id) }}" style="margin:4px 0 14px">
+<input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
+מילות מפתח: {% for k in g.keywords %}<label style="margin-left:8px"><input type="checkbox" name="kw" value="{{ k }}" {% if (not g.saved) or (k in g.saved) %}checked{% endif %}> {{ k }}</label>{% endfor %}
+<input name="extra" placeholder="מילה נוספת" style="margin-right:8px"> <button>שמירה</button></form>
+{% else %}<p>אין קבוצות</p>{% endfor %}""",
         total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/keywords", methods=["POST"])
+def task_hygiene_keywords(site_id):
+    """Save the keyword tags chosen for one proposed group (keyed by the group's first task).
+    Writes only to task_keywords; no task is changed."""
+    task_id = request.form.get("task_id", type=int)
+    if not task_id or not db().execute("SELECT 1 FROM tasks WHERE id=? AND site_id=?", (task_id, site_id)).fetchone():
+        abort(400)
+    chosen = [k.strip() for k in request.form.getlist("kw") if k.strip()]
+    extra = (request.form.get("extra") or "").strip()
+    if extra:
+        chosen.append(extra)
+    db().execute("DELETE FROM task_keywords WHERE task_id=?", (task_id,))
+    for k in dict.fromkeys(chosen):
+        db().execute("INSERT INTO task_keywords(task_id, keyword) VALUES (?,?)", (task_id, k))
+    db().commit()
+    return redirect(url_for("task_hygiene_view", site_id=site_id))
 
 
 @app.route("/sites/<int:site_id>/decisions", methods=["GET", "POST"])
