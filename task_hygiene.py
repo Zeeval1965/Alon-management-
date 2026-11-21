@@ -14,6 +14,7 @@ TENANT_CATEGORY = "שינוי דיירים"
 TENANT_CATEGORY_ALIASES = {"שינוי דיירים", "שינויי דיירים"}
 
 _STOP = {"של", "את", "על", "עם", "כי", "או", "גם", "זה", "זו", "יש", "כל", "אל", "in"}
+MIN_EXACT_WORDS = 4  # identical repeats without topic/responsible merge only when the text has this many words
 NEGATIONS = {"לא", "אין", "ללא"}  # a negation changes the meaning: "מאושרים" and "לא מאושרים" never merge
 
 
@@ -56,6 +57,30 @@ def containment(a, b):
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / min(len(wa), len(wb))
+
+
+def is_tenant(task):
+    """Tenant-change item by topic or text, in any spelling. Never merged across apartments."""
+    topic = (task.get("topic") or "")
+    text = (task.get("text") or "")
+    return normalize_topic(topic) == TENANT_CATEGORY or "שינוי דיירים" in topic + " " + text or "שינויי דיירים" in topic + " " + text
+
+
+def exact_text(text):
+    """Text for an exact-repeat check: case, spacing and punctuation ignored. Empty if no words."""
+    return " ".join(re.findall(r"[\w֐-׿]+", (text or "").lower()))
+
+
+def identical_group(members):
+    """True if every task in the group has the same exact text (the rule for repeats).
+    Such a group merges even without a topic or responsible, but never across tenant changes."""
+    texts = {exact_text(m.get("text")) for m in members}
+    topics = {normalize_topic(m.get("topic")) for m in members}
+    if len(texts) != 1 or "" in texts or TENANT_CATEGORY in topics:
+        return False
+    # a short generic label ("תכנון", "אדריכלות", "חריגים מאושרים") is not a task text: a repeat
+    # of it may stand for different items, so it needs at least MIN_EXACT_WORDS words
+    return len(texts.pop().split()) >= MIN_EXACT_WORDS
 
 
 def keywords(texts, top=8):
@@ -109,8 +134,14 @@ def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
         if t.get("status") in CLOSING_STATUSES or t.get("status") in {ONE_PROTOCOL_STATUS, "בוטלה"}:
             continue  # לידיעה closes after one protocol; בוטלה is cancelled: neither is merged
         topic = normalize_topic(t.get("topic"))
-        if not topic or topic == TENANT_CATEGORY:
-            continue  # no topic: never merged by topic; tenant-change items stay separate
+        if is_tenant(t):
+            continue  # tenant-change items stay separate, always (any apartment, any spelling)
+        if not topic or not (t.get("responsible") or "").strip():
+            # no topic or no responsible: only an identical text repeat may merge (the rule for repeats)
+            exact = exact_text(t.get("text"))
+            if exact:
+                buckets[("exact", exact)].append(t)
+            continue
         buckets[merge_key(t)].append(t)
 
     groups = []

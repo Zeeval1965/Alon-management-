@@ -802,6 +802,9 @@ def task_hygiene_view(site_id):
 <table><tr><th>סטטוס</th><th>כמות</th></tr>
 {% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
 <h2>רשימת בדיקה: מה שהכללים לא סיווגו (לקריאה בלבד)</h2>
+<p><a href="{{ url_for('task_hygiene_review_csv', site_id=site_id) }}" style="background:#ADD8E6;color:#000;padding:6px 12px;border-radius:6px;text-decoration:none;font-weight:700">הורדת רשימת הבדיקה (CSV)</a></p>
+<form method="post" action="{{ url_for('task_hygiene_auto_merge', site_id=site_id) }}" onsubmit="return confirm('לאחד אוטומטית את כל הקבוצות שעוברות את הכללים? כל שלב נרשם ביומן.')" style="margin:6px 0 12px">
+<button style="background:#2E7D32">איחוד אוטומטי (רק קבוצות שעוברות את הכללים)</button></form>
 <p class="note">אלה משימות שלא נכנסות למערכת החוקים: בלי נושא, בלי אחראי, או "שינויי דיירים". הן לא מאוחדות אוטומטית.</p>
 <table><tr><th>מזהה</th><th>סיבה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
 {% for r in review %}<tr><td>{{ r['id'] }}</td><td>{{ r['why'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>
@@ -855,6 +858,70 @@ def task_split_view(site_id, task_id):
 </form>
 <p><a href="{{ url_for('task_hygiene_view', site_id=site_id) }}">חזרה לבדיקת הכללים</a></p>
 """, parsed=parsed, items=items, s=s)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/auto-merge", methods=["POST"])
+def task_hygiene_auto_merge(site_id):
+    """Merge every proposed group that passes all rules: one topic (not empty, not tenant-change),
+    a responsible person, one negation state and the similarity threshold. Other groups are skipped.
+    The first task of each group stays; the others are set to בוטלה, their history moves, and every step is logged."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=? AND COALESCE(status,'') != 'בוטלה'", (site_id,)).fetchall()
+    records = [{"id": t["id"], "status": t["status"] or "", "topic": t["topic"] or "", "text": t["text"] or "",
+                "responsible": t["assignee_text"] or "", "target": t["target_text"] or "", "buildings": [],
+                "first_date": t["created_at"], "last_date": t["published_at"]} for t in tasks]
+    by_id = {r["id"]: r for r in records}
+    saved_all = {}
+    for tid, kw in db().execute("SELECT k.task_id, k.keyword FROM task_keywords k JOIN tasks t ON t.id = k.task_id WHERE t.site_id=?", (site_id,)).fetchall():
+        saved_all.setdefault(tid, set()).add(kw)
+    rejected = {r[0] for r in db().execute("SELECT group_key FROM task_group_rejects").fetchall()}
+    merged_groups = merged_tasks = skipped = 0
+    for g in task_hygiene.find_merge_groups(records, saved_keywords=saved_all):
+        if ",".join(str(i) for i in sorted(g)) in rejected:
+            continue
+        members = [by_id[i] for i in g]
+        topics = {task_hygiene.normalize_topic(m["topic"]) for m in members}
+        passes = ((len(topics) == 1 and "" not in topics and task_hygiene.TENANT_CATEGORY not in topics
+                   and all(m["responsible"].strip() for m in members))
+                  or task_hygiene.identical_group(members))
+        if not passes:
+            skipped += 1
+            continue
+        head = min(g)
+        for m_id in (i for i in g if i != head):
+            db().execute("UPDATE task_occurrences SET task_id=? WHERE task_id=?", (head, m_id))
+            db().execute("UPDATE tasks SET status='בוטלה', merged_into=? WHERE id=?", (head, m_id))
+            log_task_status(m_id, "בוטלה", f"אוחדה אוטומטית לתוך משימה {head}")
+        log_task_status(head, "נשארה לאחר איחוד אוטומטי", f"אוחדו אליה: {', '.join(str(i) for i in g if i != head)}")
+        merged_groups += 1
+        merged_tasks += len(g) - 1
+    db().commit()
+    return page("תוצאת איחוד אוטומטי - " + s["name"], """
+<p>אוחדו {{ mg }} קבוצות ({{ mt }} משימות בוטלו לטובת המשימה הראשונה בכל קבוצה).</p>
+<p>קבוצות שלא עברו את הכללים ונשארו לבדיקה ידנית: {{ sk }}.</p>
+<p><a href="{{ url_for('task_hygiene_view', site_id=s['id']) }}">חזרה לבדיקת הכללים</a></p>
+""", s=s, mg=merged_groups, mt=merged_tasks, sk=skipped)
+
+
+@app.route("/sites/<int:site_id>/task-hygiene/review.csv")
+def task_hygiene_review_csv(site_id):
+    """Download the review list (what the rules could not classify) as CSV. Read only."""
+    db().execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    rows = []
+    for t in db().execute("SELECT * FROM tasks WHERE site_id=? AND COALESCE(status,'') != 'בוטלה' ORDER BY public_no", (site_id,)).fetchall():
+        topic = task_hygiene.normalize_topic(t["topic"])
+        if topic == task_hygiene.TENANT_CATEGORY:
+            why = "שינויי דיירים"
+        elif not topic:
+            why = "ללא נושא"
+        elif not (t["assignee_text"] or "").strip():
+            why = "ללא אחראי"
+        else:
+            continue
+        rows.append([t["id"], t["public_no"], why, t["topic"] or "", t["assignee_text"] or "",
+                     t["text"] or "", t["status"] or "", t["target_text"] or ""])
+    header = ["id", "public_no", "reason", "topic", "responsible", "text", "status", "target"]
+    return _csv_download("review_site_%d.csv" % site_id, header, rows)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/reject", methods=["POST"])
