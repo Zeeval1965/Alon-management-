@@ -16,6 +16,7 @@ from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import drive_storage
+import task_hygiene
 from protocol_parser import extract_rows, extract_supervision_items
 
 DB_PATH = os.environ.get("APP_DB", os.path.join(os.path.dirname(__file__), "app.db"))
@@ -741,6 +742,33 @@ td,th{border:1px solid #ddd;padding:6px;vertical-align:top}
 button{background:#C62828;color:#fff;border:0;padding:6px 12px}
 input,textarea,select{padding:4px;margin:2px}
 </style>"""
+
+
+@app.route("/sites/<int:site_id>/task-hygiene")
+def task_hygiene_view(site_id):
+    """Dry run of the task rules: shows what would change. Writes nothing."""
+    tasks = db().execute("SELECT * FROM tasks WHERE site_id=?", (site_id,)).fetchall()
+    records = [{"id": t["id"], "status": t["status"] or "", "topic": t["topic"] or "",
+                "text": t["text"] or "", "responsible": t["assignee_text"] or "",
+                "target": t["target_text"] or "", "buildings": [],
+                "first_date": t["created_at"], "last_date": t["published_at"]}
+               for t in tasks if (t["status"] or "") != "בוטלה"]
+    by_id = {r["id"]: r for r in records}
+    counts = Counter(r["status"] for r in records)
+    no_target = [r for r in records
+                 if r["status"] not in task_hygiene.CLOSING_STATUSES and not r["target"].strip()]
+    groups = [[by_id[i] for i in g] for g in task_hygiene.find_merge_groups(records)]
+    return render_template_string(
+        PAGE_CSS + "<h1>בדיקת משימות (ללא שינוי)</h1>" + SECTION_NAV + """
+<p>סה"כ משימות: {{ total }} | פתוחות בלי יעד (יעברו למעקב): {{ no_target|length }} | קבוצות לאיחוד: {{ groups|length }}</p>
+<h2>ספירה לפי סטטוס</h2>
+<table><tr><th>סטטוס</th><th>כמות</th></tr>
+{% for s, n in counts.items() %}<tr><td>{{ s }}</td><td>{{ n }}</td></tr>{% endfor %}</table>
+<h2>קבוצות לאיחוד (לאישור)</h2>
+<table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
+{% for g in groups %}{% for r in g %}<tr><td>{{ r['id'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>{% endfor %}
+{% else %}<tr><td colspan="5">אין קבוצות</td></tr>{% endfor %}</table>""",
+        total=len(records), counts=counts, no_target=no_target, groups=groups, site_id=site_id)
 
 
 @app.route("/sites/<int:site_id>/decisions", methods=["GET", "POST"])
@@ -3222,6 +3250,7 @@ def site_view(site_id):
 <p>עלייה לקרקע {{ land_txt }} · מסירה לפי חוזה {{ delivery_txt }} · חודש מסירה מחושב {{ end_txt }} · חודש ביצוע נוכחי {{ month_txt }}</p>
 {% if months_strip %}<div class="mstrip" title="חודשי הביצוע לפי החוזה">{% for m in months_strip %}<span class="mcell {{ m }}"></span>{% endfor %}</div>{% endif %}
 <p><a href="{{ url_for('meeting_upload', site_id=s['id']) }}">העלאת פרוטוקול</a> · <a href="{{ url_for('continuity_view', site_id=s['id']) }}" style="background:#c62828;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-weight:700">הרץ בדיקת המשכיות</a></p>
+<form method="get" action="{{ url_for('task_hygiene_view', site_id=s['id']) }}" style="margin:6px 0"><button type="submit" style="background:#ADD8E6;color:#000;border:1px solid #7FB8D6;padding:6px 12px;border-radius:6px;font-weight:700">[זמני] בדיקת כללי משימות (ללא שינוי)</button></form>
 <h3>תוכניות האתר ({{ plan_rows|length }}) · <a href="{{ url_for('plans_view', site_id=s['id']) }}">רשימה והיסטוריית גרסאות</a></h3>
 {% if plan_rows %}<table class="cards"><tr><th>תחום</th><th>תוכנית</th><th>מהדורה</th><th>הועלה</th><th>מי</th><th>קובץ</th></tr>
 {% for p in plan_rows %}<tr><td data-label="תחום">{{ p['discipline'] or '' }}</td><td data-label="תוכנית">{{ p['title'] }}</td><td data-label="מהדורה">{{ p['version'] or '' }}</td><td data-label="הועלה">{{ p['uploaded_at'] or '' }}</td><td data-label="מי">{{ p['uploaded_by'] or '' }}</td><td data-label="קובץ">{% if p['drive_url'] %}<a href="{{ p['drive_url'] }}" target="_blank" rel="noopener">פתיחה בדרייב</a>{% else %}<a href="{{ url_for('plan_file', plan_id=p['id']) }}">הורדה</a>{% endif %}</td></tr>
