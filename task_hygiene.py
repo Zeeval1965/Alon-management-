@@ -3,7 +3,7 @@
 Pure functions only. The app decides when to call them; nothing here writes to the DB.
 """
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 CLOSING_STATUSES = {"החלטה", "בוצע"}          # close the task
 ONE_PROTOCOL_STATUS = "לידיעה"               # closes after one protocol unless it has a follow-up
@@ -13,7 +13,8 @@ APPROVERS = {"uploader", "admin"}            # who may approve closing a מעק�
 TENANT_CATEGORY = "שינוי דיירים"
 TENANT_CATEGORY_ALIASES = {"שינוי דיירים", "שינויי דיירים"}
 
-_STOP = {"של", "את", "על", "עם", "כי", "או", "גם", "זה", "זו", "יש", "לא", "כל", "אל", "in"}
+_STOP = {"של", "את", "על", "עם", "כי", "או", "גם", "זה", "זו", "יש", "כל", "אל", "in"}
+NEGATIONS = {"לא", "אין", "ללא"}  # a negation changes the meaning: "מאושרים" and "לא מאושרים" never merge
 
 
 def normalize_topic(topic):
@@ -35,10 +36,34 @@ def similarity(a, b):
     return len(wa & wb) / len(wa | wb)
 
 
+def _negated(text):
+    """True if the text contains a negation word (לא / אין / ללא)."""
+    return bool(set(re.findall(r"[\w֐-׿]+", (text or "").lower())) & NEGATIONS)
+
+
+def containment(a, b):
+    """Share of the shorter text's words found in the longer one. Catches a short protocol
+    entry that is the start of a longer one (Jaccard alone would miss it)."""
+    wa, wb = normalize_text(a), normalize_text(b)
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / min(len(wa), len(wb))
+
+
+def keywords(texts, top=8):
+    """Rough keyword tags: the words that appear most often across the group's texts.
+    Automatic and approximate; the supervisor can edit them."""
+    counts = Counter()
+    for text in texts:
+        counts.update(normalize_text(text))
+    return [w for w, _ in counts.most_common(top)]
+
+
 def merge_key(task):
     """Internal identity: sorted building tags + normalized topic + responsible."""
     buildings = tuple(sorted(task.get("buildings") or []))
-    responsible = (task.get("responsible") or "").strip()
+    # responsible compared by its words, so spacing, order or punctuation do not split one task
+    responsible = frozenset(normalize_text(task.get("responsible")))
     return (buildings, normalize_topic(task.get("topic")), responsible)
 
 
@@ -72,6 +97,9 @@ def find_merge_groups(tasks, threshold=0.40):
     for t in tasks:
         if t.get("status") in CLOSING_STATUSES:
             continue
+        topic = normalize_topic(t.get("topic"))
+        if not topic or topic == TENANT_CATEGORY:
+            continue  # no topic: never merged by topic; tenant-change items stay separate
         buckets[merge_key(t)].append(t)
 
     groups = []
@@ -89,7 +117,10 @@ def find_merge_groups(tasks, threshold=0.40):
 
         for i, a in enumerate(members):
             for b in members[i + 1:]:
-                if similarity(a.get("text"), b.get("text")) >= threshold:
+                if _negated(a.get("text")) != _negated(b.get("text")):
+                    continue
+                if max(similarity(a.get("text"), b.get("text")),
+                       containment(a.get("text"), b.get("text"))) >= threshold:
                     parent[find(a["id"])] = find(b["id"])
 
         clusters = defaultdict(list)
@@ -112,4 +143,5 @@ def merge_record(group_tasks):
         "text": last.get("text") or first.get("text"),
         "status": last.get("status") or first.get("status"),
         "buildings": sorted(set(sum((t.get("buildings") or [] for t in ordered), []))),
+        "keywords": keywords([t.get("text") or "" for t in ordered]),
     }
