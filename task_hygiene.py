@@ -130,7 +130,7 @@ def find_merge_groups(tasks, threshold=0.40):
     return groups
 
 
-_NUMBERED = re.compile(r"(?<!\S)(\d{1,2})\.\s+")
+_NUMBERED = re.compile(r"(?<!\S)(\d{1,2})\s?\.\s+")  # "2." and "2 ." both occur in protocols
 
 
 def split_numbered(text):
