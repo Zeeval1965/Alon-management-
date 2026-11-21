@@ -1596,6 +1596,17 @@ def task_print_flag(task_id):
     return redirect(_safe_next(request.form.get("next"), url_for("site_view", site_id=t["site_id"])))
 
 
+@app.route("/tasks/<int:task_id>/cancel", methods=["POST"])
+def task_cancel(task_id):
+    """'Delete' from the list: the task is set to בוטלה and kept in the database, so it can be restored."""
+    t = db().execute("SELECT site_id, status FROM tasks WHERE id=?", (task_id,)).fetchone() or abort(404)
+    if t["status"] != "בוטלה":
+        db().execute("UPDATE tasks SET status='בוטלה' WHERE id=?", (task_id,))
+        log_task_status(task_id, "בוטלה", "בוטלה מרשימת המשימות")
+        db().commit()
+    return redirect(_safe_next(request.form.get("next"), url_for("site_view", site_id=t["site_id"])))
+
+
 @app.route("/sites/<int:site_id>/print")
 def site_print(site_id):
     """Printable list of the tasks marked for printing."""
@@ -2059,7 +2070,9 @@ def site_search(site_id):
 </form></dialog></td>
 <td><form method="post" action="{{ url_for('task_print_flag', task_id=t['id']) }}">
 <input type="hidden" name="next" value="{{ request.full_path }}">
-<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form></td></tr>
+<input type="checkbox" {% if t['print_flag'] %}checked{% endif %} onchange="this.form.submit()" title="סמן להדפסה"></form>
+<form method="post" action="{{ url_for('task_cancel', task_id=t['id']) }}" onsubmit="return confirm('לסמן את המשימה כבוטלה? אפשר לשחזר דרך היסטוריית הסטטוס.')" style="margin-top:4px">
+<input type="hidden" name="next" value="{{ request.full_path }}"><button title="ביטול המשימה (נשמרת במערכת)">מחיקה</button></form></td></tr>
 {% else %}<tr><td colspan="7">אין תוצאות</td></tr>{% endfor %}</table>
 {% endif %}
 {% if kind == 'החלטות' %}

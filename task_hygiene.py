@@ -176,6 +176,26 @@ def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
     return groups
 
 
+def subject_groups(tasks, term):
+    """Subject rule (section 7): open tasks whose text contains the subject term, grouped by building.
+    Tenant-change items are excluded. Returns groups of task ids with two or more members.
+    Dry run only: nothing is merged here. Texts are not required to match."""
+    term_words = normalize_text(term)
+    if not term_words:
+        return []
+    buckets = defaultdict(list)
+    for t in tasks:
+        if t.get("status") in CLOSING_STATUSES or t.get("status") in {ONE_PROTOCOL_STATUS, "בוטלה"}:
+            continue
+        if is_tenant(t):
+            continue
+        if not term_words <= normalize_text(t.get("text")):
+            continue
+        key = tuple(sorted(t.get("buildings") or []))
+        buckets[key].append(t["id"])
+    return [ids for ids in buckets.values() if len(ids) > 1]
+
+
 # a sub-item number: "1.", "2 .", ".2 " or ". 2 " (no dot). A date (12.04.26) or 4.1 does not
 # match, because the number must be followed by a space, or by a dot and a space.
 _NUMBERED = re.compile(r"(?<!\d)(\d{1,2})\s*\.?\s+")
