@@ -764,8 +764,11 @@ def task_hygiene_view(site_id):
     counts = Counter(r["status"] for r in records)
     no_target = [r for r in records
                  if r["status"] not in task_hygiene.CLOSING_STATUSES and not r["target"].strip()]
+    saved_all = {}
+    for tid, kw in db().execute("SELECT k.task_id, k.keyword FROM task_keywords k JOIN tasks t ON t.id = k.task_id WHERE t.site_id=?", (site_id,)).fetchall():
+        saved_all.setdefault(tid, set()).add(kw)
     groups = []
-    for g in task_hygiene.find_merge_groups(records):
+    for g in task_hygiene.find_merge_groups(records, saved_keywords=saved_all):
         saved = {r[0] for r in db().execute("SELECT keyword FROM task_keywords WHERE task_id=?", (g[0],)).fetchall()}
         groups.append({"members": [by_id[i] for i in g],
                        "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g])

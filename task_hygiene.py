@@ -41,6 +41,14 @@ def _negated(text):
     return bool(set(re.findall(r"[\w֐-׿]+", (text or "").lower())) & NEGATIONS)
 
 
+def shared_keyword(text_a, text_b, saved_kw):
+    """True if one chosen keyword appears in both texts."""
+    if not saved_kw:
+        return False
+    wa, wb = normalize_text(text_a), normalize_text(text_b)
+    return any(k in wa and k in wb for k in saved_kw)
+
+
 def containment(a, b):
     """Share of the shorter text's words found in the longer one. Catches a short protocol
     entry that is the start of a longer one (Jaccard alone would miss it)."""
@@ -87,12 +95,15 @@ def status_for_unclosed_without_target(task):
     return task.get("status")
 
 
-def find_merge_groups(tasks, threshold=0.40):
+def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
     """Group open tasks that share a merge key and are similar in text.
 
     Returns a list of groups (lists of task ids). Groups of one are not returned.
     Dry run only: the caller shows these groups before anything is merged.
     """
+    saved_kw = set()
+    for words in (saved_keywords or {}).values():
+        saved_kw |= set(words)
     buckets = defaultdict(list)
     for t in tasks:
         if t.get("status") in CLOSING_STATUSES:
@@ -119,8 +130,12 @@ def find_merge_groups(tasks, threshold=0.40):
             for b in members[i + 1:]:
                 if _negated(a.get("text")) != _negated(b.get("text")):
                     continue
-                if max(similarity(a.get("text"), b.get("text")),
-                       containment(a.get("text"), b.get("text"))) >= threshold:
+                score = max(similarity(a.get("text"), b.get("text")),
+                            containment(a.get("text"), b.get("text")))
+                # keywords are a complement, never a gate: a shared chosen keyword adds a bonus
+                if shared_keyword(a.get("text"), b.get("text"), saved_kw):
+                    score += bonus
+                if score >= threshold:
                     parent[find(a["id"])] = find(b["id"])
 
         clusters = defaultdict(list)
