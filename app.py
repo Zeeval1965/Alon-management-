@@ -764,7 +764,8 @@ def task_hygiene_view(site_id):
     for g in task_hygiene.find_merge_groups(records):
         saved = {r[0] for r in db().execute("SELECT keyword FROM task_keywords WHERE task_id=?", (g[0],)).fetchall()}
         groups.append({"members": [by_id[i] for i in g],
-                       "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g]),
+                       "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g])
+                                   + sorted(saved - set(task_hygiene.keywords([by_id[i]["text"] for i in g]))),
                        "saved": saved})
     return render_template_string(
         PAGE_CSS + "<h1>בדיקת משימות (ללא שינוי)</h1>" + SECTION_NAV + """
