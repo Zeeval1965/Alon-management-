@@ -130,7 +130,9 @@ def find_merge_groups(tasks, threshold=0.40):
     return groups
 
 
-_NUMBERED = re.compile(r"(?<!\S)(\d{1,2})\s?\.\s+")  # "2." and "2 ." both occur in protocols
+# a sub-item number: "1.", "2 .", ".2 " or ". 2 " (no dot). A date (12.04.26) or 4.1 does not
+# match, because the number must be followed by a space, or by a dot and a space.
+_NUMBERED = re.compile(r"(?<!\d)(\d{1,2})\s*\.?\s+")
 
 
 def split_numbered(text):
