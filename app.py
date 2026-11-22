@@ -807,6 +807,10 @@ def task_hygiene_view(site_id):
                        "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g])
                                    + sorted(saved - set(task_hygiene.keywords([by_id[i]["text"] for i in g]))),
                        "saved": saved})
+    by_id_all = {r["id"]: r for r in records}
+    pairs = [{"score": p["score"], "same": p["same_topic"], "topics": p["topics"],
+              "a": by_id_all[p["ids"][0]], "b": by_id_all[p["ids"][1]]}
+             for p in task_hygiene.similar_pairs(records)]
     term = (request.args.get("term") or "").strip()
     subj = []
     if term:
@@ -837,6 +841,15 @@ def task_hygiene_view(site_id):
 {% for r in g.members[1:] %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
 <button style="background:#2E7D32">איחוד הקבוצה</button></form>
 {% else %}{% if term %}<p>אין קבוצות לנושא הזה.</p>{% endif %}{% endfor %}
+<h2>זוגות דומים לבחינת המפקח (לא מאוחד אוטומטית)</h2>
+<p class="note">דמיון מילים של 60% ומעלה, בטקסט שאינו זהה. נושאים שונים מסומנים. כל איחוד דורש אישור ידני.</p>
+<table><tr><th>דמיון</th><th>משימה</th><th>נושא</th><th>טקסט</th><th>סטטוס</th><th></th></tr>
+{% for p in pairs %}<tr><td>{{ p.score }}</td><td>{{ p.a['id'] }}<br>{{ p.b['id'] }}</td><td>{{ p.topics[0] }}{% if not p.same %}<br><b>≠ {{ p.topics[1] }}</b>{% endif %}</td>
+<td>{{ p.a['text'] }}<hr>{{ p.b['text'] }}</td><td>{{ p.a['status'] }}<br>{{ p.b['status'] }}</td>
+<td><form method="post" action="{{ url_for('task_hygiene_merge', site_id=site_id) }}" onsubmit="return confirm('לאחד את שתי המשימות לתוך הראשונה? הפעולה נרשמת ביומן.')">
+<input type="hidden" name="task_id" value="{{ p.a['id'] }}"><input type="hidden" name="member" value="{{ p.b['id'] }}">
+<button style="background:#2E7D32">איחוד</button></form></td></tr>
+{% else %}<tr><td colspan="6">אין זוגות דומים</td></tr>{% endfor %}</table>
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -855,7 +868,7 @@ def task_hygiene_view(site_id):
 <button style="background:#757575">לא לאחד</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
         total=len(records), counts=counts, no_target=no_target, groups=groups, review=review, site_id=site_id,
-        term=term, subj=subj)
+        term=term, subj=subj, pairs=pairs)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/split/<int:task_id>", methods=["GET", "POST"])

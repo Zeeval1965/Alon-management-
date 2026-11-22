@@ -202,6 +202,35 @@ def subject_groups(tasks, term):
     return [ids for ids in buckets.values() if len(ids) > 1]
 
 
+def similar_pairs(tasks, threshold=0.6, same_topic=False):
+    """Near-duplicate pairs for the supervisor's review only. Not tenant-change, open, not identical text,
+    word overlap (Jaccard) at or above the threshold. Topics are shown, not required to match,
+    unless same_topic=True. Containment is not used. Nothing is merged here."""
+    eligible = []
+    for t in tasks:
+        if t.get("status") in CLOSING_STATUSES or t.get("status") in {ONE_PROTOCOL_STATUS, "בוטלה"}:
+            continue
+        if is_tenant(t):
+            continue
+        if len(normalize_text(t.get("text"))) < 4:
+            continue
+        eligible.append((normalize_topic(t.get("topic")), t))
+    pairs = []
+    for i, (ta, a) in enumerate(eligible):
+        for tb, b in eligible[i + 1:]:
+            if same_topic and ta != tb:
+                continue
+            if exact_text(a.get("text")) == exact_text(b.get("text")):
+                continue
+            if _negated(a.get("text")) != _negated(b.get("text")):
+                continue
+            score = similarity(a.get("text"), b.get("text"))
+            if score >= threshold:
+                pairs.append({"score": round(score, 2), "ids": [a["id"], b["id"]],
+                              "topics": [ta or "-", tb or "-"], "same_topic": ta == tb})
+    return sorted(pairs, key=lambda p: -p["score"])
+
+
 # a sub-item number: "1.", "2 .", ".2 " or ". 2 " (no dot). A date (12.04.26) or 4.1 does not
 # match, because the number must be followed by a space, or by a dot and a space.
 _NUMBERED = re.compile(r"(?<!\d)(\d{1,2})\s*\.?\s+")
