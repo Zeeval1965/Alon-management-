@@ -129,6 +129,12 @@ def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
     saved_kw = set()
     for words in (saved_keywords or {}).values():
         saved_kw |= set(words)
+    # identical texts repeated across protocols merge whatever their topic or responsible spelling
+    # (e.g. "אינסטלצי ה" vs "אינסטלציה"): count them first
+    text_counts = Counter(exact_text(t.get("text")) for t in tasks
+                          if t.get("status") not in CLOSING_STATUSES
+                          and t.get("status") not in {ONE_PROTOCOL_STATUS, "בוטלה"}
+                          and not is_tenant(t) and exact_text(t.get("text")))
     buckets = defaultdict(list)
     for t in tasks:
         if t.get("status") in CLOSING_STATUSES or t.get("status") in {ONE_PROTOCOL_STATUS, "בוטלה"}:
@@ -136,12 +142,12 @@ def find_merge_groups(tasks, threshold=0.40, saved_keywords=None, bonus=0.10):
         topic = normalize_topic(t.get("topic"))
         if is_tenant(t):
             continue  # tenant-change items stay separate, always (any apartment, any spelling)
-        if not topic or not (t.get("responsible") or "").strip():
-            # no topic or no responsible: only an identical text repeat may merge (the rule for repeats)
-            exact = exact_text(t.get("text"))
-            if exact:
-                buckets[("exact", exact)].append(t)
+        exact = exact_text(t.get("text"))
+        if exact and text_counts[exact] > 1:
+            buckets[("exact", exact)].append(t)  # identical repeat: one bucket, topic and responsible ignored
             continue
+        if not topic or not (t.get("responsible") or "").strip():
+            continue  # no topic or no responsible: only identical repeats (above) may merge
         buckets[merge_key(t)].append(t)
 
     groups = []

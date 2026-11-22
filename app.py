@@ -436,6 +436,13 @@ def _words(text):
 def same_task(existing, row):
     """Same public number is not enough: numbers restart in every meeting.
     Treat it as the same task only when the topic matches and the wording overlaps."""
+    # identical wording is the same task whatever the topic spelling ("אינסטלצי ה" vs "אינסטלציה");
+    # the responsible is not a key: a change of responsible is recorded as an event on the task
+    row_task = {"topic": row.get("topic"), "text": row.get("task")}
+    if (task_hygiene.exact_text(existing["text"]) and len(_words(row.get("task"))) >= 4
+            and task_hygiene.exact_text(existing["text"]) == task_hygiene.exact_text(row.get("task"))
+            and not task_hygiene.is_tenant(row_task) and not task_hygiene.is_tenant(dict(existing))):
+        return True
     ta, tb = _words(existing["topic"]), _words(row.get("topic"))
     if ta and tb and not (ta & tb):  # topic column is free text; share at least one word
         return False
@@ -521,6 +528,11 @@ def publish_meeting(meeting_id):
             task_id = cur.lastrowid
         else:
             task_id = match["id"]
+            old_who, new_who = (match["assignee_text"] or "").strip(), (r.get("assignee") or "").strip()
+            if new_who and old_who and frozenset(_words(old_who)) != frozenset(_words(new_who)):
+                # responsibility changed: recorded as an event on the same task, not a new task
+                log_task_status(task_id, "שינוי אחראי", f"מ-{old_who} ל-{new_who} (פרוטוקול {day or meeting_id})")
+                db().execute("UPDATE tasks SET assignee_text=? WHERE id=?", (new_who, task_id))
             if match["target_text"] != r["target"]:  # new estimate from this protocol
                 db().execute(
                     "UPDATE tasks SET target_text=?, target_date=?, last_meeting_id=? WHERE id=?",
