@@ -795,6 +795,11 @@ def task_hygiene_view(site_id):
                        "keywords": task_hygiene.keywords([by_id[i]["text"] for i in g])
                                    + sorted(saved - set(task_hygiene.keywords([by_id[i]["text"] for i in g]))),
                        "saved": saved})
+    term = (request.args.get("term") or "").strip()
+    subj = []
+    if term:
+        for g in task_hygiene.subject_groups(records, term):
+            subj.append({"members": [by_id[i] for i in sorted(g)]})
     return render_template_string(
         PAGE_CSS + "<h1>בדיקת משימות (ללא שינוי)</h1>" + SECTION_NAV + """
 <p>סה"כ משימות: {{ total }} | פתוחות בלי יעד (יעברו למעקב): {{ no_target|length }} | קבוצות לאיחוד: {{ groups|length }}</p>
@@ -809,6 +814,17 @@ def task_hygiene_view(site_id):
 <table><tr><th>מזהה</th><th>סיבה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
 {% for r in review %}<tr><td>{{ r['id'] }}</td><td>{{ r['why'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>
 {% else %}<tr><td colspan="6">כל המשימות סווגו</td></tr>{% endfor %}</table>
+<h2>איחוד לפי נושא ובניין (סעיף 7, לאישור)</h2>
+<form method="get" style="margin:6px 0 10px">נושא לחיפוש: <input name="term" value="{{ term }}" placeholder="למשל: מפריד שומן"> <button>הצג</button></form>
+{% if term %}<p class="note">נמצאו {{ subj|length }} קבוצות עם המילה "{{ term }}" (משימות פתוחות, בלי שינויי דיירים).</p>{% endif %}
+{% for g in subj %}<h4>{{ g.members|length }} משימות · נושא: {{ term }}</h4>
+<table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
+{% for r in g.members %}<tr><td>{{ r['id'] }}</td><td>{{ r['topic'] }}</td><td>{{ r['responsible'] }}</td><td>{{ r['text'] }}</td><td>{{ r['status'] }}</td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('task_hygiene_merge', site_id=site_id) }}" style="margin:4px 0 18px" onsubmit="return confirm('לאחד את הקבוצה לתוך המשימה הראשונה? הפעולה נרשמת ביומן.')">
+<input type="hidden" name="task_id" value="{{ g.members[0]['id'] }}">
+{% for r in g.members[1:] %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
+<button style="background:#2E7D32">איחוד הקבוצה</button></form>
+{% else %}{% if term %}<p>אין קבוצות לנושא הזה.</p>{% endif %}{% endfor %}
 <h2>קבוצות לאיחוד (לאישור)</h2>
 {% for g in groups %}<h4>{{ g.members[0]['topic'] }} · {{ g.members[0]['responsible'] }} ({{ g.members|length }} משימות)</h4>
 <table><tr><th>מזהה</th><th>נושא</th><th>אחראי</th><th>טקסט</th><th>סטטוס</th></tr>
@@ -826,7 +842,8 @@ def task_hygiene_view(site_id):
 {% for r in g.members %}<input type="hidden" name="member" value="{{ r['id'] }}">{% endfor %}
 <button style="background:#757575">לא לאחד</button></form>
 {% else %}<p>אין קבוצות</p>{% endfor %}""",
-        total=len(records), counts=counts, no_target=no_target, groups=groups, review=review, site_id=site_id)
+        total=len(records), counts=counts, no_target=no_target, groups=groups, review=review, site_id=site_id,
+        term=term, subj=subj)
 
 
 @app.route("/sites/<int:site_id>/task-hygiene/split/<int:task_id>", methods=["GET", "POST"])
