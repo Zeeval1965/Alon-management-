@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS mail_inbox (
   id INTEGER PRIMARY KEY, message_id TEXT UNIQUE, received TEXT, sender TEXT, subject TEXT,
   site_id INTEGER, status TEXT
 );
+CREATE TABLE IF NOT EXISTS mail_review (
+  id INTEGER PRIMARY KEY, message_id TEXT, received TEXT, sender TEXT, subject TEXT,
+  site_id INTEGER, kind TEXT, reason TEXT, filename TEXT, file_path TEXT, recipients TEXT,
+  status TEXT DEFAULT 'ממתין'
+);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY, site_id INTEGER, contact_id INTEGER, channel TEXT,
   body TEXT, mode TEXT DEFAULT 'מיידי', status TEXT DEFAULT 'queued', created TEXT
@@ -3717,6 +3722,8 @@ def admin_overview():
     mail_senders = db().execute("SELECT email FROM mail_senders ORDER BY email").fetchall()
     mail_inbox = db().execute("SELECT * FROM mail_inbox ORDER BY id DESC LIMIT 30").fetchall()
     sites_kw = db().execute("SELECT id, name, IFNULL(mail_keyword,'') AS kw FROM sites ORDER BY id").fetchall()
+    pending = db().execute("SELECT r.*, s.name AS site_name FROM mail_review r LEFT JOIN sites s ON s.id=r.site_id "
+                           "WHERE r.status='ממתין' ORDER BY r.id DESC").fetchall()
     return page("ניהול כללי", """
 <p><a href="{{ url_for('sites') }}">כל האתרים</a></p>
 <p><a href="{{ url_for('site_new') }}">+ אתר חדש</a> · <a href="{{ url_for('sites') }}">חזרה לרשימת האתרים</a></p>
@@ -3735,14 +3742,50 @@ def admin_overview():
 <form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="add_sender"><input name="email" placeholder="כתובת דוא&quot;ל" required> <button>הוסף שולח</button></form>
 <h4>שם הפרויקט בכותרת המייל, לכל אתר</h4>
 {% for s in sites_kw %}<form method="post" action="{{ url_for('mail_admin_update') }}" style="margin:4px 0"><input type="hidden" name="action" value="set_keyword"><input type="hidden" name="site_id" value="{{ s['id'] }}">{{ s['name'] }}: <input name="keyword" value="{{ s['kw'] }}"> <button>שמור</button></form>{% endfor %}
+<h4>ממתין לבדיקה ({{ pending|length }})</h4>
+<p class="note">קבצים שהקליטה לא החליטה לגביהם לבד: שולח לא מאושר, אתר או סוג לא מזוהים, או סיכום שכבר נקלט לאותו תאריך. בחר את האתר והסוג, ואז הקלט.</p>
+{% for r in pending %}
+<div style="border:1px solid #ccc;padding:8px;margin:6px 0">
+<div><b>{{ r['filename'] }}</b> · {{ r['subject'] or '' }} · {{ r['sender'] or '' }}</div>
+<div class="note">{{ r['reason'] }} · {{ r['received'] or '' }} · {{ r['site_name'] or 'אתר לא ידוע' }} · {{ r['kind'] or 'סוג לא ידוע' }}</div>
+<form method="post" action="{{ url_for('mail_review_ingest', review_id=r['id']) }}">
+אתר: <select name="site_id">{% for s in sites_kw %}<option value="{{ s['id'] }}" {% if s['id']==r['site_id'] %}selected{% endif %}>{{ s['name'] }}</option>{% endfor %}</select>
+סוג: <select name="kind"><option {% if r['kind']=='שבועית' %}selected{% endif %}>שבועית</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
+<button name="mode" value="keep_both">הקלט והשאר את הקיים</button>
+<button name="mode" value="replace">הקלט והחלף טיוטה קיימת</button>
+</form>
+<form method="post" action="{{ url_for('mail_review_dismiss', review_id=r['id']) }}" style="margin-top:4px"><button>התעלם</button></form>
+</div>
+{% else %}<p class="note">אין פריטים הממתינים לבדיקה.</p>{% endfor %}
 <h4>מיילים אחרונים</h4>
 <table class="cards"><tr><th>התקבל</th><th>שולח</th><th>נושא</th><th>סטטוס</th></tr>{% for m in mail_inbox %}<tr><td data-label="התקבל">{{ m['received'] }}</td><td data-label="שולח">{{ m['sender'] }}</td><td data-label="נושא">{{ m['subject'] }}</td><td data-label="סטטוס">{{ m['status'] }}</td></tr>{% else %}<tr><td colspan="4">אין עדיין</td></tr>{% endfor %}</table>
-""", rows=rows, users=users, mail_senders=mail_senders, mail_inbox=mail_inbox, sites_kw=sites_kw, url_for=url_for)
+""", rows=rows, users=users, mail_senders=mail_senders, mail_inbox=mail_inbox, sites_kw=sites_kw, pending=pending, url_for=url_for)
 
 
-def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients=""):
+def _save_review(meta, site_id, kind, reason, filename, pdf_bytes, recipients=""):
+    """Keeps a mail attachment that could not be taken automatically, for the admin to decide.
+    The file is stored under UPLOAD_DIR so it can be ingested later."""
+    meta = meta or {}
+    cur = db().execute(
+        "INSERT INTO mail_review(message_id, received, sender, subject, site_id, kind, reason, filename, recipients, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (meta.get("message_id"), meta.get("received"), meta.get("sender"), meta.get("subject"),
+         site_id, kind, reason, filename, recipients or None, "ממתין"))
+    rid = cur.lastrowid
+    folder = os.path.join(UPLOAD_DIR, "mail_review")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{rid}.pdf")
+    with open(path, "wb") as fh:
+        fh.write(pdf_bytes or b"")
+    db().execute("UPDATE mail_review SET file_path=? WHERE id=?", (path, rid))
+    return rid
+
+
+def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients="", meta=None, mode="review"):
     """Same steps as the manual upload: split by date, store one draft per date.
-    recipients: the mail's To and Cc as text ('אל: ...; עותק: ...'), empty for manual uploads."""
+    recipients: the mail's To and Cc as text ('אל: ...; עותק: ...'), empty for manual uploads.
+    mode: 'review' (a date already taken goes to the review queue), 'replace' (existing drafts for that
+    date are replaced), 'keep_both' (insert anyway)."""
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.write(pdf_bytes)
     tmp.close()
@@ -3751,12 +3794,24 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients=""):
     for r in rows:
         if not r.get("meeting_date") and named:
             r["meeting_date"] = dt.date.fromisoformat(named).strftime("%d.%m.%y")
+    groups = list(split_rows_by_date(rows))
+    if mode == "review":
+        # A date that already has a meeting of this site and kind is not decided here: the whole file
+        # goes to the review queue, and the admin chooses (replace, keep both, or dismiss).
+        for day, _group in groups:
+            same = db().execute("SELECT source_name FROM meetings WHERE site_id=? AND kind=? AND meeting_date IS ?",
+                                (site_id, kind, day)).fetchall()
+            if same:
+                same_file = any(m["source_name"] == filename for m in same)
+                reason = "קובץ זהה כבר נקלט לאותו תאריך" if same_file else "כבר יש סיכום אחר לאותו תאריך (ייתכן עדכון)"
+                _save_review(meta, site_id, kind, reason, filename, pdf_bytes, recipients)
+                return []
     ids = []
-    for day, group in split_rows_by_date(rows):
-        # The same file for the same date and kind is already a draft: do not create a second one.
-        if db().execute("SELECT 1 FROM meetings WHERE site_id=? AND kind=? AND meeting_date IS ? AND source_name=?",
-                        (site_id, kind, day, filename)).fetchone():
-            continue
+    for day, group in groups:
+        if mode == "replace":
+            # Only drafts are replaced. A published meeting is never changed by a mail.
+            db().execute("DELETE FROM meetings WHERE site_id=? AND kind=? AND meeting_date IS ? AND status='draft'",
+                         (site_id, kind, day))
         cur = db().execute(
             "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date, recipients) VALUES (?,?,?,?,?,?)",
             (site_id, kind, filename, json.dumps(group, ensure_ascii=False), day, recipients or None))
@@ -3818,27 +3873,42 @@ def mail_poll_once():
         try:
             sender = parseaddr(msg.get("From", ""))[1].lower()
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
+            received = dt.datetime.now().isoformat(timespec="minutes")
+            meta = {"message_id": msg_id, "received": received, "sender": sender, "subject": subject}
+            recipients = _mail_recipients(msg)
+            pdfs = []
+            for part in msg.walk():
+                fn = part.get_filename()
+                if fn and fn.lower().endswith(".pdf"):
+                    pdfs.append((str(make_header(decode_header(fn))), part.get_payload(decode=True)))
             site_id = None
             ids = []
+            kind = _kind_from_subject(subject)
+            site = next((x for x in sites if x["mail_keyword"] in subject), None)
             if sender not in senders:
-                status = "שולח לא מאושר"
+                reason = "שולח לא מאושר"
+                for fn, data in pdfs:
+                    _save_review(meta, None, kind, reason, fn, data, recipients)
+                status = f"{reason}: נשמרו {len(pdfs)} קבצים לבדיקה" if pdfs else reason
+            elif site is None:
+                reason = "לא זוהה אתר לפי הנושא"
+                for fn, data in pdfs:
+                    _save_review(meta, None, kind, reason, fn, data, recipients)
+                status = f"{reason}: נשמרו {len(pdfs)} קבצים לבדיקה" if pdfs else reason
+            elif kind is None:
+                site_id = site["id"]
+                reason = "סוג הסיכום לא מזוהה לפי הנושא"
+                for fn, data in pdfs:
+                    _save_review(meta, site_id, None, reason, fn, data, recipients)
+                status = f"{reason}: נשמרו {len(pdfs)} קבצים לבדיקה" if pdfs else reason
+            elif not pdfs:
+                site_id = site["id"]
+                status = "אין קובץ PDF מצורף"
             else:
-                site = next((x for x in sites if x["mail_keyword"] in subject), None)
-                if site is None:
-                    status = "לא זוהה אתר לפי הנושא"
-                elif _kind_from_subject(subject) is None:
-                    site_id = site["id"]
-                    status = "סוג הסיכום לא מזוהה לפי הנושא"
-                else:
-                    site_id = site["id"]
-                    kind = _kind_from_subject(subject)
-                    for part in msg.walk():
-                        fn = part.get_filename()
-                        if fn and fn.lower().endswith(".pdf"):
-                            fn = str(make_header(decode_header(fn)))
-                            ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn, kind=kind,
-                                               recipients=_mail_recipients(msg))
-                    status = f"נקלטו {len(ids)} טיוטות" if ids else "לא נקלטו טיוטות (אין PDF חדש)"
+                site_id = site["id"]
+                for fn, data in pdfs:
+                    ids += _ingest_pdf(site_id, data, fn, kind=kind, recipients=recipients, meta=meta)
+                status = f"נקלטו {len(ids)} טיוטות" if ids else "נשמר לבדיקה במסך האדמין"
             db().execute(
                 "UPDATE mail_inbox SET sender=?, subject=?, site_id=?, status=? WHERE message_id=?",
                 (sender, subject, site_id, status, msg_id))
@@ -3864,6 +3934,39 @@ def mail_poll(token):
         return jsonify(mail_poll_once())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/mail-review/<int:review_id>/ingest", methods=["POST"])
+def mail_review_ingest(review_id):
+    """Admin decision on a kept attachment: take it as a draft for the chosen site and kind."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    r = db().execute("SELECT * FROM mail_review WHERE id=? AND status='ממתין'", (review_id,)).fetchone() or abort(404)
+    site_id = request.form.get("site_id", type=int)
+    kind = request.form.get("kind", "")
+    mode = request.form.get("mode", "")
+    if not site_id or kind not in ("שבועית", "שימור") or mode not in ("replace", "keep_both"):
+        abort(400)
+    if not r["file_path"] or not os.path.exists(r["file_path"]):
+        abort(404)
+    with open(r["file_path"], "rb") as fh:
+        data = fh.read()
+    meta = {"message_id": r["message_id"], "received": r["received"], "sender": r["sender"], "subject": r["subject"]}
+    ids = _ingest_pdf(site_id, data, r["filename"], kind=kind, recipients=r["recipients"] or "",
+                      meta=meta, mode=mode)
+    db().execute("UPDATE mail_review SET status=?, site_id=?, kind=? WHERE id=?",
+                 ("טופל" if ids else "לא נקלט", site_id, kind, review_id))
+    db().commit()
+    return redirect(url_for("admin_overview"))
+
+
+@app.route("/admin/mail-review/<int:review_id>/dismiss", methods=["POST"])
+def mail_review_dismiss(review_id):
+    if not current_contact()["is_admin"]:
+        abort(403)
+    db().execute("UPDATE mail_review SET status='נדחה' WHERE id=? AND status='ממתין'", (review_id,))
+    db().commit()
+    return redirect(url_for("admin_overview"))
 
 
 @app.route("/admin/mail", methods=["POST"])
