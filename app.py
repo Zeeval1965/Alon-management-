@@ -240,7 +240,8 @@ def init_db():
                  "ALTER TABLE plans ADD COLUMN uploaded_by TEXT",
                  "ALTER TABLE plans ADD COLUMN stage TEXT",
                  "ALTER TABLE tasks ADD COLUMN merged_into INTEGER",
-                 "ALTER TABLE meetings ADD COLUMN recipients TEXT"):
+                 "ALTER TABLE meetings ADD COLUMN recipients TEXT",
+                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_mail_inbox_message ON mail_inbox(message_id)"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -3752,6 +3753,10 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients=""):
             r["meeting_date"] = dt.date.fromisoformat(named).strftime("%d.%m.%y")
     ids = []
     for day, group in split_rows_by_date(rows):
+        # The same file for the same date and kind is already a draft: do not create a second one.
+        if db().execute("SELECT 1 FROM meetings WHERE site_id=? AND kind=? AND meeting_date IS ? AND source_name=?",
+                        (site_id, kind, day, filename)).fetchone():
+            continue
         cur = db().execute(
             "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date, recipients) VALUES (?,?,?,?,?,?)",
             (site_id, kind, filename, json.dumps(group, ensure_ascii=False), day, recipients or None))
@@ -3801,36 +3806,48 @@ def mail_poll_once():
         _, msg_data = M.fetch(num, "(RFC822)")
         msg = message_from_bytes(msg_data[0][1])
         msg_id = (msg.get("Message-ID") or num.decode()).strip()
-        if db().execute("SELECT 1 FROM mail_inbox WHERE message_id=?", (msg_id,)).fetchone():
+        # Claim the message first. The unique index on message_id makes the claim atomic, so two
+        # runs at the same time cannot both process it.
+        claim = db().execute(
+            "INSERT OR IGNORE INTO mail_inbox(message_id, received, status) VALUES (?,?,?)",
+            (msg_id, dt.datetime.now().isoformat(timespec="minutes"), "בעיבוד"))
+        db().commit()
+        if claim.rowcount == 0:
             M.store(num, "+FLAGS", "\\Seen")
             continue
-        sender = parseaddr(msg.get("From", ""))[1].lower()
-        subject = str(make_header(decode_header(msg.get("Subject", ""))))
-        site_id = None
-        ids = []
-        if sender not in senders:
-            status = "שולח לא מאושר"
-        else:
-            site = next((x for x in sites if x["mail_keyword"] in subject), None)
-            if site is None:
-                status = "לא זוהה אתר לפי הנושא"
-            elif _kind_from_subject(subject) is None:
-                site_id = site["id"]
-                status = "סוג הסיכום לא מזוהה לפי הנושא"
+        try:
+            sender = parseaddr(msg.get("From", ""))[1].lower()
+            subject = str(make_header(decode_header(msg.get("Subject", ""))))
+            site_id = None
+            ids = []
+            if sender not in senders:
+                status = "שולח לא מאושר"
             else:
-                site_id = site["id"]
-                kind = _kind_from_subject(subject)
-                for part in msg.walk():
-                    fn = part.get_filename()
-                    if fn and fn.lower().endswith(".pdf"):
-                        fn = str(make_header(decode_header(fn)))
-                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn, kind=kind,
-                                           recipients=_mail_recipients(msg))
-                status = f"נקלטו {len(ids)} טיוטות" if ids else "אין קובץ PDF מצורף"
-        db().execute(
-            "INSERT INTO mail_inbox(message_id, received, sender, subject, site_id, status) VALUES (?,?,?,?,?,?)",
-            (msg_id, dt.datetime.now().isoformat(timespec="minutes"), sender, subject, site_id, status))
-        db().commit()
+                site = next((x for x in sites if x["mail_keyword"] in subject), None)
+                if site is None:
+                    status = "לא זוהה אתר לפי הנושא"
+                elif _kind_from_subject(subject) is None:
+                    site_id = site["id"]
+                    status = "סוג הסיכום לא מזוהה לפי הנושא"
+                else:
+                    site_id = site["id"]
+                    kind = _kind_from_subject(subject)
+                    for part in msg.walk():
+                        fn = part.get_filename()
+                        if fn and fn.lower().endswith(".pdf"):
+                            fn = str(make_header(decode_header(fn)))
+                            ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn, kind=kind,
+                                               recipients=_mail_recipients(msg))
+                    status = f"נקלטו {len(ids)} טיוטות" if ids else "לא נקלטו טיוטות (אין PDF חדש)"
+            db().execute(
+                "UPDATE mail_inbox SET sender=?, subject=?, site_id=?, status=? WHERE message_id=?",
+                (sender, subject, site_id, status, msg_id))
+            db().commit()
+        except Exception:
+            # Release the claim so the next run retries this message instead of skipping it.
+            db().execute("DELETE FROM mail_inbox WHERE message_id=? AND status='בעיבוד'", (msg_id,))
+            db().commit()
+            raise
         M.store(num, "+FLAGS", "\\Seen")
         summary.append({"subject": subject, "status": status})
     M.logout()
