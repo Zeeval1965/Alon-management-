@@ -239,7 +239,8 @@ def init_db():
                  "ALTER TABLE plans ADD COLUMN drive_url TEXT",
                  "ALTER TABLE plans ADD COLUMN uploaded_by TEXT",
                  "ALTER TABLE plans ADD COLUMN stage TEXT",
-                 "ALTER TABLE tasks ADD COLUMN merged_into INTEGER"):
+                 "ALTER TABLE tasks ADD COLUMN merged_into INTEGER",
+                 "ALTER TABLE meetings ADD COLUMN recipients TEXT"):
         try:
             c.execute(stmt)
         except sqlite3.OperationalError:
@@ -1647,6 +1648,72 @@ def task_cancel(task_id):
         log_task_status(task_id, "בוטלה", "בוטלה מרשימת המשימות")
         db().commit()
     return redirect(_safe_next(request.form.get("next"), url_for("site_view", site_id=t["site_id"])))
+
+
+def _meeting_day(text):
+    """A meeting date as a date object, or None. Accepts dd.mm.yy, dd.mm.yyyy and yyyy-mm-dd."""
+    for fmt in ("%d.%m.%y", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime((text or "").strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+@app.route("/sites/<int:site_id>/meetings")
+def meetings_index(site_id):
+    """Index of the summaries (protocols) that reached the site: date, kind, source name, status, rows.
+    Search by text (kind or source name) and by date range. Read only."""
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    q = (request.args.get("q") or "").strip()
+    d_from = _meeting_day(request.args.get("from"))
+    d_to = _meeting_day(request.args.get("to"))
+    rows = []
+    for m in db().execute("SELECT * FROM meetings WHERE site_id=?", (site_id,)).fetchall():
+        day = _meeting_day(m["meeting_date"])
+        if q and q not in ((m["kind"] or "") + " " + (m["source_name"] or "")):
+            continue
+        if d_from and (day is None or day < d_from):
+            continue
+        if d_to and (day is None or day > d_to):
+            continue
+        try:
+            count = len(json.loads(m["staged_rows"] or "[]"))
+        except (ValueError, TypeError):
+            count = 0
+        rows.append({"id": m["id"], "day": day, "date_text": m["meeting_date"] or "", "kind": m["kind"] or "",
+                     "source": m["source_name"] or "", "status": m["status"] or "", "count": count,
+                     "recipients": m["recipients"] or ""})
+    rows.sort(key=lambda r: (r["day"] is None, r["day"] or dt.date.min), reverse=True)
+    return page("סיכומי פגישות - " + s["name"], """
+<p class="note">כל הסיכומים שהגיעו לאתר. ניתן לחפש לפי טקסט (סוג או שם מקור) ולפי טווח תאריכים. עמודת הנמענים מתמלאת מכותרות To ו-Cc של המייל בזמן הקליטה.</p>
+<form method="get" style="margin:8px 0">
+חיפוש: <input name="q" value="{{ q }}"> מתאריך: <input name="from" value="{{ request.args.get('from','') }}" placeholder="dd.mm.yy">
+עד תאריך: <input name="to" value="{{ request.args.get('to','') }}" placeholder="dd.mm.yy"> <button>חיפוש</button></form>
+<p class="note">נמצאו {{ rows|length }} סיכומים.</p>
+<table><tr><th>תאריך</th><th>סוג</th><th>שם מקור</th><th>סטטוס</th><th>שורות</th><th>משתתפים / מכותבים</th></tr>
+{% for r in rows %}<tr><td>{{ r['date_text'] }}</td><td>{{ r['kind'] }}</td><td>{{ r['source'] }}</td>
+<td>{{ r['status'] }}</td><td>{{ r['count'] }}</td><td>{{ r['recipients'] or 'לא נשמר' }}</td></tr>
+{% else %}<tr><td colspan="6">לא נמצאו סיכומים</td></tr>{% endfor %}</table>
+""", rows=rows, q=q)
+
+
+@app.route("/gmail-check")
+def gmail_check():
+    """Dry run (admin only): reads recent mail, shows which site each subject belongs to. Writes nothing."""
+    import gmail_reader  # imported here so the app still starts if Gmail is not configured
+    try:
+        rows = gmail_reader.scan_for_sites()
+    except Exception as exc:  # show the failure plainly instead of a server error page
+        return page("בדיקת Gmail", "<p>הבדיקה נכשלה: {{ err }}</p>", err=str(exc)), 500
+    return page("בדיקת Gmail (ללא שינוי)", """
+<p class="note">הודעות מ-14 הימים האחרונים, והאתר שאליו כל כותרת משויכת. לא נקלט דבר.</p>
+<table><tr><th>תאריך</th><th>כותרת</th><th>שויך לאתר</th><th>נמענים</th><th>קבצים מצורפים</th></tr>
+{% for r in rows %}<tr><td>{{ r['date'] }}</td><td>{{ r['subject'] }}</td>
+<td>{{ r['site'] or 'לא שויך' }}</td><td>{{ r['to'] }}{% if r['cc'] %} | עותק: {{ r['cc'] }}{% endif %}</td>
+<td>{{ r['attachments']|map(attribute='name')|join(', ') }}</td></tr>
+{% else %}<tr><td colspan="5">לא נמצאו הודעות</td></tr>{% endfor %}</table>
+""", rows=rows)
 
 
 @app.route("/sites/<int:site_id>/print")
