@@ -3739,8 +3739,9 @@ def admin_overview():
 """, rows=rows, users=users, mail_senders=mail_senders, mail_inbox=mail_inbox, sites_kw=sites_kw, url_for=url_for)
 
 
-def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע"):
-    """Same steps as the manual upload: split by date, store one draft per date."""
+def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients=""):
+    """Same steps as the manual upload: split by date, store one draft per date.
+    recipients: the mail's To and Cc as text ('אל: ...; עותק: ...'), empty for manual uploads."""
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.write(pdf_bytes)
     tmp.close()
@@ -3752,10 +3753,21 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע"):
     ids = []
     for day, group in split_rows_by_date(rows):
         cur = db().execute(
-            "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date) VALUES (?,?,?,?,?)",
-            (site_id, kind, filename, json.dumps(group, ensure_ascii=False), day))
+            "INSERT INTO meetings(site_id, kind, source_name, staged_rows, meeting_date, recipients) VALUES (?,?,?,?,?,?)",
+            (site_id, kind, filename, json.dumps(group, ensure_ascii=False), day, recipients or None))
         ids.append(cur.lastrowid)
     return ids
+
+
+def _mail_recipients(msg):
+    """'אל: ...; עותק: ...' from the To and Cc headers of a message, decoded. Empty if neither is set."""
+    from email.header import decode_header, make_header
+    parts = []
+    for header, label in (("To", "אל: "), ("Cc", "עותק: ")):
+        raw = msg.get(header, "")
+        if raw:
+            parts.append(label + str(make_header(decode_header(raw))))
+    return "; ".join(parts)
 
 
 def mail_poll_once():
@@ -3799,7 +3811,8 @@ def mail_poll_once():
                     fn = part.get_filename()
                     if fn and fn.lower().endswith(".pdf"):
                         fn = str(make_header(decode_header(fn)))
-                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn)
+                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn,
+                                           recipients=_mail_recipients(msg))
                 status = f"נקלטו {len(ids)} טיוטות" if ids else "אין קובץ PDF מצורף"
         db().execute(
             "INSERT INTO mail_inbox(message_id, received, sender, subject, site_id, status) VALUES (?,?,?,?,?,?)",
