@@ -3759,6 +3759,15 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients=""):
     return ids
 
 
+def _kind_from_subject(subject):
+    """Meeting kind from the mail subject: 'שבועית' or 'שימור'. None when neither appears (not guessed)."""
+    if "שבועית" in subject:
+        return "שבועית"
+    if "שימור" in subject:
+        return "שימור"
+    return None
+
+
 def _mail_recipients(msg):
     """'אל: ...; עותק: ...' from the To and Cc headers of a message, decoded. Empty if neither is set."""
     from email.header import decode_header, make_header
@@ -3805,13 +3814,17 @@ def mail_poll_once():
             site = next((x for x in sites if x["mail_keyword"] in subject), None)
             if site is None:
                 status = "לא זוהה אתר לפי הנושא"
+            elif _kind_from_subject(subject) is None:
+                site_id = site["id"]
+                status = "סוג הסיכום לא מזוהה לפי הנושא"
             else:
                 site_id = site["id"]
+                kind = _kind_from_subject(subject)
                 for part in msg.walk():
                     fn = part.get_filename()
                     if fn and fn.lower().endswith(".pdf"):
                         fn = str(make_header(decode_header(fn)))
-                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn,
+                        ids += _ingest_pdf(site_id, part.get_payload(decode=True), fn, kind=kind,
                                            recipients=_mail_recipients(msg))
                 status = f"נקלטו {len(ids)} טיוטות" if ids else "אין קובץ PDF מצורף"
         db().execute(
