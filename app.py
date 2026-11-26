@@ -2308,6 +2308,24 @@ def meeting_update(meeting_id):
     return redirect(url_for("site_audit", site_id=m["site_id"]))
 
 
+@app.route("/sites/<int:site_id>/drafts/delete", methods=["POST"])
+def site_drafts_delete(site_id):
+    """Admin: delete the drafts ticked on the protocols page. Published protocols are never touched here."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    d = db()
+    for raw in request.form.getlist("ids"):
+        if not raw.isdigit():
+            continue
+        mid = int(raw)
+        if d.execute("SELECT 1 FROM meetings WHERE id=? AND site_id=? AND status!='published'",
+                     (mid, site_id)).fetchone():
+            d.execute("DELETE FROM admin_queue WHERE meeting_id=?", (mid,))
+            d.execute("DELETE FROM meetings WHERE id=?", (mid,))
+    d.commit()
+    return redirect(url_for("site_protocols", site_id=site_id))
+
+
 @app.route("/meetings/<int:meeting_id>/delete", methods=["POST"])
 def meeting_delete(meeting_id):
     """Delete a protocol and the tasks that came only from it (with what was recorded against them)."""
@@ -4248,7 +4266,8 @@ def site_protocols(site_id):
 {% else %}<tr><td colspan="6">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
 <h3>הועלו ולא פורסמו (טיוטות)</h3>
 <form method="post" action="{{ url_for('site_protocols_publish', site_id=s['id']) }}">
-<p><button>פרסם את הנבחרים</button> <button name="all" value="1" onclick="return confirm('לפרסם את כל הטיוטות לפי סדר התאריכים?')">פרסם הכל</button> <span class="note">מסומנים: הפרוטוקולים יפורסמו מהישן לחדש.</span></p>
+<p><button>פרסם את הנבחרים</button> <button name="all" value="1" onclick="return confirm('לפרסם את כל הטיוטות לפי סדר התאריכים?')">פרסם הכל</button> <span class="note">מסומנים: הפרוטוקולים יפורסמו מהישן לחדש.</span>
+{% if is_admin %} <button formaction="{{ url_for('site_drafts_delete', site_id=s['id']) }}" onclick="return confirm('למחוק את הטיוטות שסומנו? הפעולה אינה הפיכה.')">מחק את הטיוטות שסומנו</button>{% endif %}</p>
 <table class="cards"><tr><th></th><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
 {% for d in drafts %}<tr><td data-label="בחירה"><input type="checkbox" name="ids" value="{{ d['m']['id'] }}"></td><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
 <td data-label="קובץ">{{ d['m']['source_name'] or '' }}</td><td data-label="שורות שזוהו">{{ d['rows'] }}{% if d['rows'] == 0 %} <span class="note">לא זוהו שורות - בדקו את הקובץ</span>{% endif %}</td>
