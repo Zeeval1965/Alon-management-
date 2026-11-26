@@ -340,8 +340,27 @@ def _site_role_of(value):
     return None if not text or text in NOT_A_ROLE else text
 
 
-def role_sections(role, write=False):
-    """Sections a site role may use. Roles without a configured rule may view tasks only."""
+SECTION_LABELS = [("tasks", "משימות"), ("decisions", "החלטות"), ("supervision", "פיקוח"),
+                  ("plans", "תוכניות"), ("protocols", "פרוטוקולים"), ("progress", "התקדמות")]
+
+
+def site_role_rules(site_id):
+    """Per-site permission rules set by the administrator: {role: {'read': [...], 'write': [...]}}.
+    A role without a rule for the site keeps the default from ROLE_READ / ROLE_WRITE."""
+    row = db().execute("SELECT value FROM app_settings WHERE key=?", (f"perm:{site_id}",)).fetchone()
+    try:
+        return json.loads(row["value"]) if row else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def role_sections(role, write=False, site_id=None):
+    """Sections a site role may use. With a site, that site's rule applies when one is set.
+    Roles without a configured rule may view tasks only."""
+    if site_id is not None:
+        rule = site_role_rules(site_id).get(role)
+        if rule is not None:
+            return set(rule.get("write" if write else "read", []))
     table = ROLE_WRITE if write else ROLE_READ
     if role in table:
         return table[role]
@@ -1503,7 +1522,7 @@ def require_access():
         abort(404)
     roles = roles_on_site(me, site_id)
     write = request.method == "POST"
-    if not any(section in role_sections(r, write) for r in roles):
+    if not any(section in role_sections(r, write, site_id) for r in roles):
         abort(403)
     return None
 
@@ -2811,7 +2830,7 @@ def _side_menu():
             sections = set()
             if not me["is_admin"]:
                 for role in roles_on_site(me, site_id):
-                    sections |= role_sections(role)
+                    sections |= role_sections(role, site_id=site_id)
             seen_labels = set()
             for group, label, endpoint, section in SIDE_SITE_ITEMS:
                 if (me["is_admin"] or section in sections) and label not in seen_labels:
@@ -3806,6 +3825,8 @@ def admin_overview():
 <h3>קליטת פרוטוקולים במייל</h3>
 <p class="note">פרוטוקול שמתקבל במייל נכנס כטיוטה, ותאשר אותו מהמסך לפני הפרסום.</p>
 <form method="post" action="{{ url_for('mail_poll_now') }}" style="margin:6px 0"><button>בדוק קליטה עכשיו</button></form>
+<h4>הרשאות לפי תפקיד, לכל אתר</h4>
+{% for s in sites_kw %}<p><a href="{{ url_for('site_role_permissions', site_id=s['id']) }}">{{ s['name'] }}</a></p>{% endfor %}
 <h4>שולחים מאושרים</h4>
 <table>{% for e in mail_senders %}<tr><td>{{ e['email'] }}</td><td><form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="del_sender"><input type="hidden" name="email" value="{{ e['email'] }}"><button>הסר</button></form></td></tr>{% endfor %}</table>
 <form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="add_sender"><input name="email" placeholder="כתובת דוא&quot;ל" required> <button>הוסף שולח</button></form>
@@ -4031,6 +4052,45 @@ def mail_poll(token):
         return jsonify(mail_poll_once())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/sites/<int:site_id>/role-permissions", methods=["GET", "POST"])
+def site_role_permissions(site_id):
+    """Administrator only (not in SECTION_OF): what each site role may view and change on this site."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    s = db().execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone() or abort(404)
+    roles = list(ROLE_READ.keys()) + [r for r in ROLE_WRITE if r not in ROLE_READ]
+    if request.method == "POST":
+        rules = {}
+        for role in roles:
+            rules[role] = {
+                "read": [k for k, _ in SECTION_LABELS if request.form.get(f"read|{role}|{k}")],
+                "write": [k for k, _ in SECTION_LABELS if request.form.get(f"write|{role}|{k}")],
+            }
+        db().execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES (?,?)",
+                     (f"perm:{site_id}", json.dumps(rules, ensure_ascii=False)))
+        db().commit()
+        return redirect(url_for("site_role_permissions", site_id=site_id))
+    current = site_role_rules(site_id)
+
+    def checked(role, mode, key):
+        rule = current.get(role)
+        if rule is None:  # no rule for this site yet: show the default
+            return key in role_sections(role, write=(mode == "write"))
+        return key in rule.get(mode, [])
+
+    return page("הרשאות לפי תפקיד - " + s["name"], """
+<p><a href="{{ url_for('admin_overview') }}">חזרה לניהול</a></p>
+<p class="note">מה כל תפקיד רואה ומשנה באתר הזה. תפקיד שלא נשמר לו שינוי מקבל את ברירת המחדל.</p>
+<form method="post">
+{% for role in roles %}<fieldset style="margin:8px 0"><legend><b>{{ role }}</b></legend>
+{% for key, label in sections %}<div>{{ label }}: <label><input type="checkbox" name="read|{{ role }}|{{ key }}" {% if checked(role, 'read', key) %}checked{% endif %}> ראייה</label>
+<label><input type="checkbox" name="write|{{ role }}|{{ key }}" {% if checked(role, 'write', key) %}checked{% endif %}> עריכה</label></div>{% endfor %}
+</fieldset>{% endfor %}
+<button>שמירה</button>
+</form>
+""", s=s, roles=roles, sections=SECTION_LABELS, checked=checked)
 
 
 @app.route("/admin/intake-log")
