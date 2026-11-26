@@ -3605,6 +3605,19 @@ def site_view(site_id):
             latest_date = dt.date.fromisoformat(latest["meeting_date"]).strftime("%d.%m.%Y")
         except (TypeError, ValueError):
             latest_date = latest["meeting_date"] or ""
+    # Tasks that were closed (or marked for information) in the last two published protocols.
+    last_two = [r[0] for r in db().execute(
+        "SELECT id FROM meetings WHERE site_id=? AND status='published' "
+        "ORDER BY meeting_date DESC, published_at DESC, id DESC LIMIT 2", (site_id,)).fetchall()]
+    closing_tasks = []
+    if last_two:
+        closing_statuses = list(CLOSED_STATUSES) + ["לידיעה"]
+        m_marks = ",".join("?" * len(last_two))
+        s_marks = ",".join("?" * len(closing_statuses))
+        closing_tasks = db().execute(
+            f"SELECT DISTINCT t.* FROM task_occurrences o JOIN tasks t ON t.id = o.task_id "
+            f"WHERE o.meeting_id IN ({m_marks}) AND t.status IN ({s_marks}) ORDER BY t.public_no",
+            (*last_two, *closing_statuses)).fetchall()
     counts = Counter(t["status"] for t in tasks)
     top = max(counts.values(), default=1)
     status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
@@ -3674,6 +3687,10 @@ def site_view(site_id):
 <select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option {% if o == t['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>{% endfor %}</table>
 {% elif latest %}<p class="note">בפרוטוקול זה אין משימות מקושרות.</p>{% else %}<p class="note">אין פרוטוקול מפורסם לאתר.</p>{% endif %}
+<h3>נסגרו או לידיעה בשני הפרוטוקולים האחרונים</h3>
+{% if closing_tasks %}<table class="cards"><tr><th>תאריך פתיחה</th><th>נושא</th><th>משימה</th><th>סטטוס</th></tr>
+{% for t in closing_tasks %}<tr><td data-label="תאריך פתיחה">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה">{{ t['text'] }}</td><td data-label="סטטוס"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span></td></tr>{% endfor %}</table>
+{% else %}<p class="note">אין משימות סגורות או לידיעה בשני הפרוטוקולים האחרונים.</p>{% endif %}
 <script>
 (function () {
   var url = {{ url_for('site_live', site_id=s['id'])|tojson }};
@@ -3727,7 +3744,7 @@ def site_view(site_id):
         land_txt=_dmy(s['land_date']), delivery_txt=_dmy(s['delivery_date']), months_strip=construction_months_strip(s['land_date'], s['months_total']),
         month_txt=construction_schedule(s["land_date"], s["months_total"])[1],
         end_txt=construction_schedule(s["land_date"], s["months_total"])[0] or "לא נקבע",
-        latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
+        latest=latest, latest_tasks=latest_tasks, latest_date=latest_date, closing_tasks=closing_tasks, now_txt=dt.datetime.now().strftime("%H:%M:%S"))
 
 
 PROTOCOL_STEPS = ["העלאת מסמך", "פענוח תוכן", "השוואה להיסטוריה", "בקרת קליטה", "אישור הפיקוח", "עדכון כלל המשתמשים"]
