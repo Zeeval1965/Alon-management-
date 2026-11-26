@@ -3778,7 +3778,7 @@ def admin_overview():
 <div><b>{{ r['filename'] }}</b> · {{ r['subject'] or '' }} · {{ r['sender'] or '' }}</div>
 <div class="note">{{ r['reason'] }} · {{ r['received'] or '' }} · {{ r['site_name'] or 'אתר לא ידוע' }} · {{ r['kind'] or 'סוג לא ידוע' }}</div>
 <form method="post" action="{{ url_for('mail_review_ingest', review_id=r['id']) }}">
-אתר: <select name="site_id">{% for s in sites_kw %}<option value="{{ s['id'] }}" {% if s['id']==r['site_id'] %}selected{% endif %}>{{ s['name'] }}</option>{% endfor %}</select>
+אתר: <select name="site_id" required><option value="" {% if not r['site_id'] %}selected{% endif %}>בחר אתר</option>{% for s in sites_kw %}<option value="{{ s['id'] }}" {% if s['id']==r['site_id'] %}selected{% endif %}>{{ s['name'] }}</option>{% endfor %}</select>
 סוג: <select name="kind"><option {% if r['kind']=='שבועית' %}selected{% endif %}>שבועית</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
 תאריך פגישה (אם לא נמצא בקובץ): <input name="date" placeholder="dd/mm/yy" style="width:110px">
 <button name="mode" value="keep_both">הקלט והשאר את הקיים</button>
