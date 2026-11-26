@@ -3618,6 +3618,8 @@ def site_view(site_id):
             f"SELECT DISTINCT t.* FROM task_occurrences o JOIN tasks t ON t.id = o.task_id "
             f"WHERE o.meeting_id IN ({m_marks}) AND t.status IN ({s_marks}) ORDER BY t.public_no",
             (*last_two, *closing_statuses)).fetchall()
+        # Grouped by status, so all the 'בוצע' tasks appear one after another, then the next status.
+        closing_tasks = sorted(closing_tasks, key=lambda t: (closing_statuses.index(t["status"]), t["public_no"] or ""))
     counts = Counter(t["status"] for t in tasks)
     top = max(counts.values(), default=1)
     status_rows = [{"name": n, "n": c, "w": round(100 * c / top)} for n, c in counts.most_common()]
