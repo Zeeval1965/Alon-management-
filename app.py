@@ -3816,7 +3816,7 @@ def admin_overview():
 <div class="note">{{ r['reason'] }} · {{ r['received'] or '' }} · {{ r['site_name'] or 'אתר לא ידוע' }} · {{ r['kind'] or 'סוג לא ידוע' }}</div>
 <form method="post" action="{{ url_for('mail_review_ingest', review_id=r['id']) }}">
 אתר: <select name="site_id" required><option value="" {% if not r['site_id'] %}selected{% endif %}>בחר אתר</option>{% for s in sites_kw %}<option value="{{ s['id'] }}" {% if s['id']==r['site_id'] %}selected{% endif %}>{{ s['name'] }}</option>{% endfor %}</select>
-סוג: <select name="kind"><option {% if r['kind']=='שבועית' %}selected{% endif %}>שבועית</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
+סוג: <select name="kind"><option {% if r['kind']=='ביצוע' %}selected{% endif %}>ביצוע</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
 תאריך פגישה (אם לא נמצא בקובץ): <input name="date" placeholder="dd/mm/yy" style="width:110px">
 <button name="mode" value="keep_both">הקלט והשאר את הקיים</button>
 <button name="mode" value="replace">הקלט והחלף טיוטה קיימת</button>
@@ -3911,9 +3911,10 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients="", 
 
 
 def _kind_from_subject(subject):
-    """Meeting kind from the mail subject: 'שבועית' or 'שימור'. None when neither appears (not guessed)."""
+    """Meeting kind from the mail subject. A weekly summary is stored as 'ביצוע', the same kind as all the
+    existing weekly protocols, so duplicates are recognised. 'שימור' stays its own kind. None when neither appears."""
     if "שבועית" in subject:
-        return "שבועית"
+        return "ביצוע"
     if "שימור" in subject:
         return "שימור"
     return None
@@ -4070,7 +4071,7 @@ def mail_review_ingest(review_id):
     site_id = request.form.get("site_id", type=int)
     kind = request.form.get("kind", "")
     mode = request.form.get("mode", "")
-    if not site_id or kind not in ("שבועית", "שימור") or mode not in ("replace", "keep_both"):
+    if not site_id or kind not in ("ביצוע", "שימור") or mode not in ("replace", "keep_both"):
         abort(400)
     if not r["file_path"] or not os.path.exists(r["file_path"]):
         abort(404)
