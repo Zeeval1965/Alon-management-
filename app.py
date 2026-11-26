@@ -3737,6 +3737,7 @@ def admin_overview():
 <table class="cards"><tr><th>שם</th><th>דוא"ל</th></tr>{% for u in users %}<tr><td data-label="שם">{{ u['first_name'] or '' }} {{ u['last_name'] or '' }}</td><td data-label='דוא"ל'>{{ u['email'] }}</td></tr>{% endfor %}</table>
 <h3>קליטת פרוטוקולים במייל</h3>
 <p class="note">פרוטוקול שמתקבל במייל נכנס כטיוטה, ותאשר אותו מהמסך לפני הפרסום.</p>
+<form method="post" action="{{ url_for('mail_poll_now') }}" style="margin:6px 0"><button>בדוק קליטה עכשיו</button></form>
 <h4>שולחים מאושרים</h4>
 <table>{% for e in mail_senders %}<tr><td>{{ e['email'] }}</td><td><form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="del_sender"><input type="hidden" name="email" value="{{ e['email'] }}"><button>הסר</button></form></td></tr>{% endfor %}</table>
 <form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="add_sender"><input name="email" placeholder="כתובת דוא&quot;ל" required> <button>הוסף שולח</button></form>
@@ -3934,6 +3935,21 @@ def mail_poll(token):
         return jsonify(mail_poll_once())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/mail/poll-now", methods=["POST"])
+def mail_poll_now():
+    """Runs one mail intake from the admin page, under the admin's own login (no token needed)."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    try:
+        result = mail_poll_once()
+    except Exception as exc:
+        result = {"error": str(exc)}
+    return page("תוצאת קליטה", """
+<pre>{{ text }}</pre>
+<p><a href="{{ url_for('admin_overview') }}">חזרה לניהול</a></p>
+""", text=json.dumps(result, ensure_ascii=False, indent=1))
 
 
 @app.route("/admin/mail-review/<int:review_id>/ingest", methods=["POST"])
