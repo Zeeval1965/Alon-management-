@@ -3668,8 +3668,8 @@ def site_view(site_id):
 </div>
 <p class="note live-strip"><span class="live-dot"></span> חי · עודכן <span id="live-time">{{ now_txt }}</span> · מתרענן כל דקה</p>
 <h3>משימות מהפרוטוקול האחרון{% if latest_date %} · {{ latest_date }}{% endif %}</h3>
-{% if latest_tasks %}<table class="cards"><tr><th>#</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
-{% for t in latest_tasks %}<tr><td data-label="#">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>
+{% if latest_tasks %}<table class="cards"><tr><th>תאריך פתיחה</th><th>נושא</th><th>משימה</th><th>יעד</th><th>סטטוס</th></tr>
+{% for t in latest_tasks %}<tr><td data-label="תאריך פתיחה">{{ t['public_no']|pubno }}</td><td data-label="נושא">{{ t['topic'] }}</td><td data-label="משימה" style="width:100%">{{ t['text'] }}{{ pic_mark(t['id']) }}</td><td data-label="יעד">{{ t['target_text'] }}</td><td data-label="סטטוס" style="min-width:180px"><span class="pill {{ sclass.get(t['status'], '') }}">{{ t['status'] }}</span>
 <form method="post" action="{{ url_for('task_status', task_id=t['id']) }}" data-ajax>
 <select name="status" style="width:100%;min-width:150px">{% for o in status_options %}<option {% if o == t['status'] %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
 <input name="by" placeholder="מי טיפל" style="width:100%;min-width:150px;margin-top:4px"><button style="margin-top:4px">עדכון</button></form></td></tr>{% endfor %}</table>
