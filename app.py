@@ -3752,6 +3752,7 @@ def admin_overview():
 <form method="post" action="{{ url_for('mail_review_ingest', review_id=r['id']) }}">
 אתר: <select name="site_id">{% for s in sites_kw %}<option value="{{ s['id'] }}" {% if s['id']==r['site_id'] %}selected{% endif %}>{{ s['name'] }}</option>{% endfor %}</select>
 סוג: <select name="kind"><option {% if r['kind']=='שבועית' %}selected{% endif %}>שבועית</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
+תאריך פגישה (אם לא נמצא בקובץ): <input name="date" placeholder="dd/mm/yy" style="width:110px">
 <button name="mode" value="keep_both">הקלט והשאר את הקיים</button>
 <button name="mode" value="replace">הקלט והחלף טיוטה קיימת</button>
 </form>
@@ -3782,11 +3783,27 @@ def _save_review(meta, site_id, kind, reason, filename, pdf_bytes, recipients=""
     return rid
 
 
-def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients="", meta=None, mode="review"):
+def _normalize_day(text):
+    """A typed date (dd/mm/yy, dd.mm.yy, dd/mm/yyyy) as dd.mm.yy, or None if it is not a real date."""
+    m = re.fullmatch(r"\s*(\d{1,2})[./-](\d{1,2})[./-](\d{2}|\d{4})\s*", text or "")
+    if not m:
+        return None
+    yy = m.group(3)[-2:]
+    try:
+        dt.date(2000 + int(yy), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+    return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}.{yy}"
+
+
+def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients="", meta=None, mode="review",
+                fallback_date=None):
     """Same steps as the manual upload: split by date, store one draft per date.
     recipients: the mail's To and Cc as text ('אל: ...; עותק: ...'), empty for manual uploads.
     mode: 'review' (a date already taken goes to the review queue), 'replace' (existing drafts for that
-    date are replaced), 'keep_both' (insert anyway)."""
+    date are replaced), 'keep_both' (insert anyway).
+    fallback_date: a date (dd.mm.yy) the admin typed; used only when the file gives no date.
+    A file with no rows, or with a row that has no date, is never saved as a draft: it goes to review."""
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.write(pdf_bytes)
     tmp.close()
@@ -3795,6 +3812,14 @@ def _ingest_pdf(site_id, pdf_bytes, filename, kind="ביצוע", recipients="", 
     for r in rows:
         if not r.get("meeting_date") and named:
             r["meeting_date"] = dt.date.fromisoformat(named).strftime("%d.%m.%y")
+        if not r.get("meeting_date") and fallback_date:
+            r["meeting_date"] = fallback_date
+    if not rows:
+        _save_review(meta, site_id, kind, "לא נמצאו שורות בקובץ", filename, pdf_bytes, recipients)
+        return []
+    if any(not r.get("meeting_date") for r in rows):
+        _save_review(meta, site_id, kind, "לא נמצא תאריך פגישה בקובץ או בשם הקובץ", filename, pdf_bytes, recipients)
+        return []
     groups = list(split_rows_by_date(rows))
     if mode == "review":
         # A date that already has a meeting of this site and kind is not decided here: the whole file
@@ -3968,8 +3993,11 @@ def mail_review_ingest(review_id):
     with open(r["file_path"], "rb") as fh:
         data = fh.read()
     meta = {"message_id": r["message_id"], "received": r["received"], "sender": r["sender"], "subject": r["subject"]}
+    fallback = _normalize_day(request.form.get("date", ""))
+    if request.form.get("date", "").strip() and not fallback:
+        abort(400)
     ids = _ingest_pdf(site_id, data, r["filename"], kind=kind, recipients=r["recipients"] or "",
-                      meta=meta, mode=mode)
+                      meta=meta, mode=mode, fallback_date=fallback)
     db().execute("UPDATE mail_review SET status=?, site_id=?, kind=? WHERE id=?",
                  ("טופל" if ids else "לא נקלט", site_id, kind, review_id))
     db().commit()
