@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS mail_review (
   site_id INTEGER, kind TEXT, reason TEXT, filename TEXT, file_path TEXT, recipients TEXT,
   status TEXT DEFAULT 'ממתין'
 );
+CREATE TABLE IF NOT EXISTS intake_log (
+  id INTEGER PRIMARY KEY, created_at TEXT, site_id INTEGER, meeting_id INTEGER,
+  event TEXT, summary TEXT
+);
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY, site_id INTEGER, contact_id INTEGER, channel TEXT,
   body TEXT, mode TEXT DEFAULT 'מיידי', status TEXT DEFAULT 'queued', created TEXT
@@ -474,6 +478,12 @@ def protocol_already_has(task_id, iso_date):
            WHERE o.task_id=? AND mm.meeting_date=?""", (task_id, iso_date)).fetchone() is not None
 
 
+def _log_intake(site_id, event, summary, meeting_id=None):
+    """One line in the intake log: what happened to a mail or a protocol, in words."""
+    db().execute("INSERT INTO intake_log(created_at, site_id, meeting_id, event, summary) VALUES (?,?,?,?,?)",
+                 (dt.datetime.now().isoformat(timespec="minutes"), site_id, meeting_id, event, summary))
+
+
 def publish_meeting(meeting_id):
     """Publish approved rows. Anything the system cannot match with confidence goes to
     the admin queue instead of being guessed. Rows are processed in meeting-date order."""
@@ -594,6 +604,23 @@ def publish_meeting(meeting_id):
         suggest_assignees(task_id)
     db().execute("UPDATE meetings SET status='published', published_at=?, meeting_date=COALESCE(meeting_date, ?) WHERE id=?",
                  (dt.datetime.now().isoformat(timespec="minutes"), meeting_day(rows), meeting_id))
+    # Summary of this publish for the intake log.
+    pub_ids = set(published)
+    seen_elsewhere = {r[0] for r in db().execute(
+        "SELECT DISTINCT task_id FROM task_occurrences WHERE meeting_id != ?", (meeting_id,)).fetchall()}
+    new_count = sum(1 for t in pub_ids if t not in seen_elsewhere)
+    day = meeting_day(rows) or str(meeting_id)
+    resp_changes = db().execute(
+        "SELECT COUNT(*) FROM task_status_log WHERE status='שינוי אחראי' AND handled_by LIKE ?",
+        (f"%(פרוטוקול {day}%",)).fetchone()[0]
+    pending_close = db().execute(
+        "SELECT COUNT(*) FROM task_closure_pending WHERE meeting_id=?", (meeting_id,)).fetchone()[0]
+    kind_name = m["kind"] or ""
+    _log_intake(site_id, "פרסום פרוטוקול",
+                f"{kind_name} {day}: פורסמו {len(pub_ids)} משימות - {new_count} חדשות, "
+                f"{len(pub_ids) - new_count} חזרו מפרוטוקולים קודמים. שינויי אחראי: {resp_changes}. "
+                f"ממתינות לאישור סגירה: {pending_close}. לתור המנהל: {len(queued)}.",
+                meeting_id)
     db().commit()
     return {"published": len(published), "queued": len(queued)}
 
@@ -3743,6 +3770,7 @@ def admin_overview():
 <form method="post" action="{{ url_for('mail_admin_update') }}"><input type="hidden" name="action" value="add_sender"><input name="email" placeholder="כתובת דוא&quot;ל" required> <button>הוסף שולח</button></form>
 <h4>שם הפרויקט בכותרת המייל, לכל אתר</h4>
 {% for s in sites_kw %}<form method="post" action="{{ url_for('mail_admin_update') }}" style="margin:4px 0"><input type="hidden" name="action" value="set_keyword"><input type="hidden" name="site_id" value="{{ s['id'] }}">{{ s['name'] }}: <input name="keyword" value="{{ s['kw'] }}"> <button>שמור</button></form>{% endfor %}
+<p><a href="{{ url_for('intake_log_view') }}">יומן קליטה וסיכומי פרסום</a></p>
 <h4>ממתין לבדיקה ({{ pending|length }})</h4>
 <p class="note">קבצים שהקליטה לא החליטה לגביהם לבד: שולח לא מאושר, אתר או סוג לא מזוהים, או סיכום שכבר נקלט לאותו תאריך. בחר את האתר והסוג, ואז הקלט.</p>
 {% for r in pending %}
@@ -3935,6 +3963,7 @@ def mail_poll_once():
                 for fn, data in pdfs:
                     ids += _ingest_pdf(site_id, data, fn, kind=kind, recipients=recipients, meta=meta)
                 status = f"נקלטו {len(ids)} טיוטות" if ids else "נשמר לבדיקה במסך האדמין"
+            _log_intake(site_id, "קליטת מייל", f"{subject} | מ: {sender} | {status}")
             db().execute(
                 "UPDATE mail_inbox SET sender=?, subject=?, site_id=?, status=? WHERE message_id=?",
                 (sender, subject, site_id, status, msg_id))
@@ -3960,6 +3989,24 @@ def mail_poll(token):
         return jsonify(mail_poll_once())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/admin/intake-log")
+def intake_log_view():
+    """Admin: what the intake did, one line per mail and per publish, newest first."""
+    if not current_contact()["is_admin"]:
+        abort(403)
+    entries = db().execute(
+        "SELECT l.*, s.name AS site_name FROM intake_log l LEFT JOIN sites s ON s.id=l.site_id "
+        "ORDER BY l.id DESC LIMIT 200").fetchall()
+    return page("יומן קליטה וסיכומים", """
+<p class="note">כל קליטת מייל ופרסום פרוטוקול נרשמים כאן, עם סיכום של מה קרה. 200 הרשומות האחרונות.</p>
+<table><tr><th>זמן</th><th>אתר</th><th>אירוע</th><th>סיכום</th></tr>
+{% for e in entries %}<tr><td>{{ e['created_at'] }}</td><td>{{ e['site_name'] or '' }}</td>
+<td>{{ e['event'] }}</td><td>{{ e['summary'] }}</td></tr>
+{% else %}<tr><td colspan="4">אין רשומות עדיין</td></tr>{% endfor %}</table>
+<p><a href="{{ url_for('admin_overview') }}">חזרה לניהול</a></p>
+""", entries=entries)
 
 
 @app.route("/admin/mail/poll-now", methods=["POST"])
@@ -4000,6 +4047,9 @@ def mail_review_ingest(review_id):
                       meta=meta, mode=mode, fallback_date=fallback)
     db().execute("UPDATE mail_review SET status=?, site_id=?, kind=? WHERE id=?",
                  ("טופל" if ids else "לא נקלט", site_id, kind, review_id))
+    _log_intake(site_id, "הקלטה מתור הבדיקה",
+                f"{r['filename']} ({kind}, {mode}): נוצרו {len(ids)} טיוטות" if ids
+                else f"{r['filename']} ({kind}, {mode}): לא נוצרה טיוטה")
     db().commit()
     return redirect(url_for("admin_overview"))
 
