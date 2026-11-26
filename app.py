@@ -1266,7 +1266,7 @@ SECTION_OF = {
     "site_view": "tasks", "site_live": "tasks", "task_status": "tasks", "assignments": "tasks", "confirm_assignee": "tasks",
     "set_responsible": "tasks", "add_responsible": "tasks", "toggle_cc": "tasks", "site_contacts": "tasks", "cc_report": "tasks",
     "site_warnings": "tasks", "site_audit": "tasks", "task_closure": "tasks",
-    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "meeting_update": "protocols", "meeting_delete": "protocols", "protocol_image": "protocols", "site_images": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
+    "task_comment_add": "tasks", "task_doc_add": "tasks", "site_send_links": "tasks", "site_protocol_search": "protocols", "site_protocols": "protocols", "site_protocols_publish": "protocols", "meeting_update": "protocols", "meeting_delete": "protocols", "site_drafts_delete": "protocols", "mail_review_ingest": "protocols", "mail_review_dismiss": "protocols", "protocol_image": "protocols", "site_images": "protocols", "assignments_rematch": "tasks", "contact_card": "tasks", "task_triage": "tasks",
     "site_search": "tasks", "task_print_flag": "tasks", "site_print": "tasks", "site_print_clear": "tasks",
     "assign_task": "tasks",
     "decisions_view": "decisions",
@@ -1495,6 +1495,9 @@ def require_access():
             site_id = row["site_id"] if row else None
         elif "meeting_id" in (request.view_args or {}):
             row = db().execute("SELECT site_id FROM meetings WHERE id=?", (request.view_args["meeting_id"],)).fetchone()
+            site_id = row["site_id"] if row else None
+        elif "review_id" in (request.view_args or {}):
+            row = db().execute("SELECT site_id FROM mail_review WHERE id=?", (request.view_args["review_id"],)).fetchone()
             site_id = row["site_id"] if row else None
     if site_id is None:
         abort(404)
@@ -2310,8 +2313,9 @@ def meeting_update(meeting_id):
 
 @app.route("/sites/<int:site_id>/drafts/delete", methods=["POST"])
 def site_drafts_delete(site_id):
-    """Admin: delete the drafts ticked on the protocols page. Published protocols are never touched here."""
-    if not current_contact()["is_admin"]:
+    """Delete the drafts ticked on the protocols page: the platform admin, or a supervisor of this site.
+    Published protocols are never touched here."""
+    if not is_task_manager(current_contact(), site_id):
         abort(403)
     d = db()
     for raw in request.form.getlist("ids"):
@@ -4064,15 +4068,16 @@ def mail_poll_now():
 
 @app.route("/admin/mail-review/<int:review_id>/ingest", methods=["POST"])
 def mail_review_ingest(review_id):
-    """Admin decision on a kept attachment: take it as a draft for the chosen site and kind."""
-    if not current_contact()["is_admin"]:
-        abort(403)
+    """Decision on a kept attachment: take it as a draft for the chosen site and kind.
+    Allowed for the platform admin, and for a supervisor of the site it is taken for."""
     r = db().execute("SELECT * FROM mail_review WHERE id=? AND status='ממתין'", (review_id,)).fetchone() or abort(404)
-    site_id = request.form.get("site_id", type=int)
+    site_id = request.form.get("site_id", type=int) or r["site_id"]
     kind = request.form.get("kind", "")
     mode = request.form.get("mode", "")
     if not site_id or kind not in ("ביצוע", "שימור") or mode not in ("replace", "keep_both"):
         abort(400)
+    if not is_task_manager(current_contact(), site_id):
+        abort(403)
     if not r["file_path"] or not os.path.exists(r["file_path"]):
         abort(404)
     with open(r["file_path"], "rb") as fh:
@@ -4094,7 +4099,11 @@ def mail_review_ingest(review_id):
 
 @app.route("/admin/mail-review/<int:review_id>/dismiss", methods=["POST"])
 def mail_review_dismiss(review_id):
-    if not current_contact()["is_admin"]:
+    r = db().execute("SELECT * FROM mail_review WHERE id=?", (review_id,)).fetchone() or abort(404)
+    if r["site_id"] is None:
+        if not current_contact()["is_admin"]:
+            abort(403)
+    elif not is_task_manager(current_contact(), r["site_id"]):
         abort(403)
     db().execute("UPDATE mail_review SET status='נדחה' WHERE id=? AND status='ממתין'", (review_id,))
     db().commit()
@@ -4284,10 +4293,22 @@ def site_protocols(site_id):
 <td data-label="זמן הפרסום">{{ i['m']['published_at'] or '' }}</td><td data-label="קובץ">{{ i['m']['source_name'] or '' }}</td><td data-label="שורות">{{ i['rows'] }}</td>
 <td data-label=""><a href="{{ url_for('meeting_view', meeting_id=i['m']['id']) }}">פתיחה</a></td></tr>
 {% else %}<tr><td colspan="6">{{ 'אין פרוטוקולים מפורסמים בחודש הנוכחי' if this_month else 'אין פרוטוקולים מפורסמים' }}</td></tr>{% endfor %}</table>
+{% if site_pending %}<h3>ממתין לבדיקה לאתר הזה ({{ site_pending|length }})</h3>
+{% for r in site_pending %}<div style="border:1px solid #ccc;padding:8px;margin:6px 0">
+<div><b>{{ r['filename'] }}</b> · {{ r['subject'] or '' }}</div>
+<div class="note">{{ r['reason'] }} · {{ r['received'] or '' }}</div>
+<form method="post" action="{{ url_for('mail_review_ingest', review_id=r['id']) }}">
+סוג: <select name="kind"><option {% if r['kind']=='ביצוע' %}selected{% endif %}>ביצוע</option><option {% if r['kind']=='שימור' %}selected{% endif %}>שימור</option></select>
+תאריך פגישה (אם לא נמצא בקובץ): <input name="date" placeholder="dd/mm/yy" style="width:110px">
+<button name="mode" value="keep_both">הקלט והשאר את הקיים</button>
+<button name="mode" value="replace">הקלט והחלף טיוטה קיימת</button>
+</form>
+<form method="post" action="{{ url_for('mail_review_dismiss', review_id=r['id']) }}" style="margin-top:4px"><button>התעלם</button></form>
+</div>{% endfor %}{% endif %}
 <h3>הועלו ולא פורסמו (טיוטות)</h3>
 <form method="post" action="{{ url_for('site_protocols_publish', site_id=s['id']) }}">
 <p><button>פרסם את הנבחרים</button> <button name="all" value="1" onclick="return confirm('לפרסם את כל הטיוטות לפי סדר התאריכים?')">פרסם הכל</button> <span class="note">מסומנים: הפרוטוקולים יפורסמו מהישן לחדש.</span>
-{% if is_admin %} <button formaction="{{ url_for('site_drafts_delete', site_id=s['id']) }}" onclick="return confirm('למחוק את הטיוטות שסומנו? הפעולה אינה הפיכה.')">מחק את הטיוטות שסומנו</button>{% endif %}</p>
+{% if can_manage %} <button formaction="{{ url_for('site_drafts_delete', site_id=s['id']) }}" onclick="return confirm('למחוק את הטיוטות שסומנו? הפעולה אינה הפיכה.')">מחק את הטיוטות שסומנו</button>{% endif %}</p>
 <table class="cards"><tr><th></th><th>סוג</th><th>תאריך הפרוטוקול</th><th>קובץ</th><th>שורות שזוהו</th><th></th></tr>
 {% for d in drafts %}<tr><td data-label="בחירה"><input type="checkbox" name="ids" value="{{ d['m']['id'] }}"></td><td data-label="סוג">{{ d['m']['kind'] }}</td><td data-label="תאריך הפרוטוקול">{{ d['m']['meeting_date'] or 'לא זוהה' }}</td>
 <td data-label="קובץ">{{ d['m']['source_name'] or '' }}</td><td data-label="שורות שזוהו">{{ d['rows'] }}{% if d['rows'] == 0 %} <span class="note">לא זוהו שורות - בדקו את הקובץ</span>{% endif %}</td>
@@ -4297,7 +4318,10 @@ def site_protocols(site_id):
 <form method="post" action="{{ url_for('site_protocols_reset', site_id=s['id']) }}" onsubmit="return confirm('למחוק את כל הפרוטוקולים והמשימות של האתר? הפעולה אינה הפיכה.')">
 <p class="note">ימחקו כל הפרוטוקולים והטיוטות, המשימות שנוצרו מהם, ההיסטוריה, השיוכים, ההערות והקבצים המקושרים למשימות. אנשי הקשר, האתר, התוכניות והחלטות שנרשמו ידנית נשארים.</p>
 <input name="confirm" placeholder='כתבו "מחק הכול"'> <button>מחיקה</button></form>{% endif %}
-""", s=s, items=items, sort=sort, this_month=this_month, drafts=drafts, on_date=on_date, ym=ym, is_admin=current_contact()["is_admin"])
+""", s=s, items=items, sort=sort, this_month=this_month, drafts=drafts, on_date=on_date, ym=ym,
+    is_admin=current_contact()["is_admin"], can_manage=is_task_manager(current_contact(), site_id),
+    site_pending=db().execute("SELECT * FROM mail_review WHERE site_id=? AND status='ממתין' ORDER BY id DESC",
+                              (site_id,)).fetchall())
 
 
 FILE_DATE = re.compile(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?!\d)")
